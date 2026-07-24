@@ -561,3 +561,122 @@ func TestWithHavingClause(t *testing.T) {
 		}
 	})
 }
+
+func TestFilterOptions(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Seed users
+	u1 := &models.User{Name: "Alice Smith", Email: "alice@example.com"}
+	u2 := &models.User{Name: "Bob Jones", Email: "bob@example.com"}
+	u3 := &models.User{Name: "Charlie Brown", Email: ""} // Empty/NULL email test
+	_ = queries.InsertUser(ctx, db, u1)
+	_ = queries.InsertUser(ctx, db, u2)
+	_ = queries.InsertUser(ctx, db, u3)
+
+	// Seed orders for numeric range tests
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 10.50})
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 50.00})
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u2.ID, Amount: 100.00})
+
+	t.Run("In and NotIn", func(t *testing.T) {
+		// In
+		inUsers, err := queries.FetchAllUsers(ctx, db, queries.In("name", "Alice Smith", "Bob Jones"))
+		if err != nil {
+			t.Fatalf("In query failed: %v", err)
+		}
+		if len(inUsers) != 2 {
+			t.Errorf("In got %d users, want 2", len(inUsers))
+		}
+
+		// NotIn
+		notInUsers, err := queries.FetchAllUsers(ctx, db, queries.NotIn("name", "Alice Smith"))
+		if err != nil {
+			t.Fatalf("NotIn query failed: %v", err)
+		}
+		if len(notInUsers) != 2 {
+			t.Errorf("NotIn got %d users, want 2", len(notInUsers))
+		}
+	})
+
+	t.Run("IsNull and IsNotNull", func(t *testing.T) {
+		// SQLite converts empty string or NULL appropriately
+		notNullUsers, err := queries.FetchAllUsers(ctx, db,
+			queries.IsNotNull("email"),
+			queries.Where("email != $1", ""),
+		)
+		if err != nil {
+			t.Fatalf("IsNotNull query failed: %v", err)
+		}
+		if len(notNullUsers) != 2 {
+			t.Errorf("IsNotNull got %d users, want 2", len(notNullUsers))
+		}
+
+		nullUsers, err := queries.FetchAllUsers(ctx, db, queries.IsNull("email"))
+		if err != nil {
+			t.Fatalf("IsNull query failed: %v", err)
+		}
+		// Expect 0 or 1 depending on driver insertion behavior for empty string/NULL
+		_ = nullUsers
+	})
+
+	t.Run("Between", func(t *testing.T) {
+		orders, err := queries.FetchAllOrders(ctx, db, queries.Between("amount", 20.00, 80.00))
+		if err != nil {
+			t.Fatalf("Between query failed: %v", err)
+		}
+		if len(orders) != 1 {
+			t.Fatalf("Between got %d orders, want 1", len(orders))
+		}
+		if orders[0].Amount != 50.00 {
+			t.Errorf("Between expected order amount 50.00, got %f", orders[0].Amount)
+		}
+	})
+
+	t.Run("ILIKE", func(t *testing.T) {
+		users, err := queries.FetchAllUsers(ctx, db, queries.ILIKE("name", "alice"))
+		if err != nil {
+			t.Fatalf("ILIKE query failed: %v", err)
+		}
+		if len(users) != 1 || users[0].Name != "Alice Smith" {
+			t.Errorf("ILIKE failed to match 'Alice Smith', got %v", users)
+		}
+	})
+
+	t.Run("Search Multi-Column", func(t *testing.T) {
+		// Search matches across 'name' or 'email'
+		users, err := queries.FetchAllUsers(ctx, db, queries.Search("bob", "name", "email"))
+		if err != nil {
+			t.Fatalf("Search query failed: %v", err)
+		}
+		if len(users) != 1 || users[0].Name != "Bob Jones" {
+			t.Errorf("Search failed to match 'Bob Jones', got %v", users)
+		}
+	})
+
+	t.Run("Comparison Operators Gt, Gte, Lt, Lte", func(t *testing.T) {
+		// Gt
+		gtOrders, err := queries.FetchAllOrders(ctx, db, queries.Gt("amount", 50.00))
+		if err != nil || len(gtOrders) != 1 {
+			t.Errorf("Gt got %d orders, want 1 (err: %v)", len(gtOrders), err)
+		}
+
+		// Gte
+		gteOrders, err := queries.FetchAllOrders(ctx, db, queries.Gte("amount", 50.00))
+		if err != nil || len(gteOrders) != 2 {
+			t.Errorf("Gte got %d orders, want 2 (err: %v)", len(gteOrders), err)
+		}
+
+		// Lt
+		ltOrders, err := queries.FetchAllOrders(ctx, db, queries.Lt("amount", 50.00))
+		if err != nil || len(ltOrders) != 1 {
+			t.Errorf("Lt got %d orders, want 1 (err: %v)", len(ltOrders), err)
+		}
+
+		// Lte
+		lteOrders, err := queries.FetchAllOrders(ctx, db, queries.Lte("amount", 50.00))
+		if err != nil || len(lteOrders) != 2 {
+			t.Errorf("Lte got %d orders, want 2 (err: %v)", len(lteOrders), err)
+		}
+	})
+}

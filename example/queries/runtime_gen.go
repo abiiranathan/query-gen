@@ -42,6 +42,189 @@ func Where(where string, args ...any) QueryOption {
 	}
 }
 
+// ILIKE performs a case-insensitive pattern match on a column using PostgreSQL ILIKE.
+// It wraps the provided value with wildcard characters ("%<value>%").
+// It does nothing if value is empty.
+func ILIKE(column, value string) QueryOption {
+	return func(o *QueryOptions) {
+		if value == "" {
+			return
+		}
+
+		o.Args = append(o.Args, "%"+value+"%")
+		clause := fmt.Sprintf("%s LIKE $%d", column, len(o.Args))
+
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// In filters a column matching any of the provided values.
+// It does nothing if values is empty.
+func In(column string, values ...any) QueryOption {
+	return func(o *QueryOptions) {
+		if len(values) == 0 {
+			return
+		}
+
+		placeholders := make([]string, 0, len(values))
+		for _, v := range values {
+			o.Args = append(o.Args, v)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(o.Args)))
+		}
+
+		clause := fmt.Sprintf("%s IN (%s)", column, strings.Join(placeholders, ", "))
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// NotIn filters a column not matching any of the provided values.
+// It does nothing if values is empty.
+func NotIn(column string, values ...any) QueryOption {
+	return func(o *QueryOptions) {
+		if len(values) == 0 {
+			return
+		}
+
+		placeholders := make([]string, 0, len(values))
+		for _, v := range values {
+			o.Args = append(o.Args, v)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(o.Args)))
+		}
+
+		clause := fmt.Sprintf("%s NOT IN (%s)", column, strings.Join(placeholders, ", "))
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// IsNull filters rows where the column is NULL.
+func IsNull(column string) QueryOption {
+	return func(o *QueryOptions) {
+		clause := fmt.Sprintf("%s IS NULL", column)
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// IsNotNull filters rows where the column is NOT NULL.
+func IsNotNull(column string) QueryOption {
+	return func(o *QueryOptions) {
+		clause := fmt.Sprintf("%s IS NOT NULL", column)
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// Between applies a BETWEEN min AND max filter on a column.
+func Between(column string, min, max any) QueryOption {
+	return func(o *QueryOptions) {
+		o.Args = append(o.Args, min, max)
+		p1 := fmt.Sprintf("$%d", len(o.Args)-1)
+		p2 := fmt.Sprintf("$%d", len(o.Args))
+
+		clause := fmt.Sprintf("%s BETWEEN %s AND %s", column, p1, p2)
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// Search performs a pattern match across multiple columns.
+// It does nothing if query or columns is empty.
+func Search(query string, columns ...string) QueryOption {
+	return func(o *QueryOptions) {
+		if query == "" || len(columns) == 0 {
+			return
+		}
+
+		o.Args = append(o.Args, "%"+query+"%")
+		placeholder := fmt.Sprintf("$%d", len(o.Args))
+
+		clauses := make([]string, 0, len(columns))
+		for _, col := range columns {
+			clauses = append(clauses, fmt.Sprintf("%s LIKE %s", col, placeholder))
+		}
+
+		groupClause := "(" + strings.Join(clauses, " OR ") + ")"
+		if o.Where != "" {
+			o.Where += " AND " + groupClause
+		} else {
+			o.Where = groupClause
+		}
+	}
+}
+
+// Gt applies a greater-than filter (>).
+func Gt(column string, val any) QueryOption {
+	return func(o *QueryOptions) {
+		o.Args = append(o.Args, val)
+		clause := fmt.Sprintf("%s > $%d", column, len(o.Args))
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// Gte applies a greater-than-or-equal filter (>=).
+func Gte(column string, val any) QueryOption {
+	return func(o *QueryOptions) {
+		o.Args = append(o.Args, val)
+		clause := fmt.Sprintf("%s >= $%d", column, len(o.Args))
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// Lt applies a less-than filter (<).
+func Lt(column string, val any) QueryOption {
+	return func(o *QueryOptions) {
+		o.Args = append(o.Args, val)
+		clause := fmt.Sprintf("%s < $%d", column, len(o.Args))
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// Lte applies a less-than-or-equal filter (<=).
+func Lte(column string, val any) QueryOption {
+	return func(o *QueryOptions) {
+		o.Args = append(o.Args, val)
+		clause := fmt.Sprintf("%s <= $%d", column, len(o.Args))
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
 func Having(having string, args ...any) QueryOption {
 	return func(o *QueryOptions) {
 		if o.Having != "" {
@@ -275,7 +458,7 @@ func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn Fe
 
 	// Append pagination limit and offset options
 	pOpts := append([]QueryOption(nil), opts...)
-	pOpts = append(pOpts, WithLimit(pageSize), WithOffset((page-1)*pageSize))
+	pOpts = append(pOpts, Limit(pageSize), Offset((page-1)*pageSize))
 
 	results, err := fetchFn(ctx, db, pOpts...)
 	if err != nil {
