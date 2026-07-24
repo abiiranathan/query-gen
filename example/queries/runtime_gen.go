@@ -16,14 +16,15 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// QueryOptions provides optional filtering, ordering, grouping, and pagination for queries.
+// QueryOptions provides optional filtering, ordering, grouping, pagination, and association preloading for queries.
 type QueryOptions struct {
-	Where   string
-	Args    []any
-	OrderBy string
-	GroupBy string
-	Limit   int
-	Offset  int
+	Where               string
+	Args                []any
+	OrderBy             string
+	GroupBy             string
+	Limit               int
+	Offset              int
+	PreloadAssociations bool
 }
 
 type QueryOption func(*QueryOptions)
@@ -59,13 +60,25 @@ func WithOffset(offset int) QueryOption {
 	}
 }
 
-func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any) {
+// WithPreloadAssociations enables or disables preloading associated model relations.
+func WithPreloadAssociations(preload bool) QueryOption {
+	return func(o *QueryOptions) {
+		o.PreloadAssociations = preload
+	}
+}
+
+func parseQueryOptions(opts ...QueryOption) QueryOptions {
 	var cfg QueryOptions
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
 	}
+	return cfg
+}
+
+func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any, QueryOptions) {
+	cfg := parseQueryOptions(opts...)
 
 	var sb strings.Builder
 	args := cfg.Args
@@ -99,7 +112,7 @@ func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any) {
 		fmt.Fprintf(&sb, " OFFSET $%d", len(args))
 	}
 
-	return sb.String(), args
+	return sb.String(), args, cfg
 }
 
 func scanNullable[T any](dst *T) *nullableScanner[T] {

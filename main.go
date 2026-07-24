@@ -53,7 +53,7 @@ const (
 )
 
 // Relation describes a HasMany or BelongsTo association discovered on a
-// model, used to generate a joined query with no N+1 reads.
+// model, used to execute association preloading when requested.
 type Relation struct {
 	FieldName   string // Struct field name on the parent, e.g. "User" or "Orders".
 	TargetModel string // Related model type name, e.g. "User" or "Order".
@@ -110,6 +110,16 @@ type Model struct {
 	PK             *Field
 	Relations      []Relation
 	AllKnownModels map[string]Model // All models in the parsed package, keyed by type name.
+}
+
+// FieldByColumn finds a struct Field by its database column name.
+func (m Model) FieldByColumn(col string) *Field {
+	for i := range m.Fields {
+		if m.Fields[i].Column == col {
+			return &m.Fields[i]
+		}
+	}
+	return nil
 }
 
 // --- Template method helpers ---
@@ -267,7 +277,6 @@ func main() {
 			log.Fatalf("query-gen: generating code for %q: %v", model.Name, err)
 		}
 
-		// Replace format.Source(...) with imports.Process(...)
 		fileName := fmt.Sprintf("%s_gen.go", toSnakeCase(model.Name))
 		filePath := filepath.Join(*outDir, fileName)
 
@@ -348,7 +357,6 @@ func parsePackage(pattern string) ([]Model, string, error) {
 					}
 
 					model.Fields = append(model.Fields, parsedField)
-					// Point to the element inside model.Fields after parsing column tags
 					if parsedField.IsPK {
 						model.PK = &model.Fields[len(model.Fields)-1]
 					}
@@ -521,14 +529,15 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// QueryOptions provides optional filtering, ordering, grouping, and pagination for queries.
+// QueryOptions provides optional filtering, ordering, grouping, pagination, and association preloading for queries.
 type QueryOptions struct {
-	Where   string
-	Args    []any
-	OrderBy string
-	GroupBy string
-	Limit   int
-	Offset  int
+	Where               string
+	Args                []any
+	OrderBy             string
+	GroupBy             string
+	Limit               int
+	Offset              int
+	PreloadAssociations bool
 }
 
 type QueryOption func(*QueryOptions)
@@ -564,13 +573,25 @@ func WithOffset(offset int) QueryOption {
 	}
 }
 
-func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any) {
+// WithPreloadAssociations enables or disables preloading associated model relations.
+func WithPreloadAssociations(preload bool) QueryOption {
+	return func(o *QueryOptions) {
+		o.PreloadAssociations = preload
+	}
+}
+
+func parseQueryOptions(opts ...QueryOption) QueryOptions {
 	var cfg QueryOptions
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
 	}
+	return cfg
+}
+
+func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any, QueryOptions) {
+	cfg := parseQueryOptions(opts...)
 
 	var sb strings.Builder
 	args := cfg.Args
@@ -604,7 +625,7 @@ func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any) {
 		fmt.Fprintf(&sb, " OFFSET $%d", len(args))
 	}
 
-	return sb.String(), args
+	return sb.String(), args, cfg
 }
 
 func scanNullable[T any](dst *T) *nullableScanner[T] {
@@ -745,11 +766,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"{{.ModelPkg}}"
 )
 
-{{$pk := .PK}}
 // Insert{{.Name}} inserts a new {{.Name}} record into the {{.Table}} table.
 func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}) error {
 	if db == nil {
@@ -772,10 +793,12 @@ func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 }
 
 // Get{{.Name}}ByID retrieves a single {{.Name}} record from {{.Table}} by its primary key.
-func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	if db == nil {
 		return nil, errors.New("get{{.Name}}ByID: db is nil")
 	}
+
+	cfg := parseQueryOptions(opts...)
 
 	const query = ` + "`" + `
 		SELECT {{.AllColumns ""}}
@@ -788,6 +811,15 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}) (*{{.ModelP
 	if err := row.Scan({{.AllScanArgs "m"}}); err != nil {
 		return nil, fmt.Errorf("get{{.Name}}ByID(%v): %w", id, err)
 	}
+
+	{{if .Relations}}
+	if cfg.PreloadAssociations {
+		if err := preload{{.Name}}Associations(ctx, db, []*{{.ModelPkgAlias}}.{{.Name}}{&m}); err != nil {
+			return nil, fmt.Errorf("get{{.Name}}ByID(%v): preloading associations: %w", id, err)
+		}
+	}
+	{{end}}
+
 	return &m, nil
 }
 
@@ -812,7 +844,7 @@ func Count{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) (int64, 
 		return 0, errors.New("count{{.Name}}s: db is nil")
 	}
 
-	clause, args := applyQueryOptions("", opts...)
+	clause, args, _ := applyQueryOptions("", opts...)
 	query := "SELECT COUNT(*) FROM {{.Table}}" + clause
 
 	var count int64
@@ -822,13 +854,13 @@ func Count{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) (int64, 
 	return count, nil
 }
 
-// FetchAll{{.Name}}s retrieves a filtered/paginated slice of {{.Name}} records without associations.
+// FetchAll{{.Name}}s retrieves a filtered/paginated slice of {{.Name}} records.
 func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	if db == nil {
 		return nil, errors.New("fetchAll{{.Name}}s: db is nil")
 	}
 
-	clause, args := applyQueryOptions("{{.PK.Column}}", opts...)
+	clause, args, cfg := applyQueryOptions("{{.PK.Column}}", opts...)
 	query := "SELECT {{.AllColumns ""}} FROM {{.Table}}" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -850,256 +882,143 @@ func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{
 		return nil, fmt.Errorf("fetchAll{{.Name}}s: iterating rows: %w", err)
 	}
 
+	{{if .Relations}}
+	if cfg.PreloadAssociations && len(items) > 0 {
+		if err := preload{{.Name}}Associations(ctx, db, items); err != nil {
+			return nil, fmt.Errorf("fetchAll{{.Name}}s: preloading associations: %w", err)
+		}
+	}
+	{{end}}
+
 	return items, nil
 }
+
+{{if .Relations}}
+func preload{{.Name}}Associations(ctx context.Context, db DBTX, items []*{{.ModelPkgAlias}}.{{.Name}}) error {
+	if len(items) == 0 {
+		return nil
+	}
 
 {{range .Relations}}
 {{$target := index $.AllKnownModels .TargetModel}}
 
 {{if eq .Type "HasMany"}}
-// Get{{$.Name}}With{{.FieldName}}ByID fetches a {{$.Name}} and its related {{.FieldName}} (HasMany) by primary key.
-func Get{{$.Name}}With{{.FieldName}}ByID(ctx context.Context, db DBTX, id {{$.PK.Type}}) (*{{$.ModelPkgAlias}}.{{$.Name}}, error) {
-	if db == nil {
-		return nil, errors.New("get{{$.Name}}sWith{{.FieldName}}ByID: db is nil")
-	}
+	// Preload {{.FieldName}} (HasMany)
+	{
+		parentMap := make(map[{{$.PK.Type}}]*{{$.ModelPkgAlias}}.{{$.Name}}, len(items))
+		pkArgs := make([]any, 0, len(items))
+		placeholders := make([]string, 0, len(items))
 
-	const query = ` + "`" + `
-		SELECT 
-			{{$.AllColumns "p"}},
-			{{$target.AllColumns "c"}}
-		FROM {{$.Table}} p
-		LEFT JOIN {{$target.Table}} c ON c.{{.ForeignKey}} = p.{{$.PK.Column}}
-		WHERE p.{{$.PK.Column}} = $1
-	` + "`" + `
-
-	rows, err := db.QueryContext(ctx, query, id)
-	if err != nil {
-		return nil, fmt.Errorf("get{{$.Name}}sWith{{.FieldName}}ByID(%v): %w", id, err)
-	}
-	defer rows.Close()
-
-	var parent *{{$.ModelPkgAlias}}.{{$.Name}}
-	parent = &{{$.ModelPkgAlias}}.{{$.Name}}{}
-	found := false
-
-	for rows.Next() {
-		var p {{$.ModelPkgAlias}}.{{$.Name}}
-
-		{{range $target.SelectableFields}}var child_{{.Name}} {{.BaseType}}
-		{{end}}
-
-		scanArgs := []any{
-			{{$.AllScanArgs "p"}},
-			{{range $target.SelectableFields}}scanNullable(&child_{{.Name}}),
-			{{end}}
+		for _, item := range items {
+			if item != nil {
+				parentMap[item.{{$.PK.Name}}] = item
+				pkArgs = append(pkArgs, item.{{$.PK.Name}})
+				placeholders = append(placeholders, fmt.Sprintf("$%d", len(pkArgs)))
+			}
 		}
 
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("get{{$.Name}}sWith{{.FieldName}}ByID(%v): scanning row: %w", id, err)
-		}
+		if len(pkArgs) > 0 {
+			query := fmt.Sprintf(
+				"SELECT {{$target.AllColumns ""}} FROM {{$target.Table}} WHERE {{.ForeignKey}} IN (%s)",
+				strings.Join(placeholders, ", "),
+			)
+			rows, err := db.QueryContext(ctx, query, pkArgs...)
+			if err != nil {
+				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}}: %w", err)
+			}
+			defer rows.Close()
 
-		if !found {
-			found = true
-			*parent = p
-		}
-
-		if !isZero(child_{{$target.PK.Name}}) {
-			child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-				{{range $target.SelectableFields}}{{.Name}}: child_{{.Name}},
+			for rows.Next() {
+				var child {{$.ModelPkgAlias}}.{{$target.Name}}
+				if err := rows.Scan({{$target.AllScanArgs "child"}}); err != nil {
+					return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} scan: %w", err)
+				}
+				{{$childFKField := $target.FieldByColumn .ForeignKey}}
+				{{if $childFKField}}
+				if parent, ok := parentMap[{{if $childFKField.Nullable}}*{{end}}child.{{$childFKField.Name}}]; ok {
+					parent.{{.FieldName}} = append(parent.{{.FieldName}}, child)
+				}
 				{{end}}
 			}
-			parent.{{.FieldName}} = append(parent.{{.FieldName}}, child)
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("get{{$.Name}}sWith{{.FieldName}}ByID(%v): iterating rows: %w", id, err)
-	}
-	if !found {
-		return nil, fmt.Errorf("get{{$.Name}}sWith{{.FieldName}}ByID(%v): %w", id, sql.ErrNoRows)
-	}
-
-	return parent, nil
-}
-
-// FetchAll{{$.Name}}sWith{{.FieldName}} retrieves a filtered/paginated slice of {{$.Name}} records with their associated {{.FieldName}} (HasMany).
-func FetchAll{{$.Name}}sWith{{.FieldName}}(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{{$.ModelPkgAlias}}.{{$.Name}}, error) {
-	if db == nil {
-		return nil, errors.New("fetchAll{{$.Name}}sWith{{.FieldName}}: db is nil")
-	}
-
-	clause, args := applyQueryOptions("p."+"{{$.PK.Column}}", opts...)
-
-	query := ` + "`" + `
-		WITH p AS (
-			SELECT {{$.AllColumns "p"}}
-			FROM {{$.Table}} p
-	` + "`" + ` + clause + ` + "`" + `
-		)
-		SELECT 
-			{{$.AllColumns "p"}},
-			{{$target.AllColumns "c"}}
-		FROM p
-		LEFT JOIN {{$target.Table}} c ON c.{{.ForeignKey}} = p.{{$.PK.Column}}
-		ORDER BY p.{{$.PK.Column}} ASC
-	` + "`" + `
-
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAll{{$.Name}}sWith{{.FieldName}}: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*{{$.ModelPkgAlias}}.{{$.Name}}
-	var current *{{$.ModelPkgAlias}}.{{$.Name}}
-
-	for rows.Next() {
-		var p {{$.ModelPkgAlias}}.{{$.Name}}
-
-		{{range $target.SelectableFields}}var child_{{.Name}} {{.BaseType}}
-		{{end}}
-
-		scanArgs := []any{
-			{{$.AllScanArgs "p"}},
-			{{range $target.SelectableFields}}scanNullable(&child_{{.Name}}),
-			{{end}}
-		}
-
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("fetchAll{{$.Name}}sWith{{.FieldName}}: scanning row: %w", err)
-		}
-
-		if current == nil || current.{{$.PK.Name}} != p.{{$.PK.Name}} {
-			items = append(items, &p)
-			current = items[len(items)-1]
-		}
-
-		if !isZero(child_{{$target.PK.Name}}) {
-			child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-				{{range $target.SelectableFields}}{{.Name}}: child_{{.Name}},
-				{{end}}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} iteration: %w", err)
 			}
-			current.{{.FieldName}} = append(current.{{.FieldName}}, child)
 		}
 	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("fetchAll{{$.Name}}sWith{{.FieldName}}: iterating rows: %w", err)
-	}
-
-	return items, nil
-}
 {{end}}
 
 {{if eq .Type "BelongsTo"}}
-// Get{{$.Name}}sWith{{.FieldName}}ByID fetches a {{$.Name}} and populates its parent {{.FieldName}} (BelongsTo).
-func Get{{$.Name}}sWith{{.FieldName}}ByID(ctx context.Context, db DBTX, id {{$.PK.Type}}) (*{{$.ModelPkgAlias}}.{{$.Name}}, error) {
-	if db == nil {
-		return nil, errors.New("get{{$.Name}}sWith{{.FieldName}}ByID: db is nil")
-	}
+	// Preload {{.FieldName}} (BelongsTo)
+	{
+		{{$parentFKField := $.FieldByColumn .ForeignKey}}
+		{{if $parentFKField}}
+		fkMap := make(map[{{$target.PK.Type}}][]*{{$.ModelPkgAlias}}.{{$.Name}})
+		fkArgs := make([]any, 0, len(items))
+		placeholders := make([]string, 0, len(items))
+		seenFK := make(map[{{$target.PK.Type}}]bool)
 
-	const query = ` + "`" + `
-		SELECT 
-			{{$.AllColumns "p"}},
-			{{$target.AllColumns "c"}}
-		FROM {{$.Table}} p
-		LEFT JOIN {{$target.Table}} c ON c.{{$target.PK.Column}} = p.{{.ForeignKey}}
-		WHERE p.{{$.PK.Column}} = $1
-	` + "`" + `
-
-	row := db.QueryRowContext(ctx, query, id)
-
-	var p {{$.ModelPkgAlias}}.{{$.Name}}
-	{{range $target.SelectableFields}}var child_{{.Name}} {{.BaseType}}
-	{{end}}
-
-	scanArgs := []any{
-		{{$.AllScanArgs "p"}},
-		{{range $target.SelectableFields}}scanNullable(&child_{{.Name}}),
-		{{end}}
-	}
-
-	if err := row.Scan(scanArgs...); err != nil {
-		return nil, fmt.Errorf("get{{$.Name}}sWith{{.FieldName}}ByID(%v): %w", id, err)
-	}
-
-	if !isZero(child_{{$target.PK.Name}}) {
-		child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-			{{range $target.SelectableFields}}{{.Name}}: child_{{.Name}},
-			{{end}}
-		}
-		{{if .IsPointer}}
-		p.{{.FieldName}} = &child
-		{{else}}
-		p.{{.FieldName}} = child
-		{{end}}
-	}
-
-	return &p, nil
-}
-
-// FetchAll{{$.Name}}sWith{{.FieldName}} retrieves {{$.Name}} records populated with their parent {{.FieldName}} (BelongsTo).
-func FetchAll{{$.Name}}sWith{{.FieldName}}(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{{$.ModelPkgAlias}}.{{$.Name}}, error) {
-	if db == nil {
-		return nil, errors.New("fetchAll{{$.Name}}sWith{{.FieldName}}: db is nil")
-	}
-
-	clause, args := applyQueryOptions("p."+"{{$.PK.Column}}", opts...)
-
-	query := ` + "`" + `
-		SELECT 
-			{{$.AllColumns "p"}},
-			{{$target.AllColumns "c"}}
-		FROM {{$.Table}} p
-		LEFT JOIN {{$target.Table}} c ON c.{{$target.PK.Column}} = p.{{.ForeignKey}}
-	` + "`" + ` + clause
-
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAll{{$.Name}}sWith{{.FieldName}}: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*{{$.ModelPkgAlias}}.{{$.Name}}
-
-	for rows.Next() {
-		var p {{$.ModelPkgAlias}}.{{$.Name}}
-
-		{{range $target.SelectableFields}}var child_{{.Name}} {{.BaseType}}
-		{{end}}
-
-		scanArgs := []any{
-			{{$.AllScanArgs "p"}},
-			{{range $target.SelectableFields}}scanNullable(&child_{{.Name}}),
-			{{end}}
-		}
-
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("fetchAll{{$.Name}}sWith{{.FieldName}}: scanning row: %w", err)
-		}
-
-		if !isZero(child_{{$target.PK.Name}}) {
-			child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-				{{range $target.SelectableFields}}{{.Name}}: child_{{.Name}},
-				{{end}}
+		for _, item := range items {
+			if item == nil {
+				continue
 			}
-			{{if .IsPointer}}
-			p.{{.FieldName}} = &child
+			fkVal := item.{{$parentFKField.Name}}
+			{{if $parentFKField.Nullable}}
+			if fkVal == nil {
+				continue
+			}
+			val := *fkVal
 			{{else}}
-			p.{{.FieldName}} = child
+			val := fkVal
 			{{end}}
+			if isZero(val) {
+				continue
+			}
+			fkMap[val] = append(fkMap[val], item)
+			if !seenFK[val] {
+				seenFK[val] = true
+				fkArgs = append(fkArgs, val)
+				placeholders = append(placeholders, fmt.Sprintf("$%d", len(fkArgs)))
+			}
 		}
 
-		items = append(items, &p)
-	}
+		if len(fkArgs) > 0 {
+			query := fmt.Sprintf(
+				"SELECT {{$target.AllColumns ""}} FROM {{$target.Table}} WHERE {{$target.PK.Column}} IN (%s)",
+				strings.Join(placeholders, ", "),
+			)
+			rows, err := db.QueryContext(ctx, query, fkArgs...)
+			if err != nil {
+				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}}: %w", err)
+			}
+			defer rows.Close()
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("fetchAll{{$.Name}}sWith{{.FieldName}}: iterating rows: %w", err)
+			for rows.Next() {
+				var target {{$.ModelPkgAlias}}.{{$target.Name}}
+				if err := rows.Scan({{$target.AllScanArgs "target"}}); err != nil {
+					return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} scan: %w", err)
+				}
+				if parents, ok := fkMap[target.{{$target.PK.Name}}]; ok {
+					for _, parent := range parents {
+						{{if .IsPointer}}
+						targetCopy := target
+						parent.{{.FieldName}} = &targetCopy
+						{{else}}
+						parent.{{.FieldName}} = target
+						{{end}}
+					}
+				}
+			}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} iteration: %w", err)
+			}
+		}
+		{{end}}
 	}
-
-	return items, nil
-}
 {{end}}
+{{end}}
+
+	return nil
+}
 {{end}}
 
 // Update{{.Name}} updates an existing {{.Name}} record in {{.Table}}.

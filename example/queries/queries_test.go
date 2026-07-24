@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// setupTestDB creates an in-memory SQLite database matching your exact GORM tags.
+// setupTestDB creates an in-memory SQLite database matching the example schema.
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 
@@ -41,7 +41,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 	}
 
 	t.Cleanup(func() {
-		db.Close()
+		_ = db.Close()
 	})
 
 	return db
@@ -58,7 +58,7 @@ func TestInsertAndGetByID(t *testing.T) {
 		CreatedAt: now,
 	}
 
-	// 1. Test Insert
+	// 1. Test InsertUser
 	if err := queries.InsertUser(ctx, db, user); err != nil {
 		t.Fatalf("InsertUser failed: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestInsertAndGetByID(t *testing.T) {
 		t.Fatalf("expected non-zero user ID after insert")
 	}
 
-	// 2. Test GetByID
+	// 2. Test GetUserByID without preloading
 	fetched, err := queries.GetUserByID(ctx, db, user.ID)
 	if err != nil {
 		t.Fatalf("GetUserByID failed: %v", err)
@@ -75,13 +75,32 @@ func TestInsertAndGetByID(t *testing.T) {
 	if fetched.Name != user.Name || fetched.Email != user.Email {
 		t.Errorf("mismatch fetched user: got %+v, want %+v", fetched, user)
 	}
+
+	// 3. Test InsertOrder & GetOrderByID
+	order := &models.Order{
+		UserID: user.ID,
+		Amount: 99.99,
+	}
+	if err := queries.InsertOrder(ctx, db, order); err != nil {
+		t.Fatalf("InsertOrder failed: %v", err)
+	}
+	if order.ID == 0 {
+		t.Fatalf("expected non-zero order ID after insert")
+	}
+
+	fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID)
+	if err != nil {
+		t.Fatalf("GetOrderByID failed: %v", err)
+	}
+	if fetchedOrder.Amount != order.Amount || fetchedOrder.UserID != user.ID {
+		t.Errorf("mismatch fetched order: got %+v, want %+v", fetchedOrder, order)
+	}
 }
 
 func TestExistsAndCount(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	// Seed data
 	users := []*models.User{
 		{Name: "User 1", Email: "u1@test.com"},
 		{Name: "User 2", Email: "u2@test.com"},
@@ -93,7 +112,7 @@ func TestExistsAndCount(t *testing.T) {
 		}
 	}
 
-	// 1. Test ExistsByID
+	// 1. Test ExistsUserByID
 	exists, err := queries.ExistsUserByID(ctx, db, users[0].ID)
 	if err != nil || !exists {
 		t.Errorf("ExistsUserByID returned (%v, %v), want (true, nil)", exists, err)
@@ -104,16 +123,30 @@ func TestExistsAndCount(t *testing.T) {
 		t.Errorf("ExistsUserByID returned (%v, %v), want (false, nil)", notExists, err)
 	}
 
-	// 2. Test Count without options
+	// 2. Test CountUsers without options
 	totalCount, err := queries.CountUsers(ctx, db)
 	if err != nil || totalCount != 3 {
 		t.Errorf("CountUsers total = %d, want 3 (err: %v)", totalCount, err)
 	}
 
-	// 3. Test Count with QueryOptions (WithWhere)
+	// 3. Test CountUsers with WithWhere
 	filteredCount, err := queries.CountUsers(ctx, db, queries.WithWhere("email = $1", "u1@test.com"))
 	if err != nil || filteredCount != 1 {
 		t.Errorf("CountUsers with filter = %d, want 1 (err: %v)", filteredCount, err)
+	}
+
+	// 4. Test ExistsOrderByID & CountOrders
+	order := &models.Order{UserID: users[0].ID, Amount: 15.00}
+	_ = queries.InsertOrder(ctx, db, order)
+
+	orderExists, err := queries.ExistsOrderByID(ctx, db, order.ID)
+	if err != nil || !orderExists {
+		t.Errorf("ExistsOrderByID returned (%v, %v), want (true, nil)", orderExists, err)
+	}
+
+	orderCount, err := queries.CountOrders(ctx, db)
+	if err != nil || orderCount != 1 {
+		t.Errorf("CountOrders total = %d, want 1 (err: %v)", orderCount, err)
 	}
 }
 
@@ -121,7 +154,6 @@ func TestFetchAllWithOptions(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	// Seed 5 users
 	names := []string{"Charlie", "Bob", "Alice", "David", "Eve"}
 	for _, name := range names {
 		_ = queries.InsertUser(ctx, db, &models.User{Name: name, Email: name + "@test.com"})
@@ -143,8 +175,9 @@ func TestFetchAllWithOptions(t *testing.T) {
 		}
 	})
 
-	t.Run("Limit and Offset Pagination", func(t *testing.T) {
+	t.Run("Limit, Offset, and GroupBy", func(t *testing.T) {
 		res, err := queries.FetchAllUsers(ctx, db,
+			queries.WithGroupBy("id"),
 			queries.WithOrderBy("name ASC"),
 			queries.WithLimit(2),
 			queries.WithOffset(1),
@@ -156,25 +189,21 @@ func TestFetchAllWithOptions(t *testing.T) {
 			t.Fatalf("got %d users, want 2", len(res))
 		}
 
-		// Alphabetical: Alice, Bob, Charlie, David, Eve
-		// Offset 1, Limit 2 => Bob, Charlie
 		if res[0].Name != "Bob" || res[1].Name != "Charlie" {
 			t.Errorf("unexpected paginated result: got [%s, %s], want [Bob, Charlie]", res[0].Name, res[1].Name)
 		}
 	})
 }
 
-func TestHasManyRelation(t *testing.T) {
+func TestHasManyRelationPreloading(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	// Seed Parent
 	user := &models.User{Name: "Order Owner", Email: "owner@test.com"}
 	if err := queries.InsertUser(ctx, db, user); err != nil {
 		t.Fatalf("failed to insert user: %v", err)
 	}
 
-	// Seed Children
 	orders := []*models.Order{
 		{UserID: user.ID, Amount: 100.50},
 		{UserID: user.ID, Amount: 49.99},
@@ -185,55 +214,71 @@ func TestHasManyRelation(t *testing.T) {
 		}
 	}
 
-	t.Run("GetUserWithOrdersByID", func(t *testing.T) {
-		fetchedUser, err := queries.GetUserWithOrdersByID(ctx, db, user.ID)
+	t.Run("GetUserByID with PreloadAssociations false (default)", func(t *testing.T) {
+		fetchedUser, err := queries.GetUserByID(ctx, db, user.ID)
 		if err != nil {
-			t.Fatalf("GetUserWithOrdersByID failed: %v", err)
+			t.Fatalf("GetUserByID failed: %v", err)
 		}
-		if len(fetchedUser.Orders) != 2 {
-			t.Fatalf("got %d orders, want 2", len(fetchedUser.Orders))
+		if len(fetchedUser.Orders) != 0 {
+			t.Errorf("expected 0 preloaded orders when disabled, got %d", len(fetchedUser.Orders))
 		}
 	})
 
-	t.Run("FetchAllUsersWithOrders", func(t *testing.T) {
-		usersWithOrders, err := queries.FetchAllUsersWithOrders(ctx, db,
-			queries.WithWhere("p.id = $1", user.ID),
+	t.Run("GetUserByID with PreloadAssociations true", func(t *testing.T) {
+		fetchedUser, err := queries.GetUserByID(ctx, db, user.ID, queries.WithPreloadAssociations(true))
+		if err != nil {
+			t.Fatalf("GetUserByID with preload failed: %v", err)
+		}
+		if len(fetchedUser.Orders) != 2 {
+			t.Fatalf("got %d preloaded orders, want 2", len(fetchedUser.Orders))
+		}
+	})
+
+	t.Run("FetchAllUsers with PreloadAssociations true", func(t *testing.T) {
+		users, err := queries.FetchAllUsers(ctx, db,
+			queries.WithWhere("id = $1", user.ID),
+			queries.WithPreloadAssociations(true),
 		)
 		if err != nil {
-			t.Fatalf("FetchAllUsersWithOrders failed: %v", err)
+			t.Fatalf("FetchAllUsers with preload failed: %v", err)
 		}
-		if len(usersWithOrders) != 1 {
-			t.Fatalf("got %d parent users, want 1", len(usersWithOrders))
+		if len(users) != 1 {
+			t.Fatalf("got %d parent users, want 1", len(users))
 		}
-		if len(usersWithOrders[0].Orders) != 2 {
-			t.Errorf("got %d joined orders, want 2", len(usersWithOrders[0].Orders))
+		if len(users[0].Orders) != 2 {
+			t.Errorf("got %d preloaded orders, want 2", len(users[0].Orders))
 		}
 	})
 }
 
-func TestBelongsToRelation(t *testing.T) {
+func TestBelongsToRelationPreloading(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	// Seed Parent
 	user := &models.User{Name: "Parent User", Email: "parent@test.com"}
 	if err := queries.InsertUser(ctx, db, user); err != nil {
 		t.Fatalf("failed to insert user: %v", err)
 	}
 
-	// Seed Child (Note: Order primary key maps to column 'order_id')
 	order := &models.Order{UserID: user.ID, Amount: 250.00}
 	if err := queries.InsertOrder(ctx, db, order); err != nil {
 		t.Fatalf("failed to insert order: %v", err)
 	}
-	if order.ID == 0 {
-		t.Fatalf("expected non-zero Order.ID (order_id) after insert")
-	}
 
-	t.Run("GetOrdersWithUserByID", func(t *testing.T) {
-		fetchedOrder, err := queries.GetOrdersWithUserByID(ctx, db, order.ID)
+	t.Run("GetOrderByID with PreloadAssociations false (default)", func(t *testing.T) {
+		fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID)
 		if err != nil {
-			t.Fatalf("GetOrdersWithUserByID failed: %v", err)
+			t.Fatalf("GetOrderByID failed: %v", err)
+		}
+		if fetchedOrder.User != nil {
+			t.Errorf("expected order.User to be nil when preloading is false")
+		}
+	})
+
+	t.Run("GetOrderByID with PreloadAssociations true", func(t *testing.T) {
+		fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.WithPreloadAssociations(true))
+		if err != nil {
+			t.Fatalf("GetOrderByID with preload failed: %v", err)
 		}
 		if fetchedOrder.User == nil {
 			t.Fatalf("expected order.User to be populated, got nil")
@@ -243,18 +288,19 @@ func TestBelongsToRelation(t *testing.T) {
 		}
 	})
 
-	t.Run("FetchAllOrdersWithUser", func(t *testing.T) {
-		ordersWithUser, err := queries.FetchAllOrdersWithUser(ctx, db,
-			queries.WithWhere("p.amount > $1", 200.00),
+	t.Run("FetchAllOrders with PreloadAssociations true", func(t *testing.T) {
+		orders, err := queries.FetchAllOrders(ctx, db,
+			queries.WithWhere("amount > $1", 200.00),
+			queries.WithPreloadAssociations(true),
 		)
 		if err != nil {
-			t.Fatalf("FetchAllOrdersWithUser failed: %v", err)
+			t.Fatalf("FetchAllOrders with preload failed: %v", err)
 		}
-		if len(ordersWithUser) != 1 {
-			t.Fatalf("got %d orders, want 1", len(ordersWithUser))
+		if len(orders) != 1 {
+			t.Fatalf("got %d orders, want 1", len(orders))
 		}
-		if ordersWithUser[0].User == nil || ordersWithUser[0].User.ID != user.ID {
-			t.Errorf("BelongsTo user not populated correctly")
+		if orders[0].User == nil || orders[0].User.ID != user.ID {
+			t.Errorf("BelongsTo user not populated correctly during FetchAllOrders")
 		}
 	})
 }
@@ -263,28 +309,53 @@ func TestUpdateAndDelete(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
+	// 1. Test User Update & Delete
 	user := &models.User{Name: "Original Name", Email: "orig@test.com"}
 	_ = queries.InsertUser(ctx, db, user)
 
-	// 1. Update
 	user.Name = "Updated Name"
 	if err := queries.UpdateUser(ctx, db, user); err != nil {
 		t.Fatalf("UpdateUser failed: %v", err)
 	}
 
-	fetched, _ := queries.GetUserByID(ctx, db, user.ID)
-	if fetched.Name != "Updated Name" {
-		t.Errorf("got name %q, want 'Updated Name'", fetched.Name)
+	fetchedUser, _ := queries.GetUserByID(ctx, db, user.ID)
+	if fetchedUser.Name != "Updated Name" {
+		t.Errorf("got name %q, want 'Updated Name'", fetchedUser.Name)
 	}
 
-	// 2. Delete
 	if err := queries.DeleteUser(ctx, db, user.ID); err != nil {
 		t.Fatalf("DeleteUser failed: %v", err)
 	}
 
-	exists, _ := queries.ExistsUserByID(ctx, db, user.ID)
-	if exists {
+	userExists, _ := queries.ExistsUserByID(ctx, db, user.ID)
+	if userExists {
 		t.Errorf("expected user to be deleted, but still exists")
+	}
+
+	// 2. Test Order Update & Delete
+	newUser := &models.User{Name: "Order User", Email: "ou@test.com"}
+	_ = queries.InsertUser(ctx, db, newUser)
+
+	order := &models.Order{UserID: newUser.ID, Amount: 10.00}
+	_ = queries.InsertOrder(ctx, db, order)
+
+	order.Amount = 20.00
+	if err := queries.UpdateOrder(ctx, db, order); err != nil {
+		t.Fatalf("UpdateOrder failed: %v", err)
+	}
+
+	fetchedOrder, _ := queries.GetOrderByID(ctx, db, order.ID)
+	if fetchedOrder.Amount != 20.00 {
+		t.Errorf("got amount %f, want 20.00", fetchedOrder.Amount)
+	}
+
+	if err := queries.DeleteOrder(ctx, db, order.ID); err != nil {
+		t.Fatalf("DeleteOrder failed: %v", err)
+	}
+
+	orderExists, _ := queries.ExistsOrderByID(ctx, db, order.ID)
+	if orderExists {
+		t.Errorf("expected order to be deleted, but still exists")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
 )
@@ -32,10 +33,12 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 }
 
 // GetUserByID retrieves a single User record from users by its primary key.
-func GetUserByID(ctx context.Context, db DBTX, id int64) (*models.User, error) {
+func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*models.User, error) {
 	if db == nil {
 		return nil, errors.New("getUserByID: db is nil")
 	}
+
+	cfg := parseQueryOptions(opts...)
 
 	const query = `
 		SELECT id, name, email, created_at
@@ -48,6 +51,13 @@ func GetUserByID(ctx context.Context, db DBTX, id int64) (*models.User, error) {
 	if err := row.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt); err != nil {
 		return nil, fmt.Errorf("getUserByID(%v): %w", id, err)
 	}
+
+	if cfg.PreloadAssociations {
+		if err := preloadUserAssociations(ctx, db, []*models.User{&m}); err != nil {
+			return nil, fmt.Errorf("getUserByID(%v): preloading associations: %w", id, err)
+		}
+	}
+
 	return &m, nil
 }
 
@@ -72,7 +82,7 @@ func CountUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 		return 0, errors.New("countUsers: db is nil")
 	}
 
-	clause, args := applyQueryOptions("", opts...)
+	clause, args, _ := applyQueryOptions("", opts...)
 	query := "SELECT COUNT(*) FROM users" + clause
 
 	var count int64
@@ -82,13 +92,13 @@ func CountUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 	return count, nil
 }
 
-// FetchAllUsers retrieves a filtered/paginated slice of User records without associations.
+// FetchAllUsers retrieves a filtered/paginated slice of User records.
 func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models.User, error) {
 	if db == nil {
 		return nil, errors.New("fetchAllUsers: db is nil")
 	}
 
-	clause, args := applyQueryOptions("id", opts...)
+	clause, args, cfg := applyQueryOptions("id", opts...)
 	query := "SELECT id, name, email, created_at FROM users" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -110,146 +120,63 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 		return nil, fmt.Errorf("fetchAllUsers: iterating rows: %w", err)
 	}
 
+	if cfg.PreloadAssociations && len(items) > 0 {
+		if err := preloadUserAssociations(ctx, db, items); err != nil {
+			return nil, fmt.Errorf("fetchAllUsers: preloading associations: %w", err)
+		}
+	}
+
 	return items, nil
 }
 
-// GetUserWithOrdersByID fetches a User and its related Orders (HasMany) by primary key.
-func GetUserWithOrdersByID(ctx context.Context, db DBTX, id int64) (*models.User, error) {
-	if db == nil {
-		return nil, errors.New("getUsersWithOrdersByID: db is nil")
+func preloadUserAssociations(ctx context.Context, db DBTX, items []*models.User) error {
+	if len(items) == 0 {
+		return nil
 	}
 
-	const query = `
-		SELECT 
-			p.id, p.name, p.email, p.created_at,
-			c.order_id, c.user_id, c.amount
-		FROM users p
-		LEFT JOIN orders c ON c.user_id = p.id
-		WHERE p.id = $1
-	`
+	// Preload Orders (HasMany)
+	{
+		parentMap := make(map[int64]*models.User, len(items))
+		pkArgs := make([]any, 0, len(items))
+		placeholders := make([]string, 0, len(items))
 
-	rows, err := db.QueryContext(ctx, query, id)
-	if err != nil {
-		return nil, fmt.Errorf("getUsersWithOrdersByID(%v): %w", id, err)
-	}
-	defer rows.Close()
-
-	var parent *models.User
-	parent = &models.User{}
-	found := false
-
-	for rows.Next() {
-		var p models.User
-
-		var child_ID int64
-		var child_UserID int64
-		var child_Amount float64
-
-		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, &p.CreatedAt,
-			scanNullable(&child_ID),
-			scanNullable(&child_UserID),
-			scanNullable(&child_Amount),
-		}
-
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("getUsersWithOrdersByID(%v): scanning row: %w", id, err)
-		}
-
-		if !found {
-			found = true
-			*parent = p
-		}
-
-		if !isZero(child_ID) {
-			child := models.Order{
-				ID:     child_ID,
-				UserID: child_UserID,
-				Amount: child_Amount,
+		for _, item := range items {
+			if item != nil {
+				parentMap[item.ID] = item
+				pkArgs = append(pkArgs, item.ID)
+				placeholders = append(placeholders, fmt.Sprintf("$%d", len(pkArgs)))
 			}
-			parent.Orders = append(parent.Orders, child)
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("getUsersWithOrdersByID(%v): iterating rows: %w", id, err)
-	}
-	if !found {
-		return nil, fmt.Errorf("getUsersWithOrdersByID(%v): %w", id, sql.ErrNoRows)
-	}
-
-	return parent, nil
-}
-
-// FetchAllUsersWithOrders retrieves a filtered/paginated slice of User records with their associated Orders (HasMany).
-func FetchAllUsersWithOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models.User, error) {
-	if db == nil {
-		return nil, errors.New("fetchAllUsersWithOrders: db is nil")
-	}
-
-	clause, args := applyQueryOptions("p."+"id", opts...)
-
-	query := `
-		WITH p AS (
-			SELECT p.id, p.name, p.email, p.created_at
-			FROM users p
-	` + clause + `
-		)
-		SELECT 
-			p.id, p.name, p.email, p.created_at,
-			c.order_id, c.user_id, c.amount
-		FROM p
-		LEFT JOIN orders c ON c.user_id = p.id
-		ORDER BY p.id ASC
-	`
-
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAllUsersWithOrders: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*models.User
-	var current *models.User
-
-	for rows.Next() {
-		var p models.User
-
-		var child_ID int64
-		var child_UserID int64
-		var child_Amount float64
-
-		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, &p.CreatedAt,
-			scanNullable(&child_ID),
-			scanNullable(&child_UserID),
-			scanNullable(&child_Amount),
 		}
 
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("fetchAllUsersWithOrders: scanning row: %w", err)
-		}
-
-		if current == nil || current.ID != p.ID {
-			items = append(items, &p)
-			current = items[len(items)-1]
-		}
-
-		if !isZero(child_ID) {
-			child := models.Order{
-				ID:     child_ID,
-				UserID: child_UserID,
-				Amount: child_Amount,
+		if len(pkArgs) > 0 {
+			query := fmt.Sprintf(
+				"SELECT order_id, user_id, amount FROM orders WHERE user_id IN (%s)",
+				strings.Join(placeholders, ", "),
+			)
+			rows, err := db.QueryContext(ctx, query, pkArgs...)
+			if err != nil {
+				return fmt.Errorf("preload User.Orders: %w", err)
 			}
-			current.Orders = append(current.Orders, child)
+			defer rows.Close()
+
+			for rows.Next() {
+				var child models.Order
+				if err := rows.Scan(&child.ID, &child.UserID, &child.Amount); err != nil {
+					return fmt.Errorf("preload User.Orders scan: %w", err)
+				}
+
+				if parent, ok := parentMap[child.UserID]; ok {
+					parent.Orders = append(parent.Orders, child)
+				}
+
+			}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("preload User.Orders iteration: %w", err)
+			}
 		}
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("fetchAllUsersWithOrders: iterating rows: %w", err)
-	}
-
-	return items, nil
+	return nil
 }
 
 // UpdateUser updates an existing User record in users.
