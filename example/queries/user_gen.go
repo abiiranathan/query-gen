@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
 )
@@ -40,6 +39,10 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 
 	cfg := parseQueryOptions(opts...)
 
+	if cfg.PreloadAssociations {
+		return getUserByIDWithRelations(ctx, db, id, cfg)
+	}
+
 	const query = `
 		SELECT id, name, email, created_at
 		FROM users
@@ -50,12 +53,6 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 	var m models.User
 	if err := row.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt); err != nil {
 		return nil, fmt.Errorf("getUserByID(%v): %w", id, err)
-	}
-
-	if cfg.PreloadAssociations {
-		if err := preloadUserAssociations(ctx, db, []*models.User{&m}); err != nil {
-			return nil, fmt.Errorf("getUserByID(%v): preloading associations: %w", id, err)
-		}
 	}
 
 	return &m, nil
@@ -99,6 +96,11 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 	}
 
 	clause, args, cfg := applyQueryOptions("id", opts...)
+
+	if cfg.PreloadAssociations {
+		return fetchAllUsersWithRelations(ctx, db, clause, args)
+	}
+
 	query := "SELECT id, name, email, created_at FROM users" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -120,63 +122,152 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 		return nil, fmt.Errorf("fetchAllUsers: iterating rows: %w", err)
 	}
 
-	if cfg.PreloadAssociations && len(items) > 0 {
-		if err := preloadUserAssociations(ctx, db, items); err != nil {
-			return nil, fmt.Errorf("fetchAllUsers: preloading associations: %w", err)
-		}
-	}
-
 	return items, nil
 }
 
-func preloadUserAssociations(ctx context.Context, db DBTX, items []*models.User) error {
-	if len(items) == 0 {
-		return nil
+func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.User, error) {
+	const query = `
+		SELECT 
+			p.id, p.name, p.email, p.created_at, r0.order_id, r0.user_id, r0.amount
+		FROM users p
+		LEFT JOIN orders r0 ON r0.user_id = p.id
+		WHERE p.id = $1
+	`
+
+	rows, err := db.QueryContext(ctx, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("getUserByIDWithRelations(%v): %w", id, err)
 	}
+	defer rows.Close()
 
-	// Preload Orders (HasMany)
-	{
-		parentMap := make(map[int64]*models.User, len(items))
-		pkArgs := make([]any, 0, len(items))
-		placeholders := make([]string, 0, len(items))
+	var parent *models.User
 
-		for _, item := range items {
-			if item != nil {
-				parentMap[item.ID] = item
-				pkArgs = append(pkArgs, item.ID)
-				placeholders = append(placeholders, fmt.Sprintf("$%d", len(pkArgs)))
+	seen_Orders := make(map[int64]bool)
+
+	for rows.Next() {
+		var p models.User
+
+		var r0_ID int64
+		var r0_UserID int64
+		var r0_Amount float64
+
+		scanArgs := []any{
+			&p.ID, &p.Name, &p.Email, &p.CreatedAt,
+
+			scanNullable(&r0_ID),
+			scanNullable(&r0_UserID),
+			scanNullable(&r0_Amount),
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("getUserByIDWithRelations(%v): scanning row: %w", id, err)
+		}
+
+		if parent == nil {
+			parent = &p
+		}
+
+		if !isZero(r0_ID) {
+			if !seen_Orders[r0_ID] {
+				seen_Orders[r0_ID] = true
+				child := models.Order{
+					ID:     r0_ID,
+					UserID: r0_UserID,
+					Amount: r0_Amount,
+				}
+
+				parent.Orders = append(parent.Orders, child)
+
 			}
 		}
 
-		if len(pkArgs) > 0 {
-			query := fmt.Sprintf(
-				"SELECT order_id, user_id, amount FROM orders WHERE user_id IN (%s)",
-				strings.Join(placeholders, ", "),
-			)
-			rows, err := db.QueryContext(ctx, query, pkArgs...)
-			if err != nil {
-				return fmt.Errorf("preload User.Orders: %w", err)
-			}
-			defer rows.Close()
-
-			for rows.Next() {
-				var child models.Order
-				if err := rows.Scan(&child.ID, &child.UserID, &child.Amount); err != nil {
-					return fmt.Errorf("preload User.Orders scan: %w", err)
-				}
-
-				if parent, ok := parentMap[child.UserID]; ok {
-					parent.Orders = append(parent.Orders, child)
-				}
-
-			}
-			if err := rows.Err(); err != nil {
-				return fmt.Errorf("preload User.Orders iteration: %w", err)
-			}
-		}
 	}
 
-	return nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("getUserByIDWithRelations(%v): iterating rows: %w", id, err)
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("getUserByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+	}
+
+	return parent, nil
+}
+
+func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.User, error) {
+	query := `
+		WITH p AS (
+			SELECT p.id, p.name, p.email, p.created_at
+			FROM users p
+	` + clause + `
+		)
+		SELECT 
+			p.id, p.name, p.email, p.created_at, r0.order_id, r0.user_id, r0.amount
+		FROM p
+		LEFT JOIN orders r0 ON r0.user_id = p.id
+		ORDER BY p.id ASC
+	`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAllUsersWithRelations: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.User
+	itemsMap := make(map[int64]*models.User)
+
+	seen_Orders := make(map[int64]map[int64]bool)
+
+	for rows.Next() {
+		var p models.User
+
+		var r0_ID int64
+		var r0_UserID int64
+		var r0_Amount float64
+
+		scanArgs := []any{
+			&p.ID, &p.Name, &p.Email, &p.CreatedAt,
+
+			scanNullable(&r0_ID),
+			scanNullable(&r0_UserID),
+			scanNullable(&r0_Amount),
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("fetchAllUsersWithRelations: scanning row: %w", err)
+		}
+
+		parent, exists := itemsMap[p.ID]
+		if !exists {
+			parent = &p
+			itemsMap[p.ID] = parent
+			items = append(items, parent)
+
+			seen_Orders[p.ID] = make(map[int64]bool)
+
+		}
+
+		if !isZero(r0_ID) {
+			if !seen_Orders[parent.ID][r0_ID] {
+				seen_Orders[parent.ID][r0_ID] = true
+				child := models.Order{
+					ID:     r0_ID,
+					UserID: r0_UserID,
+					Amount: r0_Amount,
+				}
+
+				parent.Orders = append(parent.Orders, child)
+
+			}
+		}
+
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetchAllUsersWithRelations: iterating rows: %w", err)
+	}
+
+	return items, nil
 }
 
 // UpdateUser updates an existing User record in users.

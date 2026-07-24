@@ -55,24 +55,24 @@ const (
 // Relation describes a HasMany or BelongsTo association discovered on a
 // model, used to execute association preloading when requested.
 type Relation struct {
-	FieldName   string // Struct field name on the parent, e.g. "User" or "Orders".
-	TargetModel string // Related model type name, e.g. "User" or "Order".
-	Type        RelationType
-	ForeignKey  string // Column name storing the reference ID.
-	References  string // Column name being referenced.
-	IsPointer   bool   // True if the field is a pointer (*User vs User).
+	FieldName   string       // Struct field name on the parent, e.g. "User" or "Orders".
+	TargetModel string       // Related model type name, e.g. "User" or "Order".
+	Type        RelationType // Cardinality type: HasMany or BelongsTo.
+	ForeignKey  string       // Column name storing the reference ID.
+	References  string       // Column name being referenced.
+	IsPointer   bool         // True if the field is a pointer (*User vs User).
 }
 
 // Field describes a single scalar struct field mapped to a database column,
 // including its nullability and read/write permission derived from GORM tags.
 type Field struct {
-	Name       string // Go struct field name, e.g. "Email".
-	Type       string // Go type as written in source, e.g. "string" or "*string".
-	Column     string // Database column name, e.g. "email".
-	IsPK       bool   // True if this field is the primary key.
-	IsIgnore   bool   // True if the field is excluded entirely (gorm:"-").
-	Nullable   bool   // True if the column may return SQL NULL (gorm:"null" or a pointer type).
-	Permission Permission
+	Name       string     // Go struct field name, e.g. "Email".
+	Type       string     // Go type as written in source, e.g. "string" or "*string".
+	Column     string     // Database column name, e.g. "email".
+	IsPK       bool       // True if this field is the primary key.
+	IsIgnore   bool       // True if the field is excluded entirely (gorm:"-").
+	Nullable   bool       // True if the column may return SQL NULL (gorm:"null" or a pointer type).
+	Permission Permission // Read/write visibility permission.
 }
 
 // Writable reports whether this field should appear in an INSERT statement.
@@ -101,14 +101,14 @@ func (f Field) BaseType() string {
 // generated CRUD query file: table name, columns, primary key, and any
 // HasMany/BelongsTo relations to other known models.
 type Model struct {
-	Package        string // Generated package name, e.g. "queries".
-	ModelPkg       string // Full import path of the source models package.
-	ModelPkgAlias  string // Import alias for the source models package, e.g. "models".
-	Name           string // Go type name, e.g. "User".
-	Table          string // Database table name, e.g. "users".
-	Fields         []Field
-	PK             *Field
-	Relations      []Relation
+	Package        string           // Generated package name, e.g. "queries".
+	ModelPkg       string           // Full import path of the source models package.
+	ModelPkgAlias  string           // Import alias for the source models package, e.g. "models".
+	Name           string           // Go type name, e.g. "User".
+	Table          string           // Database table name, e.g. "users".
+	Fields         []Field          // List of scalar database fields.
+	PK             *Field           // Primary key field reference.
+	Relations      []Relation       // Discovered HasMany and BelongsTo relations.
 	AllKnownModels map[string]Model // All models in the parsed package, keyed by type name.
 }
 
@@ -230,6 +230,46 @@ func (m Model) UpdatableScanArgs(varName string) string {
 		args[i] = fmt.Sprintf("&%s.%s", varName, f.Name)
 	}
 	return strings.Join(args, ", ")
+}
+
+// AllRelationColumns returns a comma-separated list of SELECT columns for all model relations.
+func (m Model) AllRelationColumns() string {
+	var cols []string
+	for i, rel := range m.Relations {
+		alias := fmt.Sprintf("r%d", i)
+		target, ok := m.AllKnownModels[rel.TargetModel]
+		if !ok {
+			continue
+		}
+		for _, f := range target.SelectableFields() {
+			cols = append(cols, fmt.Sprintf("%s.%s", alias, f.Column))
+		}
+	}
+	if len(cols) == 0 {
+		return ""
+	}
+	return ", " + strings.Join(cols, ", ")
+}
+
+// AllRelationJoins returns the combined LEFT JOIN SQL statements for all model relations.
+func (m Model) AllRelationJoins(parentPrefix string) string {
+	var joins []string
+	for i, rel := range m.Relations {
+		alias := fmt.Sprintf("r%d", i)
+		target, ok := m.AllKnownModels[rel.TargetModel]
+		if !ok {
+			continue
+		}
+		switch rel.Type {
+		case RelHasMany:
+			joins = append(joins, fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
+				target.Table, alias, alias, rel.ForeignKey, parentPrefix, m.PK.Column))
+		case RelBelongsTo:
+			joins = append(joins, fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
+				target.Table, alias, alias, target.PK.Column, parentPrefix, rel.ForeignKey))
+		}
+	}
+	return strings.Join(joins, "\n\t\t")
 }
 
 func main() {
@@ -766,7 +806,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
 	"{{.ModelPkg}}"
 )
@@ -800,6 +839,12 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...Que
 
 	cfg := parseQueryOptions(opts...)
 
+	{{if .Relations}}
+	if cfg.PreloadAssociations {
+		return get{{.Name}}ByIDWithRelations(ctx, db, id, cfg)
+	}
+	{{end}}
+
 	const query = ` + "`" + `
 		SELECT {{.AllColumns ""}}
 		FROM {{.Table}}
@@ -811,14 +856,6 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...Que
 	if err := row.Scan({{.AllScanArgs "m"}}); err != nil {
 		return nil, fmt.Errorf("get{{.Name}}ByID(%v): %w", id, err)
 	}
-
-	{{if .Relations}}
-	if cfg.PreloadAssociations {
-		if err := preload{{.Name}}Associations(ctx, db, []*{{.ModelPkgAlias}}.{{.Name}}{&m}); err != nil {
-			return nil, fmt.Errorf("get{{.Name}}ByID(%v): preloading associations: %w", id, err)
-		}
-	}
-	{{end}}
 
 	return &m, nil
 }
@@ -861,6 +898,13 @@ func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{
 	}
 
 	clause, args, cfg := applyQueryOptions("{{.PK.Column}}", opts...)
+
+	{{if .Relations}}
+	if cfg.PreloadAssociations {
+		return fetchAll{{.Name}}sWithRelations(ctx, db, clause, args)
+	}
+	{{end}}
+
 	query := "SELECT {{.AllColumns ""}} FROM {{.Table}}" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -882,142 +926,181 @@ func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{
 		return nil, fmt.Errorf("fetchAll{{.Name}}s: iterating rows: %w", err)
 	}
 
-	{{if .Relations}}
-	if cfg.PreloadAssociations && len(items) > 0 {
-		if err := preload{{.Name}}Associations(ctx, db, items); err != nil {
-			return nil, fmt.Errorf("fetchAll{{.Name}}s: preloading associations: %w", err)
-		}
-	}
-	{{end}}
-
 	return items, nil
 }
 
 {{if .Relations}}
-func preload{{.Name}}Associations(ctx context.Context, db DBTX, items []*{{.ModelPkgAlias}}.{{.Name}}) error {
-	if len(items) == 0 {
-		return nil
+func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+	const query = ` + "`" + `
+		SELECT 
+			{{.AllColumns "p"}}{{.AllRelationColumns}}
+		FROM {{.Table}} p
+		{{.AllRelationJoins "p"}}
+		WHERE p.{{.PK.Column}} = $1
+	` + "`" + `
+
+	rows, err := db.QueryContext(ctx, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", id, err)
 	}
+	defer rows.Close()
 
-{{range .Relations}}
-{{$target := index $.AllKnownModels .TargetModel}}
+	var parent *{{.ModelPkgAlias}}.{{.Name}}
 
-{{if eq .Type "HasMany"}}
-	// Preload {{.FieldName}} (HasMany)
-	{
-		parentMap := make(map[{{$.PK.Type}}]*{{$.ModelPkgAlias}}.{{$.Name}}, len(items))
-		pkArgs := make([]any, 0, len(items))
-		placeholders := make([]string, 0, len(items))
+	{{range $idx, $rel := .Relations}}
+	{{$target := index $.AllKnownModels $rel.TargetModel}}
+	seen_{{$rel.FieldName}} := make(map[{{$target.PK.Type}}]bool)
+	{{end}}
 
-		for _, item := range items {
-			if item != nil {
-				parentMap[item.{{$.PK.Name}}] = item
-				pkArgs = append(pkArgs, item.{{$.PK.Name}})
-				placeholders = append(placeholders, fmt.Sprintf("$%d", len(pkArgs)))
-			}
-		}
+	for rows.Next() {
+		var p {{.ModelPkgAlias}}.{{.Name}}
 
-		if len(pkArgs) > 0 {
-			query := fmt.Sprintf(
-				"SELECT {{$target.AllColumns ""}} FROM {{$target.Table}} WHERE {{.ForeignKey}} IN (%s)",
-				strings.Join(placeholders, ", "),
-			)
-			rows, err := db.QueryContext(ctx, query, pkArgs...)
-			if err != nil {
-				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}}: %w", err)
-			}
-			defer rows.Close()
+		{{range $idx, $rel := .Relations}}
+		{{$target := index $.AllKnownModels $rel.TargetModel}}
+		{{range $target.SelectableFields}}var r{{$idx}}_{{.Name}} {{.BaseType}}
+		{{end}}
+		{{end}}
 
-			for rows.Next() {
-				var child {{$.ModelPkgAlias}}.{{$target.Name}}
-				if err := rows.Scan({{$target.AllScanArgs "child"}}); err != nil {
-					return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} scan: %w", err)
-				}
-				{{$childFKField := $target.FieldByColumn .ForeignKey}}
-				{{if $childFKField}}
-				if parent, ok := parentMap[{{if $childFKField.Nullable}}*{{end}}child.{{$childFKField.Name}}]; ok {
-					parent.{{.FieldName}} = append(parent.{{.FieldName}}, child)
-				}
-				{{end}}
-			}
-			if err := rows.Err(); err != nil {
-				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} iteration: %w", err)
-			}
-		}
-	}
-{{end}}
-
-{{if eq .Type "BelongsTo"}}
-	// Preload {{.FieldName}} (BelongsTo)
-	{
-		{{$parentFKField := $.FieldByColumn .ForeignKey}}
-		{{if $parentFKField}}
-		fkMap := make(map[{{$target.PK.Type}}][]*{{$.ModelPkgAlias}}.{{$.Name}})
-		fkArgs := make([]any, 0, len(items))
-		placeholders := make([]string, 0, len(items))
-		seenFK := make(map[{{$target.PK.Type}}]bool)
-
-		for _, item := range items {
-			if item == nil {
-				continue
-			}
-			fkVal := item.{{$parentFKField.Name}}
-			{{if $parentFKField.Nullable}}
-			if fkVal == nil {
-				continue
-			}
-			val := *fkVal
-			{{else}}
-			val := fkVal
+		scanArgs := []any{
+			{{.AllScanArgs "p"}},
+			{{range $idx, $rel := .Relations}}
+			{{$target := index $.AllKnownModels $rel.TargetModel}}
+			{{range $target.SelectableFields}}scanNullable(&r{{$idx}}_{{.Name}}),
 			{{end}}
-			if isZero(val) {
-				continue
-			}
-			fkMap[val] = append(fkMap[val], item)
-			if !seenFK[val] {
-				seenFK[val] = true
-				fkArgs = append(fkArgs, val)
-				placeholders = append(placeholders, fmt.Sprintf("$%d", len(fkArgs)))
-			}
+			{{end}}
 		}
 
-		if len(fkArgs) > 0 {
-			query := fmt.Sprintf(
-				"SELECT {{$target.AllColumns ""}} FROM {{$target.Table}} WHERE {{$target.PK.Column}} IN (%s)",
-				strings.Join(placeholders, ", "),
-			)
-			rows, err := db.QueryContext(ctx, query, fkArgs...)
-			if err != nil {
-				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}}: %w", err)
-			}
-			defer rows.Close()
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): scanning row: %w", id, err)
+		}
 
-			for rows.Next() {
-				var target {{$.ModelPkgAlias}}.{{$target.Name}}
-				if err := rows.Scan({{$target.AllScanArgs "target"}}); err != nil {
-					return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} scan: %w", err)
+		if parent == nil {
+			parent = &p
+		}
+
+		{{range $idx, $rel := .Relations}}
+		{{$target := index $.AllKnownModels $rel.TargetModel}}
+		if !isZero(r{{$idx}}_{{$target.PK.Name}}) {
+			if !seen_{{$rel.FieldName}}[r{{$idx}}_{{$target.PK.Name}}] {
+				seen_{{$rel.FieldName}}[r{{$idx}}_{{$target.PK.Name}}] = true
+				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
+					{{range $target.SelectableFields}}{{.Name}}: r{{$idx}}_{{.Name}},
+					{{end}}
 				}
-				if parents, ok := fkMap[target.{{$target.PK.Name}}]; ok {
-					for _, parent := range parents {
-						{{if .IsPointer}}
-						targetCopy := target
-						parent.{{.FieldName}} = &targetCopy
-						{{else}}
-						parent.{{.FieldName}} = target
-						{{end}}
-					}
-				}
-			}
-			if err := rows.Err(); err != nil {
-				return fmt.Errorf("preload {{$.Name}}.{{.FieldName}} iteration: %w", err)
+				{{if eq $rel.Type "HasMany"}}
+				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, child)
+				{{else if eq $rel.Type "BelongsTo"}}
+				{{if $rel.IsPointer}}
+				parent.{{$rel.FieldName}} = &child
+				{{else}}
+				parent.{{$rel.FieldName}} = child
+				{{end}}
+				{{end}}
 			}
 		}
 		{{end}}
 	}
-{{end}}
-{{end}}
 
-	return nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): iterating rows: %w", id, err)
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+	}
+
+	return parent, nil
+}
+
+func fetchAll{{.Name}}sWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*{{.ModelPkgAlias}}.{{.Name}}, error) {
+	query := ` + "`" + `
+		WITH p AS (
+			SELECT {{.AllColumns "p"}}
+			FROM {{.Table}} p
+	` + "`" + ` + clause + ` + "`" + `
+		)
+		SELECT 
+			{{.AllColumns "p"}}{{.AllRelationColumns}}
+		FROM p
+		{{.AllRelationJoins "p"}}
+		ORDER BY p.{{.PK.Column}} ASC
+	` + "`" + `
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAll{{.Name}}sWithRelations: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*{{.ModelPkgAlias}}.{{.Name}}
+	itemsMap := make(map[{{.PK.Type}}]*{{.ModelPkgAlias}}.{{.Name}})
+
+	{{range $idx, $rel := .Relations}}
+	{{$target := index $.AllKnownModels $rel.TargetModel}}
+	seen_{{$rel.FieldName}} := make(map[{{$.PK.Type}}]map[{{$target.PK.Type}}]bool)
+	{{end}}
+
+	for rows.Next() {
+		var p {{.ModelPkgAlias}}.{{.Name}}
+
+		{{range $idx, $rel := .Relations}}
+		{{$target := index $.AllKnownModels $rel.TargetModel}}
+		{{range $target.SelectableFields}}var r{{$idx}}_{{.Name}} {{.BaseType}}
+		{{end}}
+		{{end}}
+
+		scanArgs := []any{
+			{{.AllScanArgs "p"}},
+			{{range $idx, $rel := .Relations}}
+			{{$target := index $.AllKnownModels $rel.TargetModel}}
+			{{range $target.SelectableFields}}scanNullable(&r{{$idx}}_{{.Name}}),
+			{{end}}
+			{{end}}
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("fetchAll{{.Name}}sWithRelations: scanning row: %w", err)
+		}
+
+		parent, exists := itemsMap[p.{{.PK.Name}}]
+		if !exists {
+			parent = &p
+			itemsMap[p.{{.PK.Name}}] = parent
+			items = append(items, parent)
+
+			{{range $idx, $rel := .Relations}}
+			{{$target := index $.AllKnownModels $rel.TargetModel}}
+			seen_{{$rel.FieldName}}[p.{{$.PK.Name}}] = make(map[{{$target.PK.Type}}]bool)
+			{{end}}
+		}
+
+		{{range $idx, $rel := .Relations}}
+		{{$target := index $.AllKnownModels $rel.TargetModel}}
+		if !isZero(r{{$idx}}_{{$target.PK.Name}}) {
+			if !seen_{{$rel.FieldName}}[parent.{{$.PK.Name}}][r{{$idx}}_{{$target.PK.Name}}] {
+				seen_{{$rel.FieldName}}[parent.{{$.PK.Name}}][r{{$idx}}_{{$target.PK.Name}}] = true
+				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
+					{{range $target.SelectableFields}}{{.Name}}: r{{$idx}}_{{.Name}},
+					{{end}}
+				}
+				{{if eq $rel.Type "HasMany"}}
+				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, child)
+				{{else if eq $rel.Type "BelongsTo"}}
+				{{if $rel.IsPointer}}
+				parent.{{$rel.FieldName}} = &child
+				{{else}}
+				parent.{{$rel.FieldName}} = child
+				{{end}}
+				{{end}}
+			}
+		}
+		{{end}}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetchAll{{.Name}}sWithRelations: iterating rows: %w", err)
+	}
+
+	return items, nil
 }
 {{end}}
 

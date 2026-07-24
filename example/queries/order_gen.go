@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
+	"time"
 
 	"github.com/abiiranathan/query-gen/example/models"
 )
@@ -40,6 +40,10 @@ func GetOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (
 
 	cfg := parseQueryOptions(opts...)
 
+	if cfg.PreloadAssociations {
+		return getOrderByIDWithRelations(ctx, db, id, cfg)
+	}
+
 	const query = `
 		SELECT order_id, user_id, amount
 		FROM orders
@@ -50,12 +54,6 @@ func GetOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (
 	var m models.Order
 	if err := row.Scan(&m.ID, &m.UserID, &m.Amount); err != nil {
 		return nil, fmt.Errorf("getOrderByID(%v): %w", id, err)
-	}
-
-	if cfg.PreloadAssociations {
-		if err := preloadOrderAssociations(ctx, db, []*models.Order{&m}); err != nil {
-			return nil, fmt.Errorf("getOrderByID(%v): preloading associations: %w", id, err)
-		}
 	}
 
 	return &m, nil
@@ -99,6 +97,11 @@ func FetchAllOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*model
 	}
 
 	clause, args, cfg := applyQueryOptions("order_id", opts...)
+
+	if cfg.PreloadAssociations {
+		return fetchAllOrdersWithRelations(ctx, db, clause, args)
+	}
+
 	query := "SELECT order_id, user_id, amount FROM orders" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -120,80 +123,158 @@ func FetchAllOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*model
 		return nil, fmt.Errorf("fetchAllOrders: iterating rows: %w", err)
 	}
 
-	if cfg.PreloadAssociations && len(items) > 0 {
-		if err := preloadOrderAssociations(ctx, db, items); err != nil {
-			return nil, fmt.Errorf("fetchAllOrders: preloading associations: %w", err)
-		}
-	}
-
 	return items, nil
 }
 
-func preloadOrderAssociations(ctx context.Context, db DBTX, items []*models.Order) error {
-	if len(items) == 0 {
-		return nil
+func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Order, error) {
+	const query = `
+		SELECT 
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at
+		FROM orders p
+		LEFT JOIN users r0 ON r0.id = p.user_id
+		WHERE p.order_id = $1
+	`
+
+	rows, err := db.QueryContext(ctx, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("getOrderByIDWithRelations(%v): %w", id, err)
 	}
+	defer rows.Close()
 
-	// Preload User (BelongsTo)
-	{
+	var parent *models.Order
 
-		fkMap := make(map[int64][]*models.Order)
-		fkArgs := make([]any, 0, len(items))
-		placeholders := make([]string, 0, len(items))
-		seenFK := make(map[int64]bool)
+	seen_User := make(map[int64]bool)
 
-		for _, item := range items {
-			if item == nil {
-				continue
-			}
-			fkVal := item.UserID
+	for rows.Next() {
+		var p models.Order
 
-			val := fkVal
+		var r0_ID int64
+		var r0_Name string
+		var r0_Email string
+		var r0_CreatedAt time.Time
 
-			if isZero(val) {
-				continue
-			}
-			fkMap[val] = append(fkMap[val], item)
-			if !seenFK[val] {
-				seenFK[val] = true
-				fkArgs = append(fkArgs, val)
-				placeholders = append(placeholders, fmt.Sprintf("$%d", len(fkArgs)))
-			}
+		scanArgs := []any{
+			&p.ID, &p.UserID, &p.Amount,
+
+			scanNullable(&r0_ID),
+			scanNullable(&r0_Name),
+			scanNullable(&r0_Email),
+			scanNullable(&r0_CreatedAt),
 		}
 
-		if len(fkArgs) > 0 {
-			query := fmt.Sprintf(
-				"SELECT id, name, email, created_at FROM users WHERE id IN (%s)",
-				strings.Join(placeholders, ", "),
-			)
-			rows, err := db.QueryContext(ctx, query, fkArgs...)
-			if err != nil {
-				return fmt.Errorf("preload Order.User: %w", err)
-			}
-			defer rows.Close()
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("getOrderByIDWithRelations(%v): scanning row: %w", id, err)
+		}
 
-			for rows.Next() {
-				var target models.User
-				if err := rows.Scan(&target.ID, &target.Name, &target.Email, &target.CreatedAt); err != nil {
-					return fmt.Errorf("preload Order.User scan: %w", err)
+		if parent == nil {
+			parent = &p
+		}
+
+		if !isZero(r0_ID) {
+			if !seen_User[r0_ID] {
+				seen_User[r0_ID] = true
+				child := models.User{
+					ID:        r0_ID,
+					Name:      r0_Name,
+					Email:     r0_Email,
+					CreatedAt: r0_CreatedAt,
 				}
-				if parents, ok := fkMap[target.ID]; ok {
-					for _, parent := range parents {
 
-						targetCopy := target
-						parent.User = &targetCopy
+				parent.User = &child
 
-					}
-				}
-			}
-			if err := rows.Err(); err != nil {
-				return fmt.Errorf("preload Order.User iteration: %w", err)
 			}
 		}
 
 	}
 
-	return nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("getOrderByIDWithRelations(%v): iterating rows: %w", id, err)
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("getOrderByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+	}
+
+	return parent, nil
+}
+
+func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.Order, error) {
+	query := `
+		WITH p AS (
+			SELECT p.order_id, p.user_id, p.amount
+			FROM orders p
+	` + clause + `
+		)
+		SELECT 
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at
+		FROM p
+		LEFT JOIN users r0 ON r0.id = p.user_id
+		ORDER BY p.order_id ASC
+	`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAllOrdersWithRelations: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.Order
+	itemsMap := make(map[int64]*models.Order)
+
+	seen_User := make(map[int64]map[int64]bool)
+
+	for rows.Next() {
+		var p models.Order
+
+		var r0_ID int64
+		var r0_Name string
+		var r0_Email string
+		var r0_CreatedAt time.Time
+
+		scanArgs := []any{
+			&p.ID, &p.UserID, &p.Amount,
+
+			scanNullable(&r0_ID),
+			scanNullable(&r0_Name),
+			scanNullable(&r0_Email),
+			scanNullable(&r0_CreatedAt),
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("fetchAllOrdersWithRelations: scanning row: %w", err)
+		}
+
+		parent, exists := itemsMap[p.ID]
+		if !exists {
+			parent = &p
+			itemsMap[p.ID] = parent
+			items = append(items, parent)
+
+			seen_User[p.ID] = make(map[int64]bool)
+
+		}
+
+		if !isZero(r0_ID) {
+			if !seen_User[parent.ID][r0_ID] {
+				seen_User[parent.ID][r0_ID] = true
+				child := models.User{
+					ID:        r0_ID,
+					Name:      r0_Name,
+					Email:     r0_Email,
+					CreatedAt: r0_CreatedAt,
+				}
+
+				parent.User = &child
+
+			}
+		}
+
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetchAllOrdersWithRelations: iterating rows: %w", err)
+	}
+
+	return items, nil
 }
 
 // UpdateOrder updates an existing Order record in orders.
