@@ -156,42 +156,62 @@ func (m Model) UpdatableFields() []Field {
 
 func (m Model) AllColumns(prefix string) string {
 	fields := m.SelectableFields()
-	cols := make([]string, len(fields))
+	var sb strings.Builder
+	// Preallocate estimate: avg column name len (~10 chars) + prefix + separator
+	sb.Grow(len(fields) * 16)
+
 	for i, f := range fields {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
 		if prefix != "" {
-			cols[i] = fmt.Sprintf("%s.%s", prefix, f.Column)
+			sb.WriteString(prefix)
+			sb.WriteByte('.')
+			sb.WriteString(f.Column)
 		} else {
-			cols[i] = f.Column
+			sb.WriteString(f.Column)
 		}
 	}
-	return strings.Join(cols, ", ")
+	return sb.String()
 }
 
 func (m Model) InsertColumns() string {
 	fields := m.WritableFields()
-	cols := make([]string, len(fields))
+	var sb strings.Builder
+	sb.Grow(len(fields) * 12)
 	for i, f := range fields {
-		cols[i] = f.Column
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(f.Column)
 	}
-	return strings.Join(cols, ", ")
+	return sb.String()
 }
 
 func (m Model) InsertPlaceholders() string {
 	fields := m.WritableFields()
-	placeholders := make([]string, len(fields))
+	var sb strings.Builder
+	sb.Grow(len(fields) * 4)
 	for i := range fields {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "$%d", i+1)
 	}
-	return strings.Join(placeholders, ", ")
+	return sb.String()
 }
 
 func (m Model) UpdateSetClause() string {
 	fields := m.UpdatableFields()
-	clauses := make([]string, len(fields))
+	var sb strings.Builder
+	sb.Grow(len(fields) * 16)
 	for i, f := range fields {
-		clauses[i] = fmt.Sprintf("%s = $%d", f.Column, i+1)
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "%s = $%d", f.Column, i+1)
 	}
-	return strings.Join(clauses, ", ")
+	return sb.String()
 }
 
 func (m Model) UpdatePKPlaceholderIdx() int {
@@ -234,7 +254,7 @@ func (m Model) UpdatableScanArgs(varName string) string {
 
 // AllRelationColumns returns a comma-separated list of SELECT columns for all model relations.
 func (m Model) AllRelationColumns() string {
-	var cols []string
+	var sb strings.Builder
 	for i, rel := range m.Relations {
 		alias := fmt.Sprintf("r%d", i)
 		target, ok := m.AllKnownModels[rel.TargetModel]
@@ -242,13 +262,13 @@ func (m Model) AllRelationColumns() string {
 			continue
 		}
 		for _, f := range target.SelectableFields() {
-			cols = append(cols, fmt.Sprintf("%s.%s", alias, f.Column))
+			sb.WriteString(", ")
+			sb.WriteString(alias)
+			sb.WriteByte('.')
+			sb.WriteString(f.Column)
 		}
 	}
-	if len(cols) == 0 {
-		return ""
-	}
-	return ", " + strings.Join(cols, ", ")
+	return sb.String()
 }
 
 // AllRelationJoins returns the combined LEFT JOIN SQL statements for all model relations.
@@ -683,13 +703,13 @@ func (n *nullableScanner[T]) Scan(src any) error {
 		return nil
 	}
 
-	if scanner, ok := any(n.dst).(sql.Scanner); ok {
-		return scanner.Scan(src)
-	}
-
 	if v, ok := src.(T); ok {
 		*n.dst = v
 		return nil
+	}
+
+	if scanner, ok := any(n.dst).(sql.Scanner); ok {
+		return scanner.Scan(src)
 	}
 
 	return convertAssign(n.dst, src)
@@ -707,6 +727,106 @@ func convertAssign[T any](dst *T, src any) error {
 		return nil
 	}
 
+	switch p := any(dst).(type) {
+	case *string:
+		switch s := src.(type) {
+		case []byte:
+			*p = string(s)
+			return nil
+		case string:
+			*p = s
+			return nil
+		}
+	case *[]byte:
+		switch s := src.(type) {
+		case string:
+			*p = []byte(s)
+			return nil
+		case []byte:
+			cp := make([]byte, len(s))
+			copy(cp, s)
+			*p = cp
+			return nil
+		}
+	case *time.Time:
+		switch s := src.(type) {
+		case string:
+			t, err := time.Parse(time.RFC3339, s)
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse time string %q: %w", s, err)
+			}
+			*p = t
+			return nil
+		case []byte:
+			t, err := time.Parse(time.RFC3339, string(s))
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse time bytes %q: %w", s, err)
+			}
+			*p = t
+			return nil
+		}
+	case *int:
+		if i, ok := toInt64(src); ok {
+			*p = int(i)
+			return nil
+		}
+	case *int8:
+		if i, ok := toInt64(src); ok {
+			*p = int8(i)
+			return nil
+		}
+	case *int16:
+		if i, ok := toInt64(src); ok {
+			*p = int16(i)
+			return nil
+		}
+	case *int32:
+		if i, ok := toInt64(src); ok {
+			*p = int32(i)
+			return nil
+		}
+	case *int64:
+		if i, ok := toInt64(src); ok {
+			*p = i
+			return nil
+		}
+	case *uint:
+		if u, ok := toUint64(src); ok {
+			*p = uint(u)
+			return nil
+		}
+	case *uint8:
+		if u, ok := toUint64(src); ok {
+			*p = uint8(u)
+			return nil
+		}
+	case *uint16:
+		if u, ok := toUint64(src); ok {
+			*p = uint16(u)
+			return nil
+		}
+	case *uint32:
+		if u, ok := toUint64(src); ok {
+			*p = uint32(u)
+			return nil
+		}
+	case *uint64:
+		if u, ok := toUint64(src); ok {
+			*p = u
+			return nil
+		}
+	case *float32:
+		if f, ok := toFloat64(src); ok {
+			*p = float32(f)
+			return nil
+		}
+	case *float64:
+		if f, ok := toFloat64(src); ok {
+			*p = f
+			return nil
+		}
+	}
+
 	vDst := reflect.ValueOf(dst).Elem()
 	vSrc := reflect.ValueOf(src)
 
@@ -715,54 +835,78 @@ func convertAssign[T any](dst *T, src any) error {
 		return nil
 	}
 
-	if vDst.Kind() == reflect.String && vSrc.Kind() == reflect.Slice && vSrc.Type().Elem().Kind() == reflect.Uint8 {
-		vDst.SetString(string(vSrc.Bytes()))
-		return nil
-	}
-	if vDst.Kind() == reflect.Slice && vDst.Type().Elem().Kind() == reflect.Uint8 && vSrc.Kind() == reflect.String {
-		vDst.SetBytes([]byte(vSrc.String()))
-		return nil
-	}
-
-	if _, ok := any(dst).(*time.Time); ok {
-		switch s := src.(type) {
-		case string:
-			t, err := time.Parse(time.RFC3339, s)
-			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time string %q: %w", s, err)
-			}
-			vDst.Set(reflect.ValueOf(t))
-			return nil
-		case []byte:
-			t, err := time.Parse(time.RFC3339, string(s))
-			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time bytes %q: %w", s, err)
-			}
-			vDst.Set(reflect.ValueOf(t))
-			return nil
-		}
-	}
-
-	if isNumeric(vDst.Kind()) && isNumeric(vSrc.Kind()) {
-		if vDst.Kind() >= reflect.Int && vDst.Kind() <= reflect.Int64 {
-			vDst.SetInt(vSrc.Int())
-			return nil
-		}
-		if vDst.Kind() >= reflect.Uint && vDst.Kind() <= reflect.Uint64 {
-			vDst.SetUint(vSrc.Uint())
-			return nil
-		}
-		if vDst.Kind() == reflect.Float32 || vDst.Kind() == reflect.Float64 {
-			vDst.SetFloat(vSrc.Float())
-			return nil
-		}
-	}
-
 	return fmt.Errorf("scanNullable: cannot convert %T (%v) to %T", src, src, dst)
 }
 
-func isNumeric(k reflect.Kind) bool {
-	return (k >= reflect.Int && k <= reflect.Complex128)
+func toInt64(src any) (int64, bool) {
+	switch v := src.(type) {
+	case int:
+		return int64(v), true
+	case int8:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case uint:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func toUint64(src any) (uint64, bool) {
+	switch v := src.(type) {
+	case int:
+		return uint64(v), true
+	case int8:
+		return uint64(v), true
+	case int16:
+		return uint64(v), true
+	case int32:
+		return uint64(v), true
+	case int64:
+		return uint64(v), true
+	case uint:
+		return uint64(v), true
+	case uint8:
+		return uint64(v), true
+	case uint16:
+		return uint64(v), true
+	case uint32:
+		return uint64(v), true
+	case uint64:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+func toFloat64(src any) (float64, bool) {
+	switch v := src.(type) {
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	default:
+		return 0, false
+	}
 }
 
 func isZero[T comparable](v T) bool {
@@ -913,7 +1057,7 @@ func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{
 	}
 	defer rows.Close()
 
-	var items []*{{.ModelPkgAlias}}.{{.Name}}
+	items := make([]*{{.ModelPkgAlias}}.{{.Name}}, 0, 16)
 	for rows.Next() {
 		var m {{.ModelPkgAlias}}.{{.Name}}
 		if err := rows.Scan({{.AllScanArgs "m"}}); err != nil {
@@ -949,7 +1093,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}
 
 	{{range $idx, $rel := .Relations}}
 	{{$target := index $.AllKnownModels $rel.TargetModel}}
-	seen_{{$rel.FieldName}} := make(map[{{$target.PK.Type}}]bool)
+	seen_{{$rel.FieldName}} := make(map[{{$target.PK.Type}}]bool, 4)
 	{{end}}
 
 	for rows.Next() {
@@ -980,9 +1124,10 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}
 
 		{{range $idx, $rel := .Relations}}
 		{{$target := index $.AllKnownModels $rel.TargetModel}}
-		if !isZero(r{{$idx}}_{{$target.PK.Name}}) {
-			if !seen_{{$rel.FieldName}}[r{{$idx}}_{{$target.PK.Name}}] {
-				seen_{{$rel.FieldName}}[r{{$idx}}_{{$target.PK.Name}}] = true
+		rPk{{$idx}} := r{{$idx}}_{{$target.PK.Name}}
+		if !isZero(rPk{{$idx}}) {
+			if !seen_{{$rel.FieldName}}[rPk{{$idx}}] {
+				seen_{{$rel.FieldName}}[rPk{{$idx}}] = true
 				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
 					{{range $target.SelectableFields}}{{.Name}}: r{{$idx}}_{{.Name}},
 					{{end}}
@@ -1031,12 +1176,12 @@ func fetchAll{{.Name}}sWithRelations(ctx context.Context, db DBTX, clause string
 	}
 	defer rows.Close()
 
-	var items []*{{.ModelPkgAlias}}.{{.Name}}
-	itemsMap := make(map[{{.PK.Type}}]*{{.ModelPkgAlias}}.{{.Name}})
+	items := make([]*{{.ModelPkgAlias}}.{{.Name}}, 0, 16)
+	itemsMap := make(map[{{.PK.Type}}]*{{.ModelPkgAlias}}.{{.Name}}, 16)
 
 	{{range $idx, $rel := .Relations}}
 	{{$target := index $.AllKnownModels $rel.TargetModel}}
-	seen_{{$rel.FieldName}} := make(map[{{$.PK.Type}}]map[{{$target.PK.Type}}]bool)
+	seen_{{$rel.FieldName}} := make(map[{{$.PK.Type}}]map[{{$target.PK.Type}}]bool, 16)
 	{{end}}
 
 	for rows.Next() {
@@ -1061,23 +1206,25 @@ func fetchAll{{.Name}}sWithRelations(ctx context.Context, db DBTX, clause string
 			return nil, fmt.Errorf("fetchAll{{.Name}}sWithRelations: scanning row: %w", err)
 		}
 
-		parent, exists := itemsMap[p.{{.PK.Name}}]
+		pPK := p.{{.PK.Name}}
+		parent, exists := itemsMap[pPK]
 		if !exists {
 			parent = &p
-			itemsMap[p.{{.PK.Name}}] = parent
+			itemsMap[pPK] = parent
 			items = append(items, parent)
 
 			{{range $idx, $rel := .Relations}}
 			{{$target := index $.AllKnownModels $rel.TargetModel}}
-			seen_{{$rel.FieldName}}[p.{{$.PK.Name}}] = make(map[{{$target.PK.Type}}]bool)
+			seen_{{$rel.FieldName}}[pPK] = make(map[{{$target.PK.Type}}]bool, 4)
 			{{end}}
 		}
 
 		{{range $idx, $rel := .Relations}}
 		{{$target := index $.AllKnownModels $rel.TargetModel}}
-		if !isZero(r{{$idx}}_{{$target.PK.Name}}) {
-			if !seen_{{$rel.FieldName}}[parent.{{$.PK.Name}}][r{{$idx}}_{{$target.PK.Name}}] {
-				seen_{{$rel.FieldName}}[parent.{{$.PK.Name}}][r{{$idx}}_{{$target.PK.Name}}] = true
+		rPk{{$idx}} := r{{$idx}}_{{$target.PK.Name}}
+		if !isZero(rPk{{$idx}}) {
+			if !seen_{{$rel.FieldName}}[pPK][rPk{{$idx}}] {
+				seen_{{$rel.FieldName}}[pPK][rPk{{$idx}}] = true
 				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
 					{{range $target.SelectableFields}}{{.Name}}: r{{$idx}}_{{.Name}},
 					{{end}}

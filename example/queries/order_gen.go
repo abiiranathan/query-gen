@@ -110,7 +110,7 @@ func FetchAllOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*model
 	}
 	defer rows.Close()
 
-	var items []*models.Order
+	items := make([]*models.Order, 0, 16)
 	for rows.Next() {
 		var m models.Order
 		if err := rows.Scan(&m.ID, &m.UserID, &m.Amount); err != nil {
@@ -143,7 +143,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 
 	var parent *models.Order
 
-	seen_User := make(map[int64]bool)
+	seen_User := make(map[int64]bool, 4)
 
 	for rows.Next() {
 		var p models.Order
@@ -170,9 +170,10 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 			parent = &p
 		}
 
-		if !isZero(r0_ID) {
-			if !seen_User[r0_ID] {
-				seen_User[r0_ID] = true
+		rPk0 := r0_ID
+		if !isZero(rPk0) {
+			if !seen_User[rPk0] {
+				seen_User[rPk0] = true
 				child := models.User{
 					ID:        r0_ID,
 					Name:      r0_Name,
@@ -217,10 +218,10 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 	}
 	defer rows.Close()
 
-	var items []*models.Order
-	itemsMap := make(map[int64]*models.Order)
+	items := make([]*models.Order, 0, 16)
+	itemsMap := make(map[int64]*models.Order, 16)
 
-	seen_User := make(map[int64]map[int64]bool)
+	seen_User := make(map[int64]map[int64]bool, 16)
 
 	for rows.Next() {
 		var p models.Order
@@ -243,19 +244,21 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 			return nil, fmt.Errorf("fetchAllOrdersWithRelations: scanning row: %w", err)
 		}
 
-		parent, exists := itemsMap[p.ID]
+		pPK := p.ID
+		parent, exists := itemsMap[pPK]
 		if !exists {
 			parent = &p
-			itemsMap[p.ID] = parent
+			itemsMap[pPK] = parent
 			items = append(items, parent)
 
-			seen_User[p.ID] = make(map[int64]bool)
+			seen_User[pPK] = make(map[int64]bool, 4)
 
 		}
 
-		if !isZero(r0_ID) {
-			if !seen_User[parent.ID][r0_ID] {
-				seen_User[parent.ID][r0_ID] = true
+		rPk0 := r0_ID
+		if !isZero(rPk0) {
+			if !seen_User[pPK][rPk0] {
+				seen_User[pPK][rPk0] = true
 				child := models.User{
 					ID:        r0_ID,
 					Name:      r0_Name,

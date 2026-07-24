@@ -130,13 +130,13 @@ func (n *nullableScanner[T]) Scan(src any) error {
 		return nil
 	}
 
-	if scanner, ok := any(n.dst).(sql.Scanner); ok {
-		return scanner.Scan(src)
-	}
-
 	if v, ok := src.(T); ok {
 		*n.dst = v
 		return nil
+	}
+
+	if scanner, ok := any(n.dst).(sql.Scanner); ok {
+		return scanner.Scan(src)
 	}
 
 	return convertAssign(n.dst, src)
@@ -154,6 +154,106 @@ func convertAssign[T any](dst *T, src any) error {
 		return nil
 	}
 
+	switch p := any(dst).(type) {
+	case *string:
+		switch s := src.(type) {
+		case []byte:
+			*p = string(s)
+			return nil
+		case string:
+			*p = s
+			return nil
+		}
+	case *[]byte:
+		switch s := src.(type) {
+		case string:
+			*p = []byte(s)
+			return nil
+		case []byte:
+			cp := make([]byte, len(s))
+			copy(cp, s)
+			*p = cp
+			return nil
+		}
+	case *time.Time:
+		switch s := src.(type) {
+		case string:
+			t, err := time.Parse(time.RFC3339, s)
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse time string %q: %w", s, err)
+			}
+			*p = t
+			return nil
+		case []byte:
+			t, err := time.Parse(time.RFC3339, string(s))
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse time bytes %q: %w", s, err)
+			}
+			*p = t
+			return nil
+		}
+	case *int:
+		if i, ok := toInt64(src); ok {
+			*p = int(i)
+			return nil
+		}
+	case *int8:
+		if i, ok := toInt64(src); ok {
+			*p = int8(i)
+			return nil
+		}
+	case *int16:
+		if i, ok := toInt64(src); ok {
+			*p = int16(i)
+			return nil
+		}
+	case *int32:
+		if i, ok := toInt64(src); ok {
+			*p = int32(i)
+			return nil
+		}
+	case *int64:
+		if i, ok := toInt64(src); ok {
+			*p = i
+			return nil
+		}
+	case *uint:
+		if u, ok := toUint64(src); ok {
+			*p = uint(u)
+			return nil
+		}
+	case *uint8:
+		if u, ok := toUint64(src); ok {
+			*p = uint8(u)
+			return nil
+		}
+	case *uint16:
+		if u, ok := toUint64(src); ok {
+			*p = uint16(u)
+			return nil
+		}
+	case *uint32:
+		if u, ok := toUint64(src); ok {
+			*p = uint32(u)
+			return nil
+		}
+	case *uint64:
+		if u, ok := toUint64(src); ok {
+			*p = u
+			return nil
+		}
+	case *float32:
+		if f, ok := toFloat64(src); ok {
+			*p = float32(f)
+			return nil
+		}
+	case *float64:
+		if f, ok := toFloat64(src); ok {
+			*p = f
+			return nil
+		}
+	}
+
 	vDst := reflect.ValueOf(dst).Elem()
 	vSrc := reflect.ValueOf(src)
 
@@ -162,54 +262,78 @@ func convertAssign[T any](dst *T, src any) error {
 		return nil
 	}
 
-	if vDst.Kind() == reflect.String && vSrc.Kind() == reflect.Slice && vSrc.Type().Elem().Kind() == reflect.Uint8 {
-		vDst.SetString(string(vSrc.Bytes()))
-		return nil
-	}
-	if vDst.Kind() == reflect.Slice && vDst.Type().Elem().Kind() == reflect.Uint8 && vSrc.Kind() == reflect.String {
-		vDst.SetBytes([]byte(vSrc.String()))
-		return nil
-	}
-
-	if _, ok := any(dst).(*time.Time); ok {
-		switch s := src.(type) {
-		case string:
-			t, err := time.Parse(time.RFC3339, s)
-			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time string %q: %w", s, err)
-			}
-			vDst.Set(reflect.ValueOf(t))
-			return nil
-		case []byte:
-			t, err := time.Parse(time.RFC3339, string(s))
-			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time bytes %q: %w", s, err)
-			}
-			vDst.Set(reflect.ValueOf(t))
-			return nil
-		}
-	}
-
-	if isNumeric(vDst.Kind()) && isNumeric(vSrc.Kind()) {
-		if vDst.Kind() >= reflect.Int && vDst.Kind() <= reflect.Int64 {
-			vDst.SetInt(vSrc.Int())
-			return nil
-		}
-		if vDst.Kind() >= reflect.Uint && vDst.Kind() <= reflect.Uint64 {
-			vDst.SetUint(vSrc.Uint())
-			return nil
-		}
-		if vDst.Kind() == reflect.Float32 || vDst.Kind() == reflect.Float64 {
-			vDst.SetFloat(vSrc.Float())
-			return nil
-		}
-	}
-
 	return fmt.Errorf("scanNullable: cannot convert %T (%v) to %T", src, src, dst)
 }
 
-func isNumeric(k reflect.Kind) bool {
-	return (k >= reflect.Int && k <= reflect.Complex128)
+func toInt64(src any) (int64, bool) {
+	switch v := src.(type) {
+	case int:
+		return int64(v), true
+	case int8:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case uint:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func toUint64(src any) (uint64, bool) {
+	switch v := src.(type) {
+	case int:
+		return uint64(v), true
+	case int8:
+		return uint64(v), true
+	case int16:
+		return uint64(v), true
+	case int32:
+		return uint64(v), true
+	case int64:
+		return uint64(v), true
+	case uint:
+		return uint64(v), true
+	case uint8:
+		return uint64(v), true
+	case uint16:
+		return uint64(v), true
+	case uint32:
+		return uint64(v), true
+	case uint64:
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+func toFloat64(src any) (float64, bool) {
+	switch v := src.(type) {
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	default:
+		return 0, false
+	}
 }
 
 func isZero[T comparable](v T) bool {
