@@ -524,6 +524,15 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 
 	notNullSeen := false
 
+	// First pass: look for column tag explicitly so it overrides default toSnakeCase(fieldName)
+	for part := range strings.SplitSeq(gormTag, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(strings.ToLower(part), "column:") {
+			f.Column = part[len("column:"):]
+			break
+		}
+	}
+
 	for part := range strings.SplitSeq(gormTag, ";") {
 		part = strings.TrimSpace(part)
 		lower := strings.ToLower(part)
@@ -535,9 +544,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 
 		case lower == "primarykey" || lower == "primary_key":
 			f.IsPK = true
-
-		case strings.HasPrefix(lower, "column:"):
-			f.Column = part[len("column:"):]
 
 		case lower == "not null" || lower == "notnull":
 			notNullSeen = true
@@ -578,6 +584,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"time"
@@ -589,10 +596,11 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// QueryOptions provides optional filtering, ordering, grouping, pagination, and association preloading for queries.
+// QueryOptions provides optional filtering, ordering, grouping, having, pagination, and association preloading for queries.
 type QueryOptions struct {
 	Where               string
 	Args                []any
+	Having              string
 	OrderBy             string
 	GroupBy             string
 	Limit               int
@@ -602,41 +610,161 @@ type QueryOptions struct {
 
 type QueryOption func(*QueryOptions)
 
-func WithWhere(where string, args ...any) QueryOption {
+func Where(where string, args ...any) QueryOption {
 	return func(o *QueryOptions) {
-		o.Where = where
+		if o.Where != "" {
+			o.Where += " AND " + where
+		} else {
+			o.Where = where
+		}
 		o.Args = append(o.Args, args...)
 	}
 }
 
-func WithOrderBy(orderBy string) QueryOption {
+func Having(having string, args ...any) QueryOption {
+	return func(o *QueryOptions) {
+		if o.Having != "" {
+			o.Having += " AND " + having
+		} else {
+			o.Having = having
+		}
+		o.Args = append(o.Args, args...)
+	}
+}
+
+func OrderBy(orderBy string) QueryOption {
 	return func(o *QueryOptions) {
 		o.OrderBy = orderBy
 	}
 }
 
-func WithGroupBy(groupBy string) QueryOption {
+func GroupBy(groupBy string) QueryOption {
 	return func(o *QueryOptions) {
 		o.GroupBy = groupBy
 	}
 }
 
-func WithLimit(limit int) QueryOption {
+func Limit(limit int) QueryOption {
 	return func(o *QueryOptions) {
 		o.Limit = limit
 	}
 }
 
-func WithOffset(offset int) QueryOption {
+func Offset(offset int) QueryOption {
 	return func(o *QueryOptions) {
 		o.Offset = offset
 	}
 }
 
 // WithPreloadAssociations enables or disables preloading associated model relations.
-func WithPreloadAssociations(preload bool) QueryOption {
+func PreloadAssociations(preload bool) QueryOption {
 	return func(o *QueryOptions) {
 		o.PreloadAssociations = preload
+	}
+}
+
+// DateRange applies date range filter on a date column.
+// e.g DateRange("DATE(created_at)", "2021-01-01", "2021-12-31")
+// It does nothing if start or end is empty.
+func DateRange(column string, start, end string) QueryOption {
+	return func(o *QueryOptions) {
+		if start != "" && end != "" {
+			o.Args = append(o.Args, start, end)
+			placeholder1 := fmt.Sprintf("$%d", len(o.Args)-1)
+			placeholder2 := fmt.Sprintf("$%d", len(o.Args))
+			clause := fmt.Sprintf("%s BETWEEN %s AND %s", column, placeholder1, placeholder2)
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		} else if start != "" {
+			o.Args = append(o.Args, start)
+			clause := fmt.Sprintf("%s >= $%d", column, len(o.Args))
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		} else if end != "" {
+			o.Args = append(o.Args, end)
+			clause := fmt.Sprintf("%s <= $%d", column, len(o.Args))
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		}
+	}
+}
+
+// MonthRange is the same as DateRange but truncates the date to month.
+// e.g MonthRange("DATE(created_at)", "2021-01-01", "2021-12-31")
+// It does nothing if start or end is empty.
+func MonthRange(column string, start, end string) QueryOption {
+	return func(o *QueryOptions) {
+		if start != "" && end != "" {
+			o.Args = append(o.Args, start, end)
+			p1 := fmt.Sprintf("$%d", len(o.Args)-1)
+			p2 := fmt.Sprintf("$%d", len(o.Args))
+			clause := fmt.Sprintf("%s BETWEEN DATE_TRUNC('month', %s::DATE) AND DATE_TRUNC('month', %s::DATE)", column, p1, p2)
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		} else if start != "" {
+			o.Args = append(o.Args, start)
+			clause := fmt.Sprintf("%s >= DATE_TRUNC('month', $%d::DATE)", column, len(o.Args))
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		} else if end != "" {
+			o.Args = append(o.Args, end)
+			clause := fmt.Sprintf("%s <= DATE_TRUNC('month', $%d::DATE)", column, len(o.Args))
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		}
+	}
+}
+
+// YearRange is the same as date range but truncates the date to year.
+// e.g YearRange("DATE(created_at)", "2021-01-01", "2024-12-31")
+// It does nothing if start or end is empty.
+func YearRange(column string, start, end string) QueryOption {
+	return func(o *QueryOptions) {
+		if start != "" && end != "" {
+			o.Args = append(o.Args, start, end)
+			p1 := fmt.Sprintf("$%d", len(o.Args)-1)
+			p2 := fmt.Sprintf("$%d", len(o.Args))
+			clause := fmt.Sprintf("%s BETWEEN DATE_TRUNC('year', %s::DATE) AND DATE_TRUNC('year', %s::DATE)", column, p1, p2)
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		} else if start != "" {
+			o.Args = append(o.Args, start)
+			clause := fmt.Sprintf("%s >= DATE_TRUNC('year', $%d::DATE)", column, len(o.Args))
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		} else if end != "" {
+			o.Args = append(o.Args, end)
+			clause := fmt.Sprintf("%s <= DATE_TRUNC('year', $%d::DATE)", column, len(o.Args))
+			if o.Where != "" {
+				o.Where += " AND " + clause
+			} else {
+				o.Where = clause
+			}
+		}
 	}
 }
 
@@ -666,6 +794,11 @@ func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any, Qu
 		sb.WriteString(cfg.GroupBy)
 	}
 
+	if cfg.Having != "" {
+		sb.WriteString(" HAVING ")
+		sb.WriteString(cfg.Having)
+	}
+
 	if cfg.OrderBy != "" {
 		sb.WriteString(" ORDER BY ")
 		sb.WriteString(cfg.OrderBy)
@@ -686,6 +819,61 @@ func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any, Qu
 	}
 
 	return sb.String(), args, cfg
+}
+
+// PaginationResult holds the output of a paginated query.
+type PaginationResult[T any] struct {
+	Page       int   ` + "`" + `json:"page"` + "`" + `
+	PageSize   int   ` + "`" + `json:"page_size"` + "`" + `
+	TotalPages int64 ` + "`" + `json:"total_pages"` + "`" + `
+	Count      int64 ` + "`" + `json:"count"` + "`" + `
+	HasNext    bool  ` + "`" + `json:"has_next"` + "`" + `
+	HasPrev    bool  ` + "`" + `json:"has_prev"` + "`" + `
+	Results    []T   ` + "`" + `json:"results"` + "`" + `
+}
+
+// FetchFunc defines a function signature capable of fetching records using DBTX and QueryOptions.
+type FetchFunc[T any] func(ctx context.Context, db DBTX, opts ...QueryOption) ([]T, error)
+
+// CountFunc defines a function signature capable of counting total matching rows using DBTX and QueryOptions.
+type CountFunc func(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error)
+
+// Paginate executes a paginated query using DBTX, counting total rows and retrieving the requested page.
+func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn FetchFunc[T], page, pageSize int, opts ...QueryOption) (*PaginationResult[T], error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	totalCount, err := countFn(ctx, db, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("paginate: counting total rows: %w", err)
+	}
+
+	// Append pagination limit and offset options
+	pOpts := append([]QueryOption(nil), opts...)
+	pOpts = append(pOpts, WithLimit(pageSize), WithOffset((page-1)*pageSize))
+
+	results, err := fetchFn(ctx, db, pOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("paginate: fetching page results: %w", err)
+	}
+
+	if results == nil {
+		results = make([]T, 0)
+	}
+
+	return &PaginationResult[T]{
+		Page:       page,
+		PageSize:   pageSize,
+		HasNext:    int64(page*pageSize) < totalCount,
+		HasPrev:    page > 1,
+		Results:    results,
+		Count:      totalCount,
+		TotalPages: int64(math.Ceil(float64(totalCount) / float64(pageSize))),
+	}, nil
 }
 
 func scanNullable[T any](dst *T) *nullableScanner[T] {

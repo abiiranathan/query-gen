@@ -3,6 +3,7 @@ package queries_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -130,7 +131,7 @@ func TestExistsAndCount(t *testing.T) {
 	}
 
 	// 3. Test CountUsers with WithWhere
-	filteredCount, err := queries.CountUsers(ctx, db, queries.WithWhere("email = $1", "u1@test.com"))
+	filteredCount, err := queries.CountUsers(ctx, db, queries.Where("email = $1", "u1@test.com"))
 	if err != nil || filteredCount != 1 {
 		t.Errorf("CountUsers with filter = %d, want 1 (err: %v)", filteredCount, err)
 	}
@@ -161,8 +162,8 @@ func TestFetchAllWithOptions(t *testing.T) {
 
 	t.Run("Where and OrderBy", func(t *testing.T) {
 		res, err := queries.FetchAllUsers(ctx, db,
-			queries.WithWhere("email LIKE $1", "%test.com"),
-			queries.WithOrderBy("name ASC"),
+			queries.Where("email LIKE $1", "%test.com"),
+			queries.OrderBy("name ASC"),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllUsers failed: %v", err)
@@ -177,10 +178,10 @@ func TestFetchAllWithOptions(t *testing.T) {
 
 	t.Run("Limit, Offset, and GroupBy", func(t *testing.T) {
 		res, err := queries.FetchAllUsers(ctx, db,
-			queries.WithGroupBy("id"),
-			queries.WithOrderBy("name ASC"),
-			queries.WithLimit(2),
-			queries.WithOffset(1),
+			queries.GroupBy("id"),
+			queries.OrderBy("name ASC"),
+			queries.Limit(2),
+			queries.Offset(1),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllUsers with limit/offset failed: %v", err)
@@ -225,7 +226,7 @@ func TestHasManyRelationPreloading(t *testing.T) {
 	})
 
 	t.Run("GetUserByID with PreloadAssociations true", func(t *testing.T) {
-		fetchedUser, err := queries.GetUserByID(ctx, db, user.ID, queries.WithPreloadAssociations(true))
+		fetchedUser, err := queries.GetUserByID(ctx, db, user.ID, queries.PreloadAssociations(true))
 		if err != nil {
 			t.Fatalf("GetUserByID with preload failed: %v", err)
 		}
@@ -236,8 +237,8 @@ func TestHasManyRelationPreloading(t *testing.T) {
 
 	t.Run("FetchAllUsers with PreloadAssociations true", func(t *testing.T) {
 		users, err := queries.FetchAllUsers(ctx, db,
-			queries.WithWhere("id = $1", user.ID),
-			queries.WithPreloadAssociations(true),
+			queries.Where("id = $1", user.ID),
+			queries.PreloadAssociations(true),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllUsers with preload failed: %v", err)
@@ -276,7 +277,7 @@ func TestBelongsToRelationPreloading(t *testing.T) {
 	})
 
 	t.Run("GetOrderByID with PreloadAssociations true", func(t *testing.T) {
-		fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.WithPreloadAssociations(true))
+		fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.PreloadAssociations(true))
 		if err != nil {
 			t.Fatalf("GetOrderByID with preload failed: %v", err)
 		}
@@ -290,8 +291,8 @@ func TestBelongsToRelationPreloading(t *testing.T) {
 
 	t.Run("FetchAllOrders with PreloadAssociations true", func(t *testing.T) {
 		orders, err := queries.FetchAllOrders(ctx, db,
-			queries.WithWhere("amount > $1", 200.00),
-			queries.WithPreloadAssociations(true),
+			queries.Where("amount > $1", 200.00),
+			queries.PreloadAssociations(true),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllOrders with preload failed: %v", err)
@@ -386,4 +387,177 @@ func TestTransactionSupport(t *testing.T) {
 	if exists {
 		t.Errorf("user should not exist after transaction rollback")
 	}
+}
+
+func TestPaginate(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Seed 15 users for pagination testing.
+	const totalUsers = 15
+	for i := 1; i <= totalUsers; i++ {
+		u := &models.User{
+			Name:  fmt.Sprintf("User %02d", i),
+			Email: fmt.Sprintf("user%02d@test.com", i),
+		}
+		if err := queries.InsertUser(ctx, db, u); err != nil {
+			t.Fatalf("failed to insert seed user %d: %v", i, err)
+		}
+	}
+
+	t.Run("First Page", func(t *testing.T) {
+		res, err := queries.Paginate(
+			ctx,
+			db,
+			queries.CountUsers,
+			queries.FetchAllUsers,
+			1, // page
+			5, // pageSize
+			queries.OrderBy("id ASC"),
+		)
+		if err != nil {
+			t.Fatalf("Paginate page 1 failed: %v", err)
+		}
+
+		if res.Count != totalUsers {
+			t.Errorf("got Count = %d, want %d", res.Count, totalUsers)
+		}
+		if res.TotalPages != 3 {
+			t.Errorf("got TotalPages = %d, want 3", res.TotalPages)
+		}
+		if len(res.Results) != 5 {
+			t.Fatalf("got %d results, want 5", len(res.Results))
+		}
+		if !res.HasNext || res.HasPrev {
+			t.Errorf("page 1 flags incorrect: HasNext=%v (want true), HasPrev=%v (want false)", res.HasNext, res.HasPrev)
+		}
+		if res.Results[0].Name != "User 01" {
+			t.Errorf("expected first item 'User 01', got %q", res.Results[0].Name)
+		}
+	})
+
+	t.Run("Middle Page", func(t *testing.T) {
+		res, err := queries.Paginate(
+			ctx,
+			db,
+			queries.CountUsers,
+			queries.FetchAllUsers,
+			2,
+			5,
+			queries.OrderBy("id ASC"),
+		)
+		if err != nil {
+			t.Fatalf("Paginate page 2 failed: %v", err)
+		}
+
+		if len(res.Results) != 5 {
+			t.Fatalf("got %d results, want 5", len(res.Results))
+		}
+		if !res.HasNext || !res.HasPrev {
+			t.Errorf("page 2 flags incorrect: HasNext=%v (want true), HasPrev=%v (want true)", res.HasNext, res.HasPrev)
+		}
+		if res.Results[0].Name != "User 06" {
+			t.Errorf("expected first item of page 2 'User 06', got %q", res.Results[0].Name)
+		}
+	})
+
+	t.Run("Last Page", func(t *testing.T) {
+		res, err := queries.Paginate(
+			ctx,
+			db,
+			queries.CountUsers,
+			queries.FetchAllUsers,
+			3,
+			5,
+			queries.OrderBy("id ASC"),
+		)
+		if err != nil {
+			t.Fatalf("Paginate page 3 failed: %v", err)
+		}
+
+		if len(res.Results) != 5 {
+			t.Fatalf("got %d results, want 5", len(res.Results))
+		}
+		if res.HasNext || !res.HasPrev {
+			t.Errorf("last page flags incorrect: HasNext=%v (want false), HasPrev=%v (want true)", res.HasNext, res.HasPrev)
+		}
+	})
+
+	t.Run("Invalid Page Defaults Handling", func(t *testing.T) {
+		// Passing non-positive page or pageSize should default gracefully (page=1, pageSize=10).
+		res, err := queries.Paginate(
+			ctx,
+			db,
+			queries.CountUsers,
+			queries.FetchAllUsers,
+			0, // page < 1
+			0, // pageSize < 1
+		)
+		if err != nil {
+			t.Fatalf("Paginate with invalid bounds failed: %v", err)
+		}
+
+		if res.Page != 1 {
+			t.Errorf("got Page = %d, want default 1", res.Page)
+		}
+		if res.PageSize != 10 {
+			t.Errorf("got PageSize = %d, want default 10", res.PageSize)
+		}
+		if len(res.Results) != 10 {
+			t.Errorf("got %d results, want 10", len(res.Results))
+		}
+	})
+}
+
+func TestWithHavingClause(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Seed users and orders to test aggregate filtering.
+	u1 := &models.User{Name: "Heavy Spender", Email: "heavy@test.com"}
+	u2 := &models.User{Name: "Light Spender", Email: "light@test.com"}
+	_ = queries.InsertUser(ctx, db, u1)
+	_ = queries.InsertUser(ctx, db, u2)
+
+	// User 1 gets 3 orders
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 100.00})
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 150.00})
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 200.00})
+
+	// User 2 gets 1 order
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u2.ID, Amount: 20.00})
+
+	t.Run("Group By and Having Clause", func(t *testing.T) {
+		// Select orders grouped by user_id having total amount > 50
+		orders, err := queries.FetchAllOrders(ctx, db,
+			queries.GroupBy("user_id"),
+			queries.Having("SUM(amount) > $1", 50.00),
+		)
+		if err != nil {
+			t.Fatalf("FetchAllOrders with HAVING failed: %v", err)
+		}
+
+		if len(orders) != 1 {
+			t.Fatalf("got %d grouped orders, want 1", len(orders))
+		}
+		if orders[0].UserID != u1.ID {
+			t.Errorf("got user_id %d, want %d", orders[0].UserID, u1.ID)
+		}
+	})
+
+	t.Run("Multiple Having Clauses Combined", func(t *testing.T) {
+		// Combining multiple WithHaving calls should join them with AND
+		orders, err := queries.FetchAllOrders(ctx, db,
+			queries.GroupBy("user_id"),
+			queries.Having("COUNT(*) >= $1", 2),
+			queries.Having("SUM(amount) > $2", 100.00),
+		)
+		if err != nil {
+			t.Fatalf("FetchAllOrders with multiple HAVING failed: %v", err)
+		}
+
+		if len(orders) != 1 {
+			t.Fatalf("got %d orders, want 1 matching both HAVING clauses", len(orders))
+		}
+	})
 }
