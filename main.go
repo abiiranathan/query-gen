@@ -807,6 +807,7 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 	return rel, true
 }
 
+// parseFieldTags parses a field's struct tags according to GORM specifications.
 func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 	f := Field{
 		Name:       fieldName,
@@ -839,14 +840,24 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		}
 	}
 
+	// Permission tracking flags
+	canRead := true
+	canCreate := true
+	canUpdate := true
+	hasReadTag := false
+	hasWriteTag := false
+
 	for part := range strings.SplitSeq(gormTag, ";") {
 		part = strings.TrimSpace(part)
 		lower := strings.ToLower(part)
 
 		switch {
-		case part == "-":
+		case part == "-" || lower == "-:all":
 			f.IsIgnore = true
 			return f
+
+		case lower == "-:migration":
+			// Ignore migration tag clause; keep field for read/write.
 
 		case lower == "primarykey" || lower == "primary_key":
 			f.IsPK = true
@@ -883,6 +894,7 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			if f.RawSQLType == "" {
 				f.RawSQLType = part[len("datatype:"):]
 			}
+
 		case strings.HasPrefix(lower, "size:"):
 			if n, err := strconv.Atoi(part[len("size:"):]); err == nil {
 				f.Size = n
@@ -899,16 +911,13 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			}
 
 		case strings.HasPrefix(part, "check:"):
-			// gorm:"check:amount > 0" or gorm:"check:name,amount > 0" —
-			// only the expression (last comma-separated segment) is kept;
-			// a leading constraint name, if present, is discarded since
-			// Field carries no name slot for it.
 			raw := part[len("check:"):]
 			if idx := strings.LastIndex(raw, ","); idx != -1 {
 				f.CheckConstraint = strings.TrimSpace(raw[idx+1:])
 			} else {
 				f.CheckConstraint = strings.TrimSpace(raw)
 			}
+
 		case lower == "not null" || lower == "notnull":
 			notNullSeen = true
 			f.Nullable = false
@@ -916,18 +925,68 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case lower == "null":
 			f.Nullable = true
 
-		case part == "->":
-			f.Permission = PermReadOnly
+		// Read permission tags
+		case lower == "->" || lower == "->:true" || lower == "->:rw" || lower == "->:r":
+			canRead = true
+			hasReadTag = true
 
-		case part == "<-":
-			f.Permission = PermWriteOnly
+		case lower == "->:false":
+			canRead = false
+			hasReadTag = true
+
+		// Write permission tags
+		case lower == "<-" || lower == "<-:true" || lower == "<-:rw":
+			canCreate = true
+			canUpdate = true
+			hasWriteTag = true
+
+		case lower == "<-:false":
+			canCreate = false
+			canUpdate = false
+			hasWriteTag = true
 
 		case lower == "<-:create":
-			f.Permission = PermCreateOnly
+			canCreate = true
+			canUpdate = false
+			hasWriteTag = true
 
 		case lower == "<-:update":
-			f.Permission = PermUpdateOnly
+			canCreate = false
+			canUpdate = true
+			hasWriteTag = true
 		}
+	}
+
+	// GORM rule: if `->` (readonly) is present without any `<-` tag, write permissions are disabled
+	if hasReadTag && !hasWriteTag && canRead {
+		canCreate = false
+		canUpdate = false
+	}
+
+	// Resolve composite permissions enum/bitmask
+	switch {
+	case canRead && canCreate && canUpdate:
+		f.Permission = PermReadWrite
+	case canRead && !canCreate && !canUpdate:
+		f.Permission = PermReadOnly
+	case !canRead && canCreate && canUpdate:
+		f.Permission = PermWriteOnly
+	case !canRead && canCreate && !canUpdate:
+		f.Permission = PermCreateOnly
+	case !canRead && !canCreate && canUpdate:
+		f.Permission = PermUpdateOnly
+	default:
+		var perm Permission
+		if canRead {
+			perm |= PermReadOnly
+		}
+		if canCreate {
+			perm |= PermCreateOnly
+		}
+		if canUpdate {
+			perm |= PermUpdateOnly
+		}
+		f.Permission = perm
 	}
 
 	if f.IsPK {
