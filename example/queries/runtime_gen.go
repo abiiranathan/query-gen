@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -529,22 +530,41 @@ func (n *nullableScanner[T]) Scan(src any) error {
 		return scanner.Scan(src)
 	}
 
+	vDst := reflect.ValueOf(n.dst).Elem()
+	if vDst.Kind() == reflect.Pointer {
+		if vDst.IsNil() {
+			vDst.Set(reflect.New(vDst.Type().Elem()))
+		}
+		return convertAssign(vDst.Interface(), src)
+	}
+
 	return convertAssign(n.dst, src)
 }
 
-func convertAssign[T any](dst *T, src any) error {
+func parseTimeString(s string) (time.Time, error) {
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, fmtStr := range formats {
+		if t, err := time.Parse(fmtStr, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("convertAssign: failed to parse time string %q", s)
+}
+
+func convertAssign(dst any, src any) error {
 	if src == nil {
-		var zero T
-		*dst = zero
 		return nil
 	}
 
-	if v, ok := src.(T); ok {
-		*dst = v
-		return nil
-	}
-
-	switch p := any(dst).(type) {
+	switch p := dst.(type) {
 	case *string:
 		switch s := src.(type) {
 		case []byte:
@@ -568,16 +588,16 @@ func convertAssign[T any](dst *T, src any) error {
 	case *time.Time:
 		switch s := src.(type) {
 		case string:
-			t, err := time.Parse(time.RFC3339, s)
+			t, err := parseTimeString(s)
 			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time string %q: %w", s, err)
+				return err
 			}
 			*p = t
 			return nil
 		case []byte:
-			t, err := time.Parse(time.RFC3339, string(s))
+			t, err := parseTimeString(string(s))
 			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time bytes %q: %w", s, err)
+				return err
 			}
 			*p = t
 			return nil
@@ -642,13 +662,39 @@ func convertAssign[T any](dst *T, src any) error {
 			*p = f
 			return nil
 		}
+	case *time.Duration:
+		if i, ok := toInt64(src); ok {
+			*p = time.Duration(i)
+			return nil
+		}
+		switch s := src.(type) {
+		case []byte:
+			i, err := strconv.ParseInt(string(s), 10, 64)
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse duration bytes %q: %w", s, err)
+			}
+			*p = time.Duration(i)
+			return nil
+		case string:
+			i, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse duration string %q: %w", s, err)
+			}
+			*p = time.Duration(i)
+			return nil
+		}
 	}
 
-	vDst := reflect.ValueOf(dst).Elem()
+	vDst := reflect.ValueOf(dst)
+	if vDst.Kind() != reflect.Pointer || vDst.IsNil() {
+		return fmt.Errorf("convertAssign: dst must be a non-nil pointer, got %T", dst)
+	}
+
+	vElem := vDst.Elem()
 	vSrc := reflect.ValueOf(src)
 
-	if vSrc.Type().ConvertibleTo(vDst.Type()) {
-		vDst.Set(vSrc.Convert(vDst.Type()))
+	if vSrc.Type().ConvertibleTo(vElem.Type()) {
+		vElem.Set(vSrc.Convert(vElem.Type()))
 		return nil
 	}
 

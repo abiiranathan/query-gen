@@ -5,11 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"text/template"
 	"unicode"
@@ -61,19 +63,32 @@ type Relation struct {
 	ForeignKey  string       // Column name storing the reference ID.
 	References  string       // Column name being referenced.
 	IsPointer   bool         // True if the field is a pointer (*User vs User).
+	OnDelete    string       // Referential action from gorm constraint tag, e.g. "CASCADE", "SET NULL". Empty means database default.
+	OnUpdate    string       // Referential action from gorm constraint tag, e.g. "CASCADE", "RESTRICT". Empty means database default.
 }
 
 // Field describes a single scalar struct field mapped to a database column,
 // including its nullability and read/write permission derived from GORM tags.
 type Field struct {
-	Name       string     // Go struct field name, e.g. "Email".
-	Type       string     // Go type as written in source, e.g. "string" or "*string".
-	Column     string     // Database column name, e.g. "email".
-	IsPK       bool       // True if this field is the primary key.
-	IsIgnore   bool       // True if the field is excluded entirely (gorm:"-").
-	Nullable   bool       // True if the column may return SQL NULL (gorm:"null" or a pointer type).
-	Permission Permission // Read/write visibility permission.
-	HasDefault bool       // True if the field tag contains a default clause.
+	Name            string     // Go struct field name, e.g. "Email".
+	Type            string     // Go type as written in source, e.g. "string" or "*string".
+	Column          string     // Database column name, e.g. "email".
+	IsPK            bool       // True if this field is the primary key.
+	IsIgnore        bool       // True if the field is excluded entirely (gorm:"-").
+	Nullable        bool       // True if the column may return SQL NULL (gorm:"null" or a pointer type).
+	Permission      Permission // Read/write visibility permission.
+	HasDefault      bool       // True if the field tag contains a default clause.
+	DefaultVal      string     // Literal default value extracted from gorm tag.
+	IsUnique        bool       // True if unique constraint is applied.
+	HasIndex        bool       // True if field is indexed.
+	IndexName       string     // Custom index name, if specified.
+	HasUniqueIndex  bool       // True if field has unique index.
+	UniqueIndexName string     // Custom unique index name, if specified.
+	RawSQLType      string     // Explicit column type override from gorm:"type:...", e.g. "varchar(255)" or "jsonb". Empty means infer from Go type.
+	Size            int        // Column size from gorm:"size:...", e.g. 255 for VARCHAR(255). Zero means unspecified.
+	Precision       int        // Numeric precision from gorm:"precision:...". Zero means unspecified.
+	Scale           int        // Numeric scale from gorm:"scale:...". Zero means unspecified.
+	CheckConstraint string     // Column-level CHECK expression from gorm:"check:expr". Empty means none.
 }
 
 // IsPointer reports whether the field is a pointer type.
@@ -108,6 +123,49 @@ func (f Field) BaseType() string {
 	return strings.TrimPrefix(f.Type, "*")
 }
 
+// builtinTypes lists Go predeclared types and common aliases that never
+// need a package qualifier when referenced from a generated package.
+var builtinTypes = map[string]bool{
+	"bool": true, "string": true,
+	"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+	"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+	"uintptr": true, "byte": true, "rune": true,
+	"float32": true, "float64": true, "complex64": true, "complex128": true,
+	"any": true, "error": true, "[]byte": true,
+}
+
+// QualifiedType returns f's Go type as it must be written from within a
+// generated package: pointer/slice modifiers are preserved, and if the
+// underlying named type is neither a builtin nor already package-qualified
+// (e.g. time.Time), it is prefixed with pkgAlias so identifiers like Age
+// resolve to models.Age instead of an undefined bare Age.
+func (f Field) QualifiedType(pkgAlias string) string {
+	prefix, base := "", f.Type
+	for {
+		switch {
+		case strings.HasPrefix(base, "*"):
+			prefix, base = prefix+"*", base[1:]
+			continue
+		case strings.HasPrefix(base, "[]"):
+			prefix, base = prefix+"[]", base[2:]
+			continue
+		}
+		break
+	}
+	if pkgAlias == "" || builtinTypes[base] || strings.Contains(base, ".") {
+		return prefix + base
+	}
+	return prefix + pkgAlias + "." + base
+}
+
+// QualifiedBaseType is QualifiedType with one leading pointer indirection
+// stripped, mirroring BaseType — used for scan-target variable declarations.
+func (f Field) QualifiedBaseType(pkgAlias string) string {
+	base := strings.TrimPrefix(f.Type, "*")
+	tmp := Field{Type: base}
+	return tmp.QualifiedType(pkgAlias)
+}
+
 // Model describes a parsed Go struct and everything needed to render its
 // generated CRUD query file: table name, columns, primary key, and any
 // HasMany/BelongsTo relations to other known models.
@@ -121,6 +179,7 @@ type Model struct {
 	PK             *Field           // Primary key field reference.
 	Relations      []Relation       // Discovered HasMany and BelongsTo relations.
 	AllKnownModels map[string]Model // All models in the parsed package, keyed by type name.
+	TableChecks    []checkInfo      // Struct-level CHECK constraints not scoped to a single column.
 }
 
 // HasDeletedAt reports whether the model contains a DeletedAt soft-delete field.
@@ -244,7 +303,7 @@ func (m Model) UpdatePKPlaceholderIdx() int {
 }
 
 func scanTarget(varName string, f Field) string {
-	if f.Nullable && !strings.HasPrefix(f.Type, "*") {
+	if f.IsPointer() || f.Nullable || f.IsTimestamp() {
 		return fmt.Sprintf("scanNullable(&%s.%s)", varName, f.Name)
 	}
 	return fmt.Sprintf("&%s.%s", varName, f.Name)
@@ -330,6 +389,8 @@ func main() {
 	inputPkg := flag.String("input", "./example/models", "Path to package containing models")
 	outDir := flag.String("out", "./example/queries", "Destination directory for generated code")
 	outPkg := flag.String("pkg", "queries", "Package name for generated code")
+	schemaOut := flag.String("schema", "", "If set, path to write a generated SQL schema file (e.g. ./schema.sql)")
+	dbType := flag.String("dbtype", "postgres", "Target database dialect for -schema: postgres or sqlite3")
 	flag.Parse()
 
 	parsedModels, fullPkgPath, err := parsePackage(*inputPkg)
@@ -353,6 +414,22 @@ func main() {
 				modelMap[name] = m
 				break
 			}
+		}
+	}
+
+	if *schemaOut != "" {
+		var dialect SchemaDialect
+		switch strings.ToLower(*dbType) {
+		case "postgres", "postgresql", "pg":
+			dialect = DialectPostgres
+		case "sqlite3", "sqlite":
+			dialect = DialectSQLite
+		default:
+			log.Fatalf("query-gen: unsupported -dbtype %q: must be postgres or sqlite3", *dbType)
+		}
+
+		if err := writeSchemaFile(parsedModels, modelMap, dialect, *schemaOut); err != nil {
+			log.Fatalf("query-gen: %v", err)
 		}
 	}
 
@@ -421,6 +498,13 @@ func parsePackage(pattern string) ([]Model, string, error) {
 	fullPkgPath := pkgs[0].PkgPath
 
 	for _, pkg := range pkgs {
+		// First pass: collect explicit table names from any TableName()
+		// methods, keyed by receiver type name. This must run before model
+		// construction below so the table name is available immediately,
+		// regardless of declaration order within the file/package.
+		tableNames := collectTableNameMethods(pkg.Syntax)
+		customDataTypes := collectDataTypeMethods(pkg.Syntax)
+
 		for _, file := range pkg.Syntax {
 			ast.Inspect(file, func(n ast.Node) bool {
 				typeSpec, ok := n.(*ast.TypeSpec)
@@ -438,6 +522,12 @@ func parsePackage(pattern string) ([]Model, string, error) {
 					Table: toSnakeCase(typeSpec.Name.Name) + "s",
 				}
 
+				// Override the default pluralized snake_case table name if
+				// the model declares an explicit TableName() method.
+				if explicit, ok := tableNames[model.Name]; ok {
+					model.Table = explicit
+				}
+
 				for _, field := range structType.Fields.List {
 					if len(field.Names) == 0 || !field.Names[0].IsExported() {
 						continue
@@ -449,7 +539,7 @@ func parsePackage(pattern string) ([]Model, string, error) {
 						rawTag = strings.Trim(field.Tag.Value, "`")
 					}
 
-					if rel, ok := detectRelation(field, rawTag, model.Name); ok {
+					if rel, ok := detectRelation(field, rawTag, model.Name, pkg.TypesInfo); ok {
 						model.Relations = append(model.Relations, rel)
 						continue
 					}
@@ -461,6 +551,13 @@ func parsePackage(pattern string) ([]Model, string, error) {
 						continue
 					}
 
+					// If no explicit type tag was provided, check for a DataType/GormDataType method on the type.
+					if parsedField.RawSQLType == "" {
+						baseType := strings.TrimPrefix(fieldType, "*")
+						if dt, ok := customDataTypes[baseType]; ok {
+							parsedField.RawSQLType = dt
+						}
+					}
 					model.Fields = append(model.Fields, parsedField)
 				}
 
@@ -491,7 +588,147 @@ func parsePackage(pattern string) ([]Model, string, error) {
 	return result, fullPkgPath, nil
 }
 
-func detectRelation(field *ast.Field, rawTag string, parentModelName string) (Relation, bool) {
+// collectDataTypeMethods scans a package's syntax trees for methods with
+// the signature `func (r ReceiverType) DataType() string` or
+// `func (r ReceiverType) GormDataType() string` that return a single constant
+// string literal, returning a map of receiver type name to custom data type.
+func collectDataTypeMethods(files []*ast.File) map[string]string {
+	dataTypes := make(map[string]string)
+
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			funcDecl, ok := decl.(*ast.FuncDecl)
+			if !ok || funcDecl.Recv == nil || len(funcDecl.Recv.List) != 1 {
+				continue
+			}
+
+			methodName := funcDecl.Name.Name
+			if methodName != "DataType" && methodName != "GormDataType" {
+				continue
+			}
+
+			sig := funcDecl.Type
+			if sig.Params != nil && len(sig.Params.List) > 0 {
+				continue
+			}
+			if sig.Results == nil || len(sig.Results.List) != 1 {
+				continue
+			}
+			if resultIdent, ok := sig.Results.List[0].Type.(*ast.Ident); !ok || resultIdent.Name != "string" {
+				continue
+			}
+
+			receiverType := receiverTypeName(funcDecl.Recv.List[0].Type)
+			if receiverType == "" {
+				continue
+			}
+
+			literal := extractReturnedStringLiteral(funcDecl.Body)
+			if literal == "" {
+				continue
+			}
+
+			// GormDataType takes precedence over DataType if both are defined.
+			if methodName == "GormDataType" || dataTypes[receiverType] == "" {
+				dataTypes[receiverType] = literal
+			}
+		}
+	}
+
+	return dataTypes
+}
+
+// collectTableNameMethods scans a package's syntax trees for methods with
+// the signature `func (r ReceiverType) TableName() string` (value or
+// pointer receiver) that return a single constant string literal, and
+// returns a map of receiver type name to that literal table name.
+//
+// Only a bare `return "literal"` body is recognized; methods that compute
+// the name dynamically (concatenation, conditionals, a field lookup, etc.)
+// are skipped, since query-gen resolves table names at generate-time, not
+// at runtime.
+func collectTableNameMethods(files []*ast.File) map[string]string {
+	names := make(map[string]string)
+
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			funcDecl, ok := decl.(*ast.FuncDecl)
+			if !ok || funcDecl.Recv == nil || len(funcDecl.Recv.List) != 1 {
+				continue
+			}
+			if funcDecl.Name.Name != "TableName" {
+				continue
+			}
+
+			// Method must take no parameters and return a single string.
+			sig := funcDecl.Type
+			if sig.Params != nil && len(sig.Params.List) > 0 {
+				continue
+			}
+			if sig.Results == nil || len(sig.Results.List) != 1 {
+				continue
+			}
+			if resultIdent, ok := sig.Results.List[0].Type.(*ast.Ident); !ok || resultIdent.Name != "string" {
+				continue
+			}
+
+			receiverType := receiverTypeName(funcDecl.Recv.List[0].Type)
+			if receiverType == "" {
+				continue
+			}
+
+			literal := extractReturnedStringLiteral(funcDecl.Body)
+			if literal == "" {
+				continue
+			}
+
+			names[receiverType] = literal
+		}
+	}
+
+	return names
+}
+
+// receiverTypeName extracts the bare type name from a method receiver
+// expression, stripping one level of pointer indirection if present
+// (e.g. *User -> "User", User -> "User").
+func receiverTypeName(expr ast.Expr) string {
+	if starExpr, ok := expr.(*ast.StarExpr); ok {
+		expr = starExpr.X
+	}
+	if ident, ok := expr.(*ast.Ident); ok {
+		return ident.Name
+	}
+	return ""
+}
+
+// extractReturnedStringLiteral looks for a single, unconditional
+// `return "literal"` statement in a function body and returns its
+// unquoted value. Returns "" if the body doesn't match that exact shape.
+func extractReturnedStringLiteral(body *ast.BlockStmt) string {
+	if body == nil || len(body.List) != 1 {
+		return ""
+	}
+
+	retStmt, ok := body.List[0].(*ast.ReturnStmt)
+	if !ok || len(retStmt.Results) != 1 {
+		return ""
+	}
+
+	basicLit, ok := retStmt.Results[0].(*ast.BasicLit)
+	if !ok || basicLit.Kind != token.STRING {
+		return ""
+	}
+
+	unquoted, err := strconv.Unquote(basicLit.Value)
+	if err != nil {
+		return ""
+	}
+
+	return unquoted
+}
+
+func detectRelation(field *ast.Field, rawTag string, parentModelName string, typesInfo *types.Info) (Relation, bool) {
 	fieldName := field.Names[0].Name
 	rel := Relation{FieldName: fieldName}
 
@@ -520,6 +757,17 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string) (Re
 	if !ok || !ident.IsExported() {
 		return rel, false
 	}
+
+	// Verify that the target type's underlying type is actually a struct.
+	// Custom scalar types (e.g. type Age string) are scalar fields, not model relations.
+	if typesInfo != nil {
+		if t := typesInfo.TypeOf(fieldType); t != nil {
+			if _, isStruct := t.Underlying().(*types.Struct); !isStruct {
+				return rel, false
+			}
+		}
+	}
+
 	rel.TargetModel = ident.Name
 
 	if gormTag != "" {
@@ -530,6 +778,17 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string) (Re
 				rel.ForeignKey = toSnakeCase(strings.TrimPrefix(part, "foreignKey:"))
 			case strings.HasPrefix(part, "references:"):
 				rel.References = toSnakeCase(strings.TrimPrefix(part, "references:"))
+			case strings.HasPrefix(part, "constraint:"):
+				constraintBody := strings.TrimPrefix(part, "constraint:")
+				for clause := range strings.SplitSeq(constraintBody, ",") {
+					clause = strings.TrimSpace(clause)
+					switch {
+					case strings.HasPrefix(strings.ToUpper(clause), "ONDELETE:"):
+						rel.OnDelete = strings.ToUpper(strings.TrimSpace(clause[len("OnDelete:"):]))
+					case strings.HasPrefix(strings.ToUpper(clause), "ONUPDATE:"):
+						rel.OnUpdate = strings.ToUpper(strings.TrimSpace(clause[len("OnUpdate:"):]))
+					}
+				}
 			}
 		}
 	}
@@ -592,9 +851,64 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case lower == "primarykey" || lower == "primary_key":
 			f.IsPK = true
 
+		case lower == "unique":
+			f.IsUnique = true
+
+		case lower == "index":
+			f.HasIndex = true
+
+		case strings.HasPrefix(lower, "index:"):
+			f.HasIndex = true
+			f.IndexName = part[len("index:"):]
+
+		case lower == "uniqueindex" || lower == "unique_index":
+			f.HasUniqueIndex = true
+
+		case strings.HasPrefix(lower, "uniqueindex:"):
+			f.HasUniqueIndex = true
+			f.UniqueIndexName = part[len("uniqueindex:"):]
+
+		case strings.HasPrefix(lower, "unique_index:"):
+			f.HasUniqueIndex = true
+			f.UniqueIndexName = part[len("unique_index:"):]
+
 		case strings.HasPrefix(lower, "default:"):
 			f.HasDefault = true
+			f.DefaultVal = part[len("default:"):]
 
+		case strings.HasPrefix(lower, "type:"):
+			f.RawSQLType = part[len("type:"):]
+
+		case strings.HasPrefix(lower, "datatype:"):
+			if f.RawSQLType == "" {
+				f.RawSQLType = part[len("datatype:"):]
+			}
+		case strings.HasPrefix(lower, "size:"):
+			if n, err := strconv.Atoi(part[len("size:"):]); err == nil {
+				f.Size = n
+			}
+
+		case strings.HasPrefix(lower, "precision:"):
+			if n, err := strconv.Atoi(part[len("precision:"):]); err == nil {
+				f.Precision = n
+			}
+
+		case strings.HasPrefix(lower, "scale:"):
+			if n, err := strconv.Atoi(part[len("scale:"):]); err == nil {
+				f.Scale = n
+			}
+
+		case strings.HasPrefix(part, "check:"):
+			// gorm:"check:amount > 0" or gorm:"check:name,amount > 0" —
+			// only the expression (last comma-separated segment) is kept;
+			// a leading constraint name, if present, is discarded since
+			// Field carries no name slot for it.
+			raw := part[len("check:"):]
+			if idx := strings.LastIndex(raw, ","); idx != -1 {
+				f.CheckConstraint = strings.TrimSpace(raw[idx+1:])
+			} else {
+				f.CheckConstraint = strings.TrimSpace(raw)
+			}
 		case lower == "not null" || lower == "notnull":
 			notNullSeen = true
 			f.Nullable = false
@@ -1158,22 +1472,41 @@ func (n *nullableScanner[T]) Scan(src any) error {
 		return scanner.Scan(src)
 	}
 
+	vDst := reflect.ValueOf(n.dst).Elem()
+	if vDst.Kind() == reflect.Pointer {
+		if vDst.IsNil() {
+			vDst.Set(reflect.New(vDst.Type().Elem()))
+		}
+		return convertAssign(vDst.Interface(), src)
+	}
+
 	return convertAssign(n.dst, src)
 }
 
-func convertAssign[T any](dst *T, src any) error {
+func parseTimeString(s string) (time.Time, error) {
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, fmtStr := range formats {
+		if t, err := time.Parse(fmtStr, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("convertAssign: failed to parse time string %q", s)
+}
+
+func convertAssign(dst any, src any) error {
 	if src == nil {
-		var zero T
-		*dst = zero
 		return nil
 	}
 
-	if v, ok := src.(T); ok {
-		*dst = v
-		return nil
-	}
-
-	switch p := any(dst).(type) {
+	switch p := dst.(type) {
 	case *string:
 		switch s := src.(type) {
 		case []byte:
@@ -1197,16 +1530,16 @@ func convertAssign[T any](dst *T, src any) error {
 	case *time.Time:
 		switch s := src.(type) {
 		case string:
-			t, err := time.Parse(time.RFC3339, s)
+			t, err := parseTimeString(s)
 			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time string %q: %w", s, err)
+				return err
 			}
 			*p = t
 			return nil
 		case []byte:
-			t, err := time.Parse(time.RFC3339, string(s))
+			t, err := parseTimeString(string(s))
 			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse time bytes %q: %w", s, err)
+				return err
 			}
 			*p = t
 			return nil
@@ -1271,18 +1604,45 @@ func convertAssign[T any](dst *T, src any) error {
 			*p = f
 			return nil
 		}
+	case *time.Duration:
+		if i, ok := toInt64(src); ok {
+			*p = time.Duration(i)
+			return nil
+		}
+		switch s := src.(type) {
+		case []byte:
+			i, err := strconv.ParseInt(string(s), 10, 64)
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse duration bytes %q: %w", s, err)
+			}
+			*p = time.Duration(i)
+			return nil
+		case string:
+			i, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return fmt.Errorf("convertAssign: failed to parse duration string %q: %w", s, err)
+			}
+			*p = time.Duration(i)
+			return nil
+		}
 	}
 
-	vDst := reflect.ValueOf(dst).Elem()
+	vDst := reflect.ValueOf(dst)
+	if vDst.Kind() != reflect.Pointer || vDst.IsNil() {
+		return fmt.Errorf("convertAssign: dst must be a non-nil pointer, got %T", dst)
+	}
+
+	vElem := vDst.Elem()
 	vSrc := reflect.ValueOf(src)
 
-	if vSrc.Type().ConvertibleTo(vDst.Type()) {
-		vDst.Set(vSrc.Convert(vDst.Type()))
+	if vSrc.Type().ConvertibleTo(vElem.Type()) {
+		vElem.Set(vSrc.Convert(vElem.Type()))
 		return nil
 	}
 
 	return fmt.Errorf("scanNullable: cannot convert %T (%v) to %T", src, src, dst)
 }
+
 
 func toInt64(src any) (int64, bool) {
 	switch v := src.(type) {
@@ -1474,7 +1834,7 @@ func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 }
 
 // Get{{.Name}}ByID retrieves a single {{.Name}} record from {{.Table}} by its primary key.
-func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	if db == nil {
 		return nil, errors.New("get{{.Name}}ByID: db is nil")
 	}
@@ -1516,7 +1876,7 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...Que
 }
 
 // Exists{{.Name}}ByID reports whether a {{.Name}} record with the given primary key exists.
-func Exists{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...QueryOption) (bool, error) {
+func Exists{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, opts ...QueryOption) (bool, error) {
 	if db == nil {
 		return false, errors.New("exists{{.Name}}ByID: db is nil")
 	}
@@ -1595,7 +1955,7 @@ func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{
 }
 
 {{if .Relations}}
-func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	{{if .HasDeletedAt}}
 	query := ` + "`" + `
 		SELECT 
@@ -1634,9 +1994,9 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}
 		var p {{.ModelPkgAlias}}.{{.Name}}
 
 		{{range $idx, $rel := .Relations}}
-		{{$target := index $.AllKnownModels $rel.TargetModel}}
-		{{range $target.SelectableFields}}var r{{$idx}}_{{.Name}} {{.BaseType}}
-		{{end}}
+			{{$target := index $.AllKnownModels $rel.TargetModel}}
+			{{range $target.SelectableFields}}var r{{$idx}}_{{.Name}} {{.QualifiedBaseType $.ModelPkgAlias}}
+			{{end}}
 		{{end}}
 
 		scanArgs := []any{
@@ -1723,8 +2083,8 @@ func fetchAll{{.Name}}sWithRelations(ctx context.Context, db DBTX, clause string
 
 		{{range $idx, $rel := .Relations}}
 		{{$target := index $.AllKnownModels $rel.TargetModel}}
-		{{range $target.SelectableFields}}var r{{$idx}}_{{.Name}} {{.BaseType}}
-		{{end}}
+		{{range $target.SelectableFields}}var r{{$idx}}_{{.Name}} {{.QualifiedBaseType $.ModelPkgAlias}}
+		{{end}}		
 		{{end}}
 
 		scanArgs := []any{
@@ -1818,7 +2178,7 @@ func Update{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 // Delete{{.Name}} deletes the {{.Name}} record identified by id from {{.Table}}.
 // If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
 // unless the HardDelete() query option is supplied.
-func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...QueryOption) error {
+func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("delete{{.Name}}: db is nil")
 	}

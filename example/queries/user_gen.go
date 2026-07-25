@@ -27,8 +27,9 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 	}{
 		{col: "name", val: m.Name, omitIfZero: false},
 		{col: "email", val: m.Email, omitIfZero: false},
-		{col: "created_at", val: m.CreatedAt, omitIfZero: false},
+		{col: "created_at", val: m.CreatedAt, omitIfZero: true},
 		{col: "deleted_at", val: m.DeletedAt, omitIfZero: false},
+		{col: "age", val: m.Age, omitIfZero: false},
 	}
 
 	cols := make([]string, 0, len(fields))
@@ -46,13 +47,13 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	var query string
 	if len(cols) == 0 {
-		query = "INSERT INTO users DEFAULT VALUES RETURNING id, name, email, created_at, deleted_at"
+		query = "INSERT INTO users DEFAULT VALUES RETURNING id, name, email, created_at, deleted_at, age"
 	} else {
-		query = fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING id, name, email, created_at, deleted_at",
+		query = fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING id, name, email, created_at, deleted_at, age",
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt); err != nil {
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
 		return fmt.Errorf("insertUser: %w", err)
 	}
 	return nil
@@ -71,7 +72,7 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 	}
 
 	query := `
-		SELECT id, name, email, created_at, deleted_at
+		SELECT id, name, email, created_at, deleted_at, age
 		FROM users
 		WHERE id = $1
 	`
@@ -81,7 +82,7 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m models.User
-	if err := row.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt); err != nil {
+	if err := row.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
 		return nil, fmt.Errorf("getUserByID(%v): %w", id, err)
 	}
 
@@ -135,7 +136,7 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 		return fetchAllUsersWithRelations(ctx, db, clause, args)
 	}
 
-	query := "SELECT id, name, email, created_at, deleted_at FROM users" + clause
+	query := "SELECT id, name, email, created_at, deleted_at, age FROM users" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -146,7 +147,7 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 	items := make([]*models.User, 0, 16)
 	for rows.Next() {
 		var m models.User
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
 			return nil, fmt.Errorf("fetchAllUsers: scanning row: %w", err)
 		}
 		items = append(items, &m)
@@ -163,7 +164,7 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 
 	query := `
 		SELECT 
-			p.id, p.name, p.email, p.created_at, p.deleted_at, r0.order_id, r0.user_id, r0.amount
+			p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, r0.order_id, r0.user_id, r0.amount
 		FROM users p
 		LEFT JOIN orders r0 ON r0.user_id = p.id
 		WHERE p.id = $1
@@ -190,7 +191,7 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 		var r0_Amount float64
 
 		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, &p.CreatedAt, &p.DeletedAt,
+			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
 
 			scanNullable(&r0_ID),
 			scanNullable(&r0_UserID),
@@ -235,12 +236,12 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.User, error) {
 	query := `
 		WITH p AS (
-			SELECT p.id, p.name, p.email, p.created_at, p.deleted_at
+			SELECT p.id, p.name, p.email, p.created_at, p.deleted_at, p.age
 			FROM users p
 	` + clause + `
 		)
 		SELECT 
-			p.id, p.name, p.email, p.created_at, p.deleted_at, r0.order_id, r0.user_id, r0.amount
+			p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, r0.order_id, r0.user_id, r0.amount
 		FROM p
 		LEFT JOIN orders r0 ON r0.user_id = p.id
 		ORDER BY p.id ASC
@@ -265,7 +266,7 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 		var r0_Amount float64
 
 		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, &p.CreatedAt, &p.DeletedAt,
+			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
 
 			scanNullable(&r0_ID),
 			scanNullable(&r0_UserID),
@@ -322,11 +323,11 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	const query = `
 		UPDATE users
-		SET name = $1, email = $2, created_at = $3, deleted_at = $4
-		WHERE id = $5
+		SET name = $1, email = $2, created_at = $3, deleted_at = $4, age = $5
+		WHERE id = $6
 	`
 
-	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt, m.ID)
+	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt, &m.Age, m.ID)
 	if err != nil {
 		return fmt.Errorf("updateUser(%v): %w", m.ID, err)
 	}

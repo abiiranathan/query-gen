@@ -154,7 +154,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 
 	const query = `
 		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
 		FROM orders p
 		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
 		WHERE p.order_id = $1
@@ -178,6 +178,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 		var r0_Email string
 		var r0_CreatedAt time.Time
 		var r0_DeletedAt time.Time
+		var r0_Age models.Age
 
 		scanArgs := []any{
 			&p.ID, &p.UserID, &p.Amount,
@@ -187,6 +188,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 			scanNullable(&r0_Email),
 			scanNullable(&r0_CreatedAt),
 			scanNullable(&r0_DeletedAt),
+			scanNullable(&r0_Age),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -205,8 +207,9 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 					ID:        r0_ID,
 					Name:      r0_Name,
 					Email:     r0_Email,
-					CreatedAt: toPtr(r0_CreatedAt),
+					CreatedAt: r0_CreatedAt,
 					DeletedAt: toPtr(r0_DeletedAt),
+					Age:       r0_Age,
 				}
 
 				parent.User = &child
@@ -234,7 +237,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 	` + clause + `
 		)
 		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
 		FROM p
 		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
 		ORDER BY p.order_id ASC
@@ -259,6 +262,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 		var r0_Email string
 		var r0_CreatedAt time.Time
 		var r0_DeletedAt time.Time
+		var r0_Age models.Age
 
 		scanArgs := []any{
 			&p.ID, &p.UserID, &p.Amount,
@@ -268,6 +272,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 			scanNullable(&r0_Email),
 			scanNullable(&r0_CreatedAt),
 			scanNullable(&r0_DeletedAt),
+			scanNullable(&r0_Age),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -293,8 +298,9 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 					ID:        r0_ID,
 					Name:      r0_Name,
 					Email:     r0_Email,
-					CreatedAt: toPtr(r0_CreatedAt),
+					CreatedAt: r0_CreatedAt,
 					DeletedAt: toPtr(r0_DeletedAt),
+					Age:       r0_Age,
 				}
 
 				parent.User = &child
