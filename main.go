@@ -123,6 +123,21 @@ type Model struct {
 	AllKnownModels map[string]Model // All models in the parsed package, keyed by type name.
 }
 
+// HasDeletedAt reports whether the model contains a DeletedAt soft-delete field.
+func (m Model) HasDeletedAt() bool {
+	return m.DeletedAtField() != nil
+}
+
+// DeletedAtField returns the Field corresponding to DeletedAt, if present.
+func (m Model) DeletedAtField() *Field {
+	for i := range m.Fields {
+		if strings.EqualFold(m.Fields[i].Name, "DeletedAt") || m.Fields[i].Column == "deleted_at" {
+			return &m.Fields[i]
+		}
+	}
+	return nil
+}
+
 // FieldByColumn finds a struct Field by its database column name.
 func (m Model) FieldByColumn(col string) *Field {
 	for i := range m.Fields {
@@ -281,7 +296,8 @@ func (m Model) AllRelationColumns() string {
 	return sb.String()
 }
 
-// AllRelationJoins returns the combined LEFT JOIN SQL statements for all model relations.
+// AllRelationJoins returns the combined LEFT JOIN SQL statements for all model relations,
+// incorporating soft-delete filter conditions for related models when present.
 func (m Model) AllRelationJoins(parentPrefix string) string {
 	var joins []string
 	for i, rel := range m.Relations {
@@ -290,14 +306,22 @@ func (m Model) AllRelationJoins(parentPrefix string) string {
 		if !ok {
 			continue
 		}
+
+		var joinCond string
 		switch rel.Type {
 		case RelHasMany:
-			joins = append(joins, fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
-				target.Table, alias, alias, rel.ForeignKey, parentPrefix, m.PK.Column))
+			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
+				target.Table, alias, alias, rel.ForeignKey, parentPrefix, m.PK.Column)
 		case RelBelongsTo:
-			joins = append(joins, fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
-				target.Table, alias, alias, target.PK.Column, parentPrefix, rel.ForeignKey))
+			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
+				target.Table, alias, alias, target.PK.Column, parentPrefix, rel.ForeignKey)
 		}
+
+		if target.HasDeletedAt() {
+			joinCond += fmt.Sprintf(" AND %s.%s IS NULL", alias, target.DeletedAtField().Column)
+		}
+
+		joins = append(joins, joinCond)
 	}
 	return strings.Join(joins, "\n\t\t")
 }
@@ -319,6 +343,17 @@ func main() {
 	modelMap := make(map[string]Model, len(parsedModels))
 	for _, m := range parsedModels {
 		modelMap[m.Name] = m
+	}
+
+	// Re-link PK pointers in modelMap entries after all value copies
+	for name, m := range modelMap {
+		for i := range m.Fields {
+			if m.Fields[i].IsPK {
+				m.PK = &m.Fields[i]
+				modelMap[name] = m
+				break
+			}
+		}
 	}
 
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
@@ -427,8 +462,13 @@ func parsePackage(pattern string) ([]Model, string, error) {
 					}
 
 					model.Fields = append(model.Fields, parsedField)
-					if parsedField.IsPK {
-						model.PK = &model.Fields[len(model.Fields)-1]
+				}
+
+				// Assign PK pointer after all fields are appended to avoid slice reallocation invalidation
+				for i := range model.Fields {
+					if model.Fields[i].IsPK {
+						model.PK = &model.Fields[i]
+						break
 					}
 				}
 
@@ -606,7 +646,7 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// QueryOptions provides optional filtering, ordering, grouping, having, pagination, and association preloading for queries.
+// QueryOptions provides optional filtering, ordering, grouping, having, pagination, association preloading, and soft-delete controls for queries.
 type QueryOptions struct {
 	Where               string
 	Args                []any
@@ -616,6 +656,8 @@ type QueryOptions struct {
 	Limit               int
 	Offset              int
 	PreloadAssociations bool
+	IncludeDeleted      bool
+	HardDelete          bool
 }
 
 type QueryOption func(*QueryOptions)
@@ -856,6 +898,20 @@ func PreloadAssociations(preload bool) QueryOption {
 	}
 }
 
+// IncludeDeleted includes soft-deleted records (where deleted_at IS NOT NULL) in query results.
+func IncludeDeleted() QueryOption {
+	return func(o *QueryOptions) {
+		o.IncludeDeleted = true
+	}
+}
+
+// HardDelete forces permanent SQL deletion on models supporting soft deletes.
+func HardDelete() QueryOption {
+	return func(o *QueryOptions) {
+		o.HardDelete = true
+	}
+}
+
 // DateRange applies date range filter on a date column.
 // e.g DateRange("DATE(created_at)", "2021-01-01", "2021-12-31")
 // It does nothing if start or end is empty.
@@ -971,8 +1027,17 @@ func parseQueryOptions(opts ...QueryOption) QueryOptions {
 	return cfg
 }
 
-func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any, QueryOptions) {
+func applyQueryOptions(defaultPK string, deletedAtCol string, opts ...QueryOption) (string, []any, QueryOptions) {
 	cfg := parseQueryOptions(opts...)
+
+	if deletedAtCol != "" && !cfg.IncludeDeleted {
+		clause := deletedAtCol + " IS NULL"
+		if cfg.Where != "" {
+			cfg.Where = clause + " AND " + cfg.Where
+		} else {
+			cfg.Where = clause
+		}
+	}
 
 	var sb strings.Builder
 	args := cfg.Args
@@ -1348,6 +1413,8 @@ func generateRuntimeFile(outDir, outPkg string) error {
 
 // --- Model Code Template ---
 
+// --- Model Code Template ---
+
 const codeTemplate = `// Code generated by query-gen. DO NOT EDIT.
 package {{.Package}}
 
@@ -1412,7 +1479,9 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...Que
 		return nil, errors.New("get{{.Name}}ByID: db is nil")
 	}
 
+	{{if or .Relations .HasDeletedAt}}
 	cfg := parseQueryOptions(opts...)
+	{{end}}
 
 	{{if .Relations}}
 	if cfg.PreloadAssociations {
@@ -1420,11 +1489,22 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...Que
 	}
 	{{end}}
 
+	{{if .HasDeletedAt}}
+	query := ` + "`" + `
+		SELECT {{.AllColumns ""}}
+		FROM {{.Table}}
+		WHERE {{.PK.Column}} = $1
+	` + "`" + `
+	if !cfg.IncludeDeleted {
+		query += " AND {{.DeletedAtField.Column}} IS NULL"
+	}
+	{{else}}
 	const query = ` + "`" + `
 		SELECT {{.AllColumns ""}}
 		FROM {{.Table}}
 		WHERE {{.PK.Column}} = $1
 	` + "`" + `
+	{{end}}
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m {{.ModelPkgAlias}}.{{.Name}}
@@ -1436,12 +1516,21 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...Que
 }
 
 // Exists{{.Name}}ByID reports whether a {{.Name}} record with the given primary key exists.
-func Exists{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}) (bool, error) {
+func Exists{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...QueryOption) (bool, error) {
 	if db == nil {
 		return false, errors.New("exists{{.Name}}ByID: db is nil")
 	}
 
+	{{if .HasDeletedAt}}
+	cfg := parseQueryOptions(opts...)
+	query := ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PK.Column}} = $1` + "`" + `
+	if !cfg.IncludeDeleted {
+		query += " AND {{.DeletedAtField.Column}} IS NULL"
+	}
+	query += ")"
+	{{else}}
 	const query = ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PK.Column}} = $1)` + "`" + `
+	{{end}}
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
@@ -1456,7 +1545,7 @@ func Count{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) (int64, 
 		return 0, errors.New("count{{.Name}}s: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", opts...)
+	clause, args, _ := applyQueryOptions("", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	query := "SELECT COUNT(*) FROM {{.Table}}" + clause
 
 	var count int64
@@ -1472,12 +1561,13 @@ func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{
 		return nil, errors.New("fetchAll{{.Name}}s: db is nil")
 	}
 
-	clause, args, cfg := applyQueryOptions("{{.PK.Column}}", opts...)
-
 	{{if .Relations}}
+	clause, args, cfg := applyQueryOptions("{{.PK.Column}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	if cfg.PreloadAssociations {
 		return fetchAll{{.Name}}sWithRelations(ctx, db, clause, args)
 	}
+	{{else}}
+	clause, args, _ := applyQueryOptions("{{.PK.Column}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	{{end}}
 
 	query := "SELECT {{.AllColumns ""}} FROM {{.Table}}" + clause
@@ -1506,6 +1596,18 @@ func FetchAll{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{
 
 {{if .Relations}}
 func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+	{{if .HasDeletedAt}}
+	query := ` + "`" + `
+		SELECT 
+			{{.AllColumns "p"}}{{.AllRelationColumns}}
+		FROM {{.Table}} p
+		{{.AllRelationJoins "p"}}
+		WHERE p.{{.PK.Column}} = $1
+	` + "`" + `
+	if !cfg.IncludeDeleted {
+		query += " AND p.{{.DeletedAtField.Column}} IS NULL"
+	}
+	{{else}}
 	const query = ` + "`" + `
 		SELECT 
 			{{.AllColumns "p"}}{{.AllRelationColumns}}
@@ -1513,6 +1615,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}
 		{{.AllRelationJoins "p"}}
 		WHERE p.{{.PK.Column}} = $1
 	` + "`" + `
+	{{end}}
 
 	rows, err := db.QueryContext(ctx, query, id)
 	if err != nil {
@@ -1713,10 +1816,31 @@ func Update{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 }
 
 // Delete{{.Name}} deletes the {{.Name}} record identified by id from {{.Table}}.
-func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.Type}}) error {
+// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
+// unless the HardDelete() query option is supplied.
+func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.Type}}, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("delete{{.Name}}: db is nil")
 	}
+
+	{{if .HasDeletedAt}}
+	cfg := parseQueryOptions(opts...)
+	if !cfg.HardDelete {
+		const query = ` + "`" + `UPDATE {{.Table}} SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP WHERE {{.PK.Column}} = $1 AND {{.DeletedAtField.Column}} IS NULL` + "`" + `
+		res, err := db.ExecContext(ctx, query, id)
+		if err != nil {
+			return fmt.Errorf("delete{{.Name}}(%v): %w", id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("detect rows affected: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("delete{{.Name}}(%v): %w", id, sql.ErrNoRows)
+		}
+		return nil
+	}
+	{{end}}
 
 	const query = ` + "`" + `DELETE FROM {{.Table}} WHERE {{.PK.Column}} = $1` + "`" + `
 
@@ -1733,6 +1857,49 @@ func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.Type}}) error {
 		return fmt.Errorf("delete{{.Name}}(%v): %w", id, sql.ErrNoRows)
 	}
 	return nil
+}
+
+// Delete{{.Name}}s deletes records from {{.Table}} matching the provided query options and returns the number of affected rows.
+// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
+// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
+func Delete{{.Name}}s(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
+	if db == nil {
+		return 0, errors.New("delete{{.Name}}s: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return 0, errors.New("delete{{.Name}}s: query options/where clause required to prevent accidental bulk deletion")
+	}
+
+	{{if .HasDeletedAt}}
+	clause, args, cfg := applyQueryOptions("", "{{.DeletedAtField.Column}}", opts...)
+	{{else}}
+	clause, args, _ := applyQueryOptions("", "", opts...)
+	{{end}}
+
+	var query string
+	{{if .HasDeletedAt}}
+	if !cfg.HardDelete {
+		query = "UPDATE {{.Table}} SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP" + clause
+	} else {
+		query = "DELETE FROM {{.Table}}" + clause
+	}
+	{{else}}
+	query = "DELETE FROM {{.Table}}" + clause
+	{{end}}
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("delete{{.Name}}s: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete{{.Name}}s: detecting rows affected: %w", err)
+	}
+
+	return n, nil
 }
 `
 

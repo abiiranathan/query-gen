@@ -26,7 +26,8 @@ func setupTestDB(t *testing.T) *sql.DB {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
 		email TEXT,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		deleted_at DATETIME
 	);
 
 	CREATE TABLE IF NOT EXISTS orders (
@@ -306,6 +307,106 @@ func TestBelongsToRelationPreloading(t *testing.T) {
 	})
 }
 
+func TestSoftDelete(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u1 := &models.User{Name: "Active User", Email: "active@test.com"}
+	u2 := &models.User{Name: "Soft Deleted User", Email: "deleted@test.com"}
+	if err := queries.InsertUser(ctx, db, u1); err != nil {
+		t.Fatalf("failed to insert u1: %v", err)
+	}
+	if err := queries.InsertUser(ctx, db, u2); err != nil {
+		t.Fatalf("failed to insert u2: %v", err)
+	}
+
+	// 1. Verify initial count
+	initialCount, err := queries.CountUsers(ctx, db)
+	if err != nil || initialCount != 2 {
+		t.Fatalf("expected initial count 2, got %d (err: %v)", initialCount, err)
+	}
+
+	// 2. Perform soft delete on u2
+	if err := queries.DeleteUser(ctx, db, u2.ID); err != nil {
+		t.Fatalf("DeleteUser (soft delete) failed: %v", err)
+	}
+
+	// 3. GetUserByID should return ErrNoRows by default for soft-deleted record
+	_, err = queries.GetUserByID(ctx, db, u2.ID)
+	if err == nil {
+		t.Fatalf("expected ErrNoRows for soft-deleted user, got nil error")
+	}
+
+	// 4. GetUserByID with IncludeDeleted option should return u2 with non-nil DeletedAt timestamp
+	deletedUser, err := queries.GetUserByID(ctx, db, u2.ID, queries.IncludeDeleted())
+	if err != nil {
+		t.Fatalf("GetUserByID with IncludeDeleted failed: %v", err)
+	}
+	if deletedUser.DeletedAt == nil {
+		t.Errorf("expected DeletedAt timestamp to be set on soft-deleted user")
+	}
+
+	// 5. ExistsUserByID default vs IncludeDeleted
+	exists, err := queries.ExistsUserByID(ctx, db, u2.ID)
+	if err != nil || exists {
+		t.Errorf("ExistsUserByID should return false for soft-deleted user by default, got (%v, %v)", exists, err)
+	}
+
+	existsWithDeleted, err := queries.ExistsUserByID(ctx, db, u2.ID, queries.IncludeDeleted())
+	if err != nil || !existsWithDeleted {
+		t.Errorf("ExistsUserByID with IncludeDeleted should return true, got (%v, %v)", existsWithDeleted, err)
+	}
+
+	// 6. CountUsers default vs IncludeDeleted
+	count, err := queries.CountUsers(ctx, db)
+	if err != nil || count != 1 {
+		t.Errorf("CountUsers default = %d, want 1 (active user only)", count)
+	}
+
+	countAll, err := queries.CountUsers(ctx, db, queries.IncludeDeleted())
+	if err != nil || countAll != 2 {
+		t.Errorf("CountUsers with IncludeDeleted = %d, want 2", countAll)
+	}
+
+	// 7. FetchAllUsers default vs IncludeDeleted
+	activeUsers, err := queries.FetchAllUsers(ctx, db)
+	if err != nil || len(activeUsers) != 1 {
+		t.Fatalf("FetchAllUsers default returned %d users, want 1", len(activeUsers))
+	}
+	if activeUsers[0].ID != u1.ID {
+		t.Errorf("FetchAllUsers returned user ID %d, want active user ID %d", activeUsers[0].ID, u1.ID)
+	}
+
+	allUsers, err := queries.FetchAllUsers(ctx, db, queries.IncludeDeleted())
+	if err != nil || len(allUsers) != 2 {
+		t.Fatalf("FetchAllUsers with IncludeDeleted returned %d users, want 2", len(allUsers))
+	}
+
+	// 8. Preloaded BelongsTo should filter out soft-deleted user
+	order := &models.Order{UserID: u2.ID, Amount: 75.00}
+	if err := queries.InsertOrder(ctx, db, order); err != nil {
+		t.Fatalf("InsertOrder failed: %v", err)
+	}
+
+	fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.PreloadAssociations(true))
+	if err != nil {
+		t.Fatalf("GetOrderByID with preload failed: %v", err)
+	}
+	if fetchedOrder.User != nil {
+		t.Errorf("expected preloaded User to be nil for soft-deleted parent, got %+v", fetchedOrder.User)
+	}
+
+	// 9. HardDelete permanently removes the soft-deleted row
+	if err := queries.DeleteUser(ctx, db, u2.ID, queries.HardDelete()); err != nil {
+		t.Fatalf("DeleteUser with HardDelete failed: %v", err)
+	}
+
+	_, err = queries.GetUserByID(ctx, db, u2.ID, queries.IncludeDeleted())
+	if err == nil {
+		t.Errorf("expected ErrNoRows after HardDelete even with IncludeDeleted(), got user record")
+	}
+}
+
 func TestUpdateAndDelete(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -324,16 +425,17 @@ func TestUpdateAndDelete(t *testing.T) {
 		t.Errorf("got name %q, want 'Updated Name'", fetchedUser.Name)
 	}
 
+	// DeleteUser performs soft-delete (model contains DeletedAt)
 	if err := queries.DeleteUser(ctx, db, user.ID); err != nil {
 		t.Fatalf("DeleteUser failed: %v", err)
 	}
 
 	userExists, _ := queries.ExistsUserByID(ctx, db, user.ID)
 	if userExists {
-		t.Errorf("expected user to be deleted, but still exists")
+		t.Errorf("expected user to be excluded after soft delete")
 	}
 
-	// 2. Test Order Update & Delete
+	// 2. Test Order Update & Delete (Hard Delete, Order lacks DeletedAt)
 	newUser := &models.User{Name: "Order User", Email: "ou@test.com"}
 	_ = queries.InsertUser(ctx, db, newUser)
 
@@ -358,6 +460,84 @@ func TestUpdateAndDelete(t *testing.T) {
 	if orderExists {
 		t.Errorf("expected order to be deleted, but still exists")
 	}
+}
+
+func TestDeleteWithConditions(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Seed users: 3 spam users and 2 valid users
+	seedUsers := []*models.User{
+		{Name: "Spam 1", Email: "s1@spam.com"},
+		{Name: "Spam 2", Email: "s2@spam.com"},
+		{Name: "Spam 3", Email: "s3@spam.com"},
+		{Name: "Valid 1", Email: "v1@test.com"},
+		{Name: "Valid 2", Email: "v2@test.com"},
+	}
+
+	for _, u := range seedUsers {
+		if err := queries.InsertUser(ctx, db, u); err != nil {
+			t.Fatalf("failed to insert seed user: %v", err)
+		}
+	}
+
+	t.Run("Rejects execution when no options are provided", func(t *testing.T) {
+		affected, err := queries.DeleteUsers(ctx, db)
+		if err == nil {
+			t.Fatalf("expected error when calling DeleteUsers without options, got nil")
+		}
+		if affected != 0 {
+			t.Errorf("expected 0 affected rows on error, got %d", affected)
+		}
+
+		// Ensure no rows were deleted
+		count, err := queries.CountUsers(ctx, db)
+		if err != nil || count != 5 {
+			t.Errorf("CountUsers = %d, want 5 (err: %v)", count, err)
+		}
+	})
+
+	t.Run("Bulk soft-deletes matching users", func(t *testing.T) {
+		affected, err := queries.DeleteUsers(ctx, db, queries.Where("email LIKE $1", "%@spam.com"))
+		if err != nil {
+			t.Fatalf("DeleteUsers failed: %v", err)
+		}
+		if affected != 3 {
+			t.Fatalf("got %d affected rows, want 3", affected)
+		}
+
+		// Active count should drop from 5 to 2
+		activeCount, err := queries.CountUsers(ctx, db)
+		if err != nil || activeCount != 2 {
+			t.Errorf("CountUsers active = %d, want 2 (err: %v)", activeCount, err)
+		}
+
+		// Total count including soft-deleted should remain 5
+		totalCount, err := queries.CountUsers(ctx, db, queries.IncludeDeleted())
+		if err != nil || totalCount != 5 {
+			t.Errorf("CountUsers with IncludeDeleted = %d, want 5 (err: %v)", totalCount, err)
+		}
+	})
+
+	t.Run("Bulk hard-deletes soft-deleted users", func(t *testing.T) {
+		affected, err := queries.DeleteUsers(ctx, db,
+			queries.Where("email LIKE $1", "%@spam.com"),
+			queries.IncludeDeleted(),
+			queries.HardDelete(),
+		)
+		if err != nil {
+			t.Fatalf("DeleteUsers with HardDelete failed: %v", err)
+		}
+		if affected != 3 {
+			t.Fatalf("got %d affected rows, want 3", affected)
+		}
+
+		// Total count including soft-deleted should now be 2
+		totalCount, err := queries.CountUsers(ctx, db, queries.IncludeDeleted())
+		if err != nil || totalCount != 2 {
+			t.Errorf("CountUsers after HardDelete = %d, want 2 (err: %v)", totalCount, err)
+		}
+	})
 }
 
 func TestTransactionSupport(t *testing.T) {

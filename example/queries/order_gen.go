@@ -85,7 +85,7 @@ func GetOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (
 }
 
 // ExistsOrderByID reports whether a Order record with the given primary key exists.
-func ExistsOrderByID(ctx context.Context, db DBTX, id int64) (bool, error) {
+func ExistsOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (bool, error) {
 	if db == nil {
 		return false, errors.New("existsOrderByID: db is nil")
 	}
@@ -105,7 +105,7 @@ func CountOrders(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 		return 0, errors.New("countOrders: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", opts...)
+	clause, args, _ := applyQueryOptions("", "", opts...)
 	query := "SELECT COUNT(*) FROM orders" + clause
 
 	var count int64
@@ -121,8 +121,7 @@ func FetchAllOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*model
 		return nil, errors.New("fetchAllOrders: db is nil")
 	}
 
-	clause, args, cfg := applyQueryOptions("order_id", opts...)
-
+	clause, args, cfg := applyQueryOptions("order_id", "", opts...)
 	if cfg.PreloadAssociations {
 		return fetchAllOrdersWithRelations(ctx, db, clause, args)
 	}
@@ -152,11 +151,12 @@ func FetchAllOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*model
 }
 
 func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Order, error) {
+
 	const query = `
 		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at
 		FROM orders p
-		LEFT JOIN users r0 ON r0.id = p.user_id
+		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
 		WHERE p.order_id = $1
 	`
 
@@ -177,6 +177,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 		var r0_Name string
 		var r0_Email string
 		var r0_CreatedAt time.Time
+		var r0_DeletedAt time.Time
 
 		scanArgs := []any{
 			&p.ID, &p.UserID, &p.Amount,
@@ -185,6 +186,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 			scanNullable(&r0_Name),
 			scanNullable(&r0_Email),
 			scanNullable(&r0_CreatedAt),
+			scanNullable(&r0_DeletedAt),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -204,6 +206,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 					Name:      r0_Name,
 					Email:     r0_Email,
 					CreatedAt: toPtr(r0_CreatedAt),
+					DeletedAt: toPtr(r0_DeletedAt),
 				}
 
 				parent.User = &child
@@ -231,9 +234,9 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 	` + clause + `
 		)
 		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at
 		FROM p
-		LEFT JOIN users r0 ON r0.id = p.user_id
+		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
 		ORDER BY p.order_id ASC
 	`
 
@@ -255,6 +258,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 		var r0_Name string
 		var r0_Email string
 		var r0_CreatedAt time.Time
+		var r0_DeletedAt time.Time
 
 		scanArgs := []any{
 			&p.ID, &p.UserID, &p.Amount,
@@ -263,6 +267,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 			scanNullable(&r0_Name),
 			scanNullable(&r0_Email),
 			scanNullable(&r0_CreatedAt),
+			scanNullable(&r0_DeletedAt),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -289,6 +294,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 					Name:      r0_Name,
 					Email:     r0_Email,
 					CreatedAt: toPtr(r0_CreatedAt),
+					DeletedAt: toPtr(r0_DeletedAt),
 				}
 
 				parent.User = &child
@@ -336,7 +342,9 @@ func UpdateOrder(ctx context.Context, db DBTX, m *models.Order) error {
 }
 
 // DeleteOrder deletes the Order record identified by id from orders.
-func DeleteOrder(ctx context.Context, db DBTX, id int64) error {
+// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
+// unless the HardDelete() query option is supplied.
+func DeleteOrder(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteOrder: db is nil")
 	}
@@ -356,4 +364,36 @@ func DeleteOrder(ctx context.Context, db DBTX, id int64) error {
 		return fmt.Errorf("deleteOrder(%v): %w", id, sql.ErrNoRows)
 	}
 	return nil
+}
+
+// DeleteOrders deletes records from orders matching the provided query options and returns the number of affected rows.
+// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
+// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
+func DeleteOrders(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
+	if db == nil {
+		return 0, errors.New("deleteOrders: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return 0, errors.New("deleteOrders: query options/where clause required to prevent accidental bulk deletion")
+	}
+
+	clause, args, _ := applyQueryOptions("", "", opts...)
+
+	var query string
+
+	query = "DELETE FROM orders" + clause
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleteOrders: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("deleteOrders: detecting rows affected: %w", err)
+	}
+
+	return n, nil
 }

@@ -17,7 +17,7 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// QueryOptions provides optional filtering, ordering, grouping, having, pagination, and association preloading for queries.
+// QueryOptions provides optional filtering, ordering, grouping, having, pagination, association preloading, and soft-delete controls for queries.
 type QueryOptions struct {
 	Where               string
 	Args                []any
@@ -27,6 +27,8 @@ type QueryOptions struct {
 	Limit               int
 	Offset              int
 	PreloadAssociations bool
+	IncludeDeleted      bool
+	HardDelete          bool
 }
 
 type QueryOption func(*QueryOptions)
@@ -267,6 +269,20 @@ func PreloadAssociations(preload bool) QueryOption {
 	}
 }
 
+// IncludeDeleted includes soft-deleted records (where deleted_at IS NOT NULL) in query results.
+func IncludeDeleted() QueryOption {
+	return func(o *QueryOptions) {
+		o.IncludeDeleted = true
+	}
+}
+
+// HardDelete forces permanent SQL deletion on models supporting soft deletes.
+func HardDelete() QueryOption {
+	return func(o *QueryOptions) {
+		o.HardDelete = true
+	}
+}
+
 // DateRange applies date range filter on a date column.
 // e.g DateRange("DATE(created_at)", "2021-01-01", "2021-12-31")
 // It does nothing if start or end is empty.
@@ -382,8 +398,17 @@ func parseQueryOptions(opts ...QueryOption) QueryOptions {
 	return cfg
 }
 
-func applyQueryOptions(defaultPK string, opts ...QueryOption) (string, []any, QueryOptions) {
+func applyQueryOptions(defaultPK string, deletedAtCol string, opts ...QueryOption) (string, []any, QueryOptions) {
 	cfg := parseQueryOptions(opts...)
+
+	if deletedAtCol != "" && !cfg.IncludeDeleted {
+		clause := deletedAtCol + " IS NULL"
+		if cfg.Where != "" {
+			cfg.Where = clause + " AND " + cfg.Where
+		} else {
+			cfg.Where = clause
+		}
+	}
 
 	var sb strings.Builder
 	args := cfg.Args

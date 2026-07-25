@@ -28,6 +28,7 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 		{col: "name", val: m.Name, omitIfZero: false},
 		{col: "email", val: m.Email, omitIfZero: false},
 		{col: "created_at", val: m.CreatedAt, omitIfZero: false},
+		{col: "deleted_at", val: m.DeletedAt, omitIfZero: false},
 	}
 
 	cols := make([]string, 0, len(fields))
@@ -45,13 +46,13 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	var query string
 	if len(cols) == 0 {
-		query = "INSERT INTO users DEFAULT VALUES RETURNING id, name, email, created_at"
+		query = "INSERT INTO users DEFAULT VALUES RETURNING id, name, email, created_at, deleted_at"
 	} else {
-		query = fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING id, name, email, created_at",
+		query = fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING id, name, email, created_at, deleted_at",
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt); err != nil {
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt); err != nil {
 		return fmt.Errorf("insertUser: %w", err)
 	}
 	return nil
@@ -69,15 +70,18 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 		return getUserByIDWithRelations(ctx, db, id, cfg)
 	}
 
-	const query = `
-		SELECT id, name, email, created_at
+	query := `
+		SELECT id, name, email, created_at, deleted_at
 		FROM users
 		WHERE id = $1
 	`
+	if !cfg.IncludeDeleted {
+		query += " AND deleted_at IS NULL"
+	}
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m models.User
-	if err := row.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt); err != nil {
+	if err := row.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt); err != nil {
 		return nil, fmt.Errorf("getUserByID(%v): %w", id, err)
 	}
 
@@ -85,12 +89,17 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 }
 
 // ExistsUserByID reports whether a User record with the given primary key exists.
-func ExistsUserByID(ctx context.Context, db DBTX, id int64) (bool, error) {
+func ExistsUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (bool, error) {
 	if db == nil {
 		return false, errors.New("existsUserByID: db is nil")
 	}
 
-	const query = `SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`
+	cfg := parseQueryOptions(opts...)
+	query := `SELECT EXISTS(SELECT 1 FROM users WHERE id = $1`
+	if !cfg.IncludeDeleted {
+		query += " AND deleted_at IS NULL"
+	}
+	query += ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
@@ -105,7 +114,7 @@ func CountUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 		return 0, errors.New("countUsers: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", opts...)
+	clause, args, _ := applyQueryOptions("", "deleted_at", opts...)
 	query := "SELECT COUNT(*) FROM users" + clause
 
 	var count int64
@@ -121,13 +130,12 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 		return nil, errors.New("fetchAllUsers: db is nil")
 	}
 
-	clause, args, cfg := applyQueryOptions("id", opts...)
-
+	clause, args, cfg := applyQueryOptions("id", "deleted_at", opts...)
 	if cfg.PreloadAssociations {
 		return fetchAllUsersWithRelations(ctx, db, clause, args)
 	}
 
-	query := "SELECT id, name, email, created_at FROM users" + clause
+	query := "SELECT id, name, email, created_at, deleted_at FROM users" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -138,7 +146,7 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 	items := make([]*models.User, 0, 16)
 	for rows.Next() {
 		var m models.User
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt); err != nil {
 			return nil, fmt.Errorf("fetchAllUsers: scanning row: %w", err)
 		}
 		items = append(items, &m)
@@ -152,13 +160,17 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 }
 
 func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.User, error) {
-	const query = `
+
+	query := `
 		SELECT 
-			p.id, p.name, p.email, p.created_at, r0.order_id, r0.user_id, r0.amount
+			p.id, p.name, p.email, p.created_at, p.deleted_at, r0.order_id, r0.user_id, r0.amount
 		FROM users p
 		LEFT JOIN orders r0 ON r0.user_id = p.id
 		WHERE p.id = $1
 	`
+	if !cfg.IncludeDeleted {
+		query += " AND p.deleted_at IS NULL"
+	}
 
 	rows, err := db.QueryContext(ctx, query, id)
 	if err != nil {
@@ -178,7 +190,7 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 		var r0_Amount float64
 
 		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, &p.CreatedAt,
+			&p.ID, &p.Name, &p.Email, &p.CreatedAt, &p.DeletedAt,
 
 			scanNullable(&r0_ID),
 			scanNullable(&r0_UserID),
@@ -223,12 +235,12 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.User, error) {
 	query := `
 		WITH p AS (
-			SELECT p.id, p.name, p.email, p.created_at
+			SELECT p.id, p.name, p.email, p.created_at, p.deleted_at
 			FROM users p
 	` + clause + `
 		)
 		SELECT 
-			p.id, p.name, p.email, p.created_at, r0.order_id, r0.user_id, r0.amount
+			p.id, p.name, p.email, p.created_at, p.deleted_at, r0.order_id, r0.user_id, r0.amount
 		FROM p
 		LEFT JOIN orders r0 ON r0.user_id = p.id
 		ORDER BY p.id ASC
@@ -253,7 +265,7 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 		var r0_Amount float64
 
 		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, &p.CreatedAt,
+			&p.ID, &p.Name, &p.Email, &p.CreatedAt, &p.DeletedAt,
 
 			scanNullable(&r0_ID),
 			scanNullable(&r0_UserID),
@@ -310,11 +322,11 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	const query = `
 		UPDATE users
-		SET name = $1, email = $2, created_at = $3
-		WHERE id = $4
+		SET name = $1, email = $2, created_at = $3, deleted_at = $4
+		WHERE id = $5
 	`
 
-	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, m.ID)
+	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt, m.ID)
 	if err != nil {
 		return fmt.Errorf("updateUser(%v): %w", m.ID, err)
 	}
@@ -330,9 +342,28 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 }
 
 // DeleteUser deletes the User record identified by id from users.
-func DeleteUser(ctx context.Context, db DBTX, id int64) error {
+// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
+// unless the HardDelete() query option is supplied.
+func DeleteUser(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteUser: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if !cfg.HardDelete {
+		const query = `UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1 AND deleted_at IS NULL`
+		res, err := db.ExecContext(ctx, query, id)
+		if err != nil {
+			return fmt.Errorf("deleteUser(%v): %w", id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("detect rows affected: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("deleteUser(%v): %w", id, sql.ErrNoRows)
+		}
+		return nil
 	}
 
 	const query = `DELETE FROM users WHERE id = $1`
@@ -350,4 +381,40 @@ func DeleteUser(ctx context.Context, db DBTX, id int64) error {
 		return fmt.Errorf("deleteUser(%v): %w", id, sql.ErrNoRows)
 	}
 	return nil
+}
+
+// DeleteUsers deletes records from users matching the provided query options and returns the number of affected rows.
+// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
+// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
+func DeleteUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
+	if db == nil {
+		return 0, errors.New("deleteUsers: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return 0, errors.New("deleteUsers: query options/where clause required to prevent accidental bulk deletion")
+	}
+
+	clause, args, cfg := applyQueryOptions("", "deleted_at", opts...)
+
+	var query string
+
+	if !cfg.HardDelete {
+		query = "UPDATE users SET deleted_at = CURRENT_TIMESTAMP" + clause
+	} else {
+		query = "DELETE FROM users" + clause
+	}
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleteUsers: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("deleteUsers: detecting rows affected: %w", err)
+	}
+
+	return n, nil
 }
