@@ -327,7 +327,7 @@ func UpdateOrder(ctx context.Context, db DBTX, m *models.Order) error {
 
 	n, err := res.RowsAffected()
 	if err != nil {
-		return nil
+		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
 		return fmt.Errorf("updateOrder(%v): %w", m.ID, sql.ErrNoRows)
@@ -350,7 +350,7 @@ func DeleteOrder(ctx context.Context, db DBTX, id int64) error {
 
 	n, err := res.RowsAffected()
 	if err != nil {
-		return nil
+		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
 		return fmt.Errorf("deleteOrder(%v): %w", id, sql.ErrNoRows)

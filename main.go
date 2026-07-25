@@ -458,32 +458,29 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string) (Re
 	structTag := reflect.StructTag(rawTag)
 	gormTag := structTag.Get("gorm")
 
-	switch t := field.Type.(type) {
-	case *ast.ArrayType:
-		elemIdent, ok := t.Elt.(*ast.Ident)
-		if !ok || !elemIdent.IsExported() {
-			return rel, false
-		}
+	fieldType := field.Type
+
+	// Detect HasMany (slice) vs BelongsTo (scalar)
+	if arrayType, ok := fieldType.(*ast.ArrayType); ok {
 		rel.Type = RelHasMany
-		rel.TargetModel = elemIdent.Name
-	case *ast.StarExpr:
-		ident, ok := t.X.(*ast.Ident)
-		if !ok || !ident.IsExported() {
-			return rel, false
-		}
+		fieldType = arrayType.Elt
+	} else {
 		rel.Type = RelBelongsTo
-		rel.TargetModel = ident.Name
+	}
+
+	// Detect if pointer
+	if starExpr, ok := fieldType.(*ast.StarExpr); ok {
 		rel.IsPointer = true
-	case *ast.Ident:
-		if !t.IsExported() {
-			return rel, false
-		}
-		rel.Type = RelBelongsTo
-		rel.TargetModel = t.Name
-		rel.IsPointer = false
-	default:
+		fieldType = starExpr.X
+	}
+
+	// Relations within the same package are Identifiers (e.g. User or Order).
+	// Imported types like time.Time or uuid.UUID are SelectorExpr and NOT model relations.
+	ident, ok := fieldType.(*ast.Ident)
+	if !ok || !ident.IsExported() {
 		return rel, false
 	}
+	rel.TargetModel = ident.Name
 
 	if gormTag != "" {
 		for part := range strings.SplitSeq(gormTag, ";") {
@@ -1707,7 +1704,7 @@ func Update{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 
 	n, err := res.RowsAffected()
 	if err != nil {
-		return nil
+		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
 		return fmt.Errorf("update{{.Name}}(%v): %w", m.{{.PK.Name}}, sql.ErrNoRows)
@@ -1730,7 +1727,7 @@ func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.Type}}) error {
 
 	n, err := res.RowsAffected()
 	if err != nil {
-		return nil
+		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
 		return fmt.Errorf("delete{{.Name}}(%v): %w", id, sql.ErrNoRows)
