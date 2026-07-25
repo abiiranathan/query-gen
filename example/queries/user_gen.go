@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
 )
@@ -19,13 +20,38 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 		return errors.New("insertUser: m is nil")
 	}
 
-	const query = `
-		INSERT INTO users (name, email, created_at)
-		VALUES ($1, $2, $3)
-		RETURNING id
-	`
+	fields := []struct {
+		col        string
+		val        any
+		omitIfZero bool
+	}{
+		{col: "name", val: m.Name, omitIfZero: false},
+		{col: "email", val: m.Email, omitIfZero: false},
+		{col: "created_at", val: m.CreatedAt, omitIfZero: false},
+	}
 
-	if err := db.QueryRowContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt).Scan(&m.ID); err != nil {
+	cols := make([]string, 0, len(fields))
+	args := make([]any, 0, len(fields))
+	placeholders := make([]string, 0, len(fields))
+
+	for _, f := range fields {
+		if f.omitIfZero && IsZero(f.val) {
+			continue
+		}
+		cols = append(cols, f.col)
+		args = append(args, f.val)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+	}
+
+	var query string
+	if len(cols) == 0 {
+		query = "INSERT INTO users DEFAULT VALUES RETURNING id, name, email, created_at"
+	} else {
+		query = fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING id, name, email, created_at",
+			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+	}
+
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.Name, &m.Email, &m.CreatedAt); err != nil {
 		return fmt.Errorf("insertUser: %w", err)
 	}
 	return nil
@@ -168,7 +194,7 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 		}
 
 		rPk0 := r0_ID
-		if !isZero(rPk0) {
+		if !IsZero(rPk0) {
 			if !seen_Orders[rPk0] {
 				seen_Orders[rPk0] = true
 				child := models.Order{
@@ -250,7 +276,7 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 		}
 
 		rPk0 := r0_ID
-		if !isZero(rPk0) {
+		if !IsZero(rPk0) {
 			if !seen_Orders[pPK][rPk0] {
 				seen_Orders[pPK][rPk0] = true
 				child := models.Order{

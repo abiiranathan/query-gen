@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/abiiranathan/query-gen/example/models"
@@ -20,13 +21,37 @@ func InsertOrder(ctx context.Context, db DBTX, m *models.Order) error {
 		return errors.New("insertOrder: m is nil")
 	}
 
-	const query = `
-		INSERT INTO orders (user_id, amount)
-		VALUES ($1, $2)
-		RETURNING order_id
-	`
+	fields := []struct {
+		col        string
+		val        any
+		omitIfZero bool
+	}{
+		{col: "user_id", val: m.UserID, omitIfZero: false},
+		{col: "amount", val: m.Amount, omitIfZero: false},
+	}
 
-	if err := db.QueryRowContext(ctx, query, &m.UserID, &m.Amount).Scan(&m.ID); err != nil {
+	cols := make([]string, 0, len(fields))
+	args := make([]any, 0, len(fields))
+	placeholders := make([]string, 0, len(fields))
+
+	for _, f := range fields {
+		if f.omitIfZero && IsZero(f.val) {
+			continue
+		}
+		cols = append(cols, f.col)
+		args = append(args, f.val)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+	}
+
+	var query string
+	if len(cols) == 0 {
+		query = "INSERT INTO orders DEFAULT VALUES RETURNING order_id, user_id, amount"
+	} else {
+		query = fmt.Sprintf("INSERT INTO orders (%s) VALUES (%s) RETURNING order_id, user_id, amount",
+			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+	}
+
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.UserID, &m.Amount); err != nil {
 		return fmt.Errorf("insertOrder: %w", err)
 	}
 	return nil
@@ -171,14 +196,14 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 		}
 
 		rPk0 := r0_ID
-		if !isZero(rPk0) {
+		if !IsZero(rPk0) {
 			if !seen_User[rPk0] {
 				seen_User[rPk0] = true
 				child := models.User{
 					ID:        r0_ID,
 					Name:      r0_Name,
 					Email:     r0_Email,
-					CreatedAt: r0_CreatedAt,
+					CreatedAt: toPtr(r0_CreatedAt),
 				}
 
 				parent.User = &child
@@ -256,14 +281,14 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 		}
 
 		rPk0 := r0_ID
-		if !isZero(rPk0) {
+		if !IsZero(rPk0) {
 			if !seen_User[pPK][rPk0] {
 				seen_User[pPK][rPk0] = true
 				child := models.User{
 					ID:        r0_ID,
 					Name:      r0_Name,
 					Email:     r0_Email,
-					CreatedAt: r0_CreatedAt,
+					CreatedAt: toPtr(r0_CreatedAt),
 				}
 
 				parent.User = &child

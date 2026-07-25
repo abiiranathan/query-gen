@@ -73,6 +73,17 @@ type Field struct {
 	IsIgnore   bool       // True if the field is excluded entirely (gorm:"-").
 	Nullable   bool       // True if the column may return SQL NULL (gorm:"null" or a pointer type).
 	Permission Permission // Read/write visibility permission.
+	HasDefault bool       // True if the field tag contains a default clause.
+}
+
+// IsPointer reports whether the field is a pointer type.
+func (f Field) IsPointer() bool {
+	return strings.HasPrefix(f.Type, "*")
+}
+
+// IsTimestamp reports whether the field represents a time.Time struct.
+func (f Field) IsTimestamp() bool {
+	return f.BaseType() == "time.Time"
 }
 
 // Writable reports whether this field should appear in an INSERT statement.
@@ -157,7 +168,6 @@ func (m Model) UpdatableFields() []Field {
 func (m Model) AllColumns(prefix string) string {
 	fields := m.SelectableFields()
 	var sb strings.Builder
-	// Preallocate estimate: avg column name len (~10 chars) + prefix + separator
 	sb.Grow(len(fields) * 16)
 
 	for i, f := range fields {
@@ -544,6 +554,9 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 
 		case lower == "primarykey" || lower == "primary_key":
 			f.IsPK = true
+
+		case strings.HasPrefix(lower, "default:"):
+			f.HasDefault = true
 
 		case lower == "not null" || lower == "notnull":
 			notNullSeen = true
@@ -1280,9 +1293,34 @@ func toFloat64(src any) (float64, bool) {
 	}
 }
 
-func isZero[T comparable](v T) bool {
-	var zero T
-	return v == zero
+func IsZero(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	switch t := v.(type) {
+	case time.Time:
+		return t.IsZero()
+	case *time.Time:
+		return t == nil || t.IsZero()
+	}
+
+	val := reflect.ValueOf(v)
+	if val.Kind() == reflect.Pointer {
+		if val.IsNil() {
+			return true
+		}
+		return val.Elem().IsZero()
+	}
+
+	return val.IsZero()
+}
+
+func toPtr[T any](v T) *T {
+	if IsZero(v) {
+		return nil
+	}
+	return &v
 }
 `
 
@@ -1321,6 +1359,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"{{.ModelPkg}}"
 )
@@ -1334,13 +1373,37 @@ func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 		return errors.New("insert{{.Name}}: m is nil")
 	}
 
-	const query = ` + "`" + `
-		INSERT INTO {{.Table}} ({{.InsertColumns}})
-		VALUES ({{.InsertPlaceholders}})
-		RETURNING {{.PK.Column}}
-	` + "`" + `
+	fields := []struct {
+		col        string
+		val        any
+		omitIfZero bool
+	}{
+		{{range .WritableFields}}{col: "{{.Column}}", val: m.{{.Name}}, omitIfZero: {{or .HasDefault (and .IsTimestamp (not .Nullable))}}},
+		{{end}}
+	}
 
-	if err := db.QueryRowContext(ctx, query, {{.WritableScanArgs "m"}}).Scan(&m.{{.PK.Name}}); err != nil {
+	cols := make([]string, 0, len(fields))
+	args := make([]any, 0, len(fields))
+	placeholders := make([]string, 0, len(fields))
+
+	for _, f := range fields {
+		if f.omitIfZero && IsZero(f.val) {
+			continue
+		}
+		cols = append(cols, f.col)
+		args = append(args, f.val)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+	}
+
+	var query string
+	if len(cols) == 0 {
+		query = "INSERT INTO {{.Table}} DEFAULT VALUES RETURNING {{.AllColumns ""}}"
+	} else {
+		query = fmt.Sprintf("INSERT INTO {{.Table}} (%s) VALUES (%s) RETURNING {{.AllColumns ""}}",
+			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+	}
+
+	if err := db.QueryRowContext(ctx, query, args...).Scan({{.AllScanArgs "m"}}); err != nil {
 		return fmt.Errorf("insert{{.Name}}: %w", err)
 	}
 	return nil
@@ -1496,11 +1559,11 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Type}}
 		{{range $idx, $rel := .Relations}}
 		{{$target := index $.AllKnownModels $rel.TargetModel}}
 		rPk{{$idx}} := r{{$idx}}_{{$target.PK.Name}}
-		if !isZero(rPk{{$idx}}) {
+		if !IsZero(rPk{{$idx}}) {
 			if !seen_{{$rel.FieldName}}[rPk{{$idx}}] {
 				seen_{{$rel.FieldName}}[rPk{{$idx}}] = true
 				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-					{{range $target.SelectableFields}}{{.Name}}: r{{$idx}}_{{.Name}},
+					{{range $target.SelectableFields}}{{.Name}}: {{if .IsPointer}}toPtr(r{{$idx}}_{{.Name}}){{else}}r{{$idx}}_{{.Name}}{{end}},
 					{{end}}
 				}
 				{{if eq $rel.Type "HasMany"}}
@@ -1593,11 +1656,11 @@ func fetchAll{{.Name}}sWithRelations(ctx context.Context, db DBTX, clause string
 		{{range $idx, $rel := .Relations}}
 		{{$target := index $.AllKnownModels $rel.TargetModel}}
 		rPk{{$idx}} := r{{$idx}}_{{$target.PK.Name}}
-		if !isZero(rPk{{$idx}}) {
+		if !IsZero(rPk{{$idx}}) {
 			if !seen_{{$rel.FieldName}}[pPK][rPk{{$idx}}] {
 				seen_{{$rel.FieldName}}[pPK][rPk{{$idx}}] = true
 				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-					{{range $target.SelectableFields}}{{.Name}}: r{{$idx}}_{{.Name}},
+					{{range $target.SelectableFields}}{{.Name}}: {{if .IsPointer}}toPtr(r{{$idx}}_{{.Name}}){{else}}r{{$idx}}_{{.Name}}{{end}},
 					{{end}}
 				}
 				{{if eq $rel.Type "HasMany"}}

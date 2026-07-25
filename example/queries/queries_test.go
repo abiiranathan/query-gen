@@ -26,7 +26,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
 		email TEXT,
-		created_at DATETIME
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
 	CREATE TABLE IF NOT EXISTS orders (
@@ -56,7 +56,7 @@ func TestInsertAndGetByID(t *testing.T) {
 	user := &models.User{
 		Name:      "Alice",
 		Email:     "alice@example.com",
-		CreatedAt: now,
+		CreatedAt: &now,
 	}
 
 	// 1. Test InsertUser

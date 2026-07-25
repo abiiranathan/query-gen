@@ -701,7 +701,32 @@ func toFloat64(src any) (float64, bool) {
 	}
 }
 
-func isZero[T comparable](v T) bool {
-	var zero T
-	return v == zero
+func IsZero(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	switch t := v.(type) {
+	case time.Time:
+		return t.IsZero()
+	case *time.Time:
+		return t == nil || t.IsZero()
+	}
+
+	val := reflect.ValueOf(v)
+	if val.Kind() == reflect.Pointer {
+		if val.IsNil() {
+			return true
+		}
+		return val.Elem().IsZero()
+	}
+
+	return val.IsZero()
+}
+
+func toPtr[T any](v T) *T {
+	if IsZero(v) {
+		return nil
+	}
+	return &v
 }
