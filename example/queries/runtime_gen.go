@@ -18,6 +18,32 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// inBatchSize sets the maximum number of bind parameters per IN clause batch.
+// 999 is chosen to conform to SQLite3's default maximum limit (SQLITE_MAX_VARIABLE_NUMBER).
+const inBatchSize = 999
+
+// batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
+// concatenating results to avoid exceeding database SQL parameter limits.
+func batchIn[T any](ctx context.Context, db DBTX, ids []any, fetch func(ctx context.Context, db DBTX, batch []any) ([]T, error)) ([]T, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if len(ids) <= inBatchSize {
+		return fetch(ctx, db, ids)
+	}
+
+	results := make([]T, 0, len(ids))
+	for i := 0; i < len(ids); i += inBatchSize {
+		end := min(i+inBatchSize, len(ids))
+		batch, err := fetch(ctx, db, ids[i:end])
+		if err != nil {
+			return nil, fmt.Errorf("batchIn: batch [%d:%d]: %w", i, end, err)
+		}
+		results = append(results, batch...)
+	}
+	return results, nil
+}
+
 // QueryOptions provides optional filtering, ordering, grouping, having, pagination, association preloading, and soft-delete controls for queries.
 type QueryOptions struct {
 	Where               string
@@ -73,13 +99,21 @@ func In(column string, values ...any) QueryOption {
 			return
 		}
 
-		placeholders := make([]string, 0, len(values))
-		for _, v := range values {
-			o.Args = append(o.Args, v)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", len(o.Args)))
-		}
+		var sb strings.Builder
+		sb.WriteString(column)
+		sb.WriteString(" IN (")
 
-		clause := fmt.Sprintf("%s IN (%s)", column, strings.Join(placeholders, ", "))
+		for i, v := range values {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			o.Args = append(o.Args, v)
+			sb.WriteByte('$')
+			sb.WriteString(strconv.Itoa(len(o.Args)))
+		}
+		sb.WriteByte(')')
+
+		clause := sb.String()
 		if o.Where != "" {
 			o.Where += " AND " + clause
 		} else {
@@ -800,4 +834,11 @@ func toPtr[T any](v T) *T {
 		return nil
 	}
 	return &v
+}
+
+// seenKey uniquely identifies a (parent, child) primary key pair, used to
+// de-duplicate JOIN fan-out without allocating a nested map per parent.
+type seenKey[P comparable, C comparable] struct {
+	parent P
+	child  C
 }

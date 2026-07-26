@@ -66,7 +66,7 @@ func GetOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (
 	cfg := parseQueryOptions(opts...)
 
 	if cfg.PreloadAssociations {
-		return getOrderByIDWithRelations(ctx, db, id, cfg)
+		return getOrdersByIDWithRelations(ctx, db, id, cfg)
 	}
 
 	const query = `
@@ -145,173 +145,6 @@ func FetchAllOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*model
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("fetchAllOrders: iterating rows: %w", err)
-	}
-
-	return items, nil
-}
-
-func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Order, error) {
-
-	const query = `
-		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
-		FROM orders p
-		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
-		WHERE p.order_id = $1
-	`
-
-	rows, err := db.QueryContext(ctx, query, id)
-	if err != nil {
-		return nil, fmt.Errorf("getOrderByIDWithRelations(%v): %w", id, err)
-	}
-	defer rows.Close()
-
-	var parent *models.Order
-
-	seen_User := make(map[int64]bool, 4)
-
-	for rows.Next() {
-		var p models.Order
-
-		var r0_ID int64
-		var r0_Name string
-		var r0_Email string
-		var r0_CreatedAt time.Time
-		var r0_DeletedAt time.Time
-		var r0_Age models.Age
-
-		scanArgs := []any{
-			&p.ID, &p.UserID, &p.Amount,
-
-			scanNullable(&r0_ID),
-			scanNullable(&r0_Name),
-			scanNullable(&r0_Email),
-			scanNullable(&r0_CreatedAt),
-			scanNullable(&r0_DeletedAt),
-			scanNullable(&r0_Age),
-		}
-
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("getOrderByIDWithRelations(%v): scanning row: %w", id, err)
-		}
-
-		if parent == nil {
-			parent = &p
-		}
-
-		rPk0 := r0_ID
-		if !IsZero(rPk0) {
-			if !seen_User[rPk0] {
-				seen_User[rPk0] = true
-				child := models.User{
-					ID:        r0_ID,
-					Name:      r0_Name,
-					Email:     r0_Email,
-					CreatedAt: r0_CreatedAt,
-					DeletedAt: toPtr(r0_DeletedAt),
-					Age:       r0_Age,
-				}
-
-				parent.User = &child
-
-			}
-		}
-
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("getOrderByIDWithRelations(%v): iterating rows: %w", id, err)
-	}
-	if parent == nil {
-		return nil, fmt.Errorf("getOrderByIDWithRelations(%v): %w", id, sql.ErrNoRows)
-	}
-
-	return parent, nil
-}
-
-func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.Order, error) {
-	query := `
-		WITH p AS (
-			SELECT p.order_id, p.user_id, p.amount
-			FROM orders p
-	` + clause + `
-		)
-		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
-		FROM p
-		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
-		ORDER BY p.order_id ASC
-	`
-
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAllOrdersWithRelations: %w", err)
-	}
-	defer rows.Close()
-
-	items := make([]*models.Order, 0, 16)
-	itemsMap := make(map[int64]*models.Order, 16)
-
-	seen_User := make(map[int64]map[int64]bool, 16)
-
-	for rows.Next() {
-		var p models.Order
-
-		var r0_ID int64
-		var r0_Name string
-		var r0_Email string
-		var r0_CreatedAt time.Time
-		var r0_DeletedAt time.Time
-		var r0_Age models.Age
-
-		scanArgs := []any{
-			&p.ID, &p.UserID, &p.Amount,
-
-			scanNullable(&r0_ID),
-			scanNullable(&r0_Name),
-			scanNullable(&r0_Email),
-			scanNullable(&r0_CreatedAt),
-			scanNullable(&r0_DeletedAt),
-			scanNullable(&r0_Age),
-		}
-
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("fetchAllOrdersWithRelations: scanning row: %w", err)
-		}
-
-		pPK := p.ID
-		parent, exists := itemsMap[pPK]
-		if !exists {
-			parent = &p
-			itemsMap[pPK] = parent
-			items = append(items, parent)
-
-			seen_User[pPK] = make(map[int64]bool, 4)
-
-		}
-
-		rPk0 := r0_ID
-		if !IsZero(rPk0) {
-			if !seen_User[pPK][rPk0] {
-				seen_User[pPK][rPk0] = true
-				child := models.User{
-					ID:        r0_ID,
-					Name:      r0_Name,
-					Email:     r0_Email,
-					CreatedAt: r0_CreatedAt,
-					DeletedAt: toPtr(r0_DeletedAt),
-					Age:       r0_Age,
-				}
-
-				parent.User = &child
-
-			}
-		}
-
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("fetchAllOrdersWithRelations: iterating rows: %w", err)
 	}
 
 	return items, nil
@@ -402,4 +235,182 @@ func DeleteOrders(ctx context.Context, db DBTX, opts ...QueryOption) (int64, err
 	}
 
 	return n, nil
+}
+
+// ================= FETCHING RELATIONS ===============================
+
+func getOrdersByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Order, error) {
+
+	const query = `
+		SELECT 
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
+		FROM orders p
+		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
+		WHERE p.order_id = $1
+	`
+
+	rows, err := db.QueryContext(ctx, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("getOrdersByIDWithRelations(%v): %w", id, err)
+	}
+	defer rows.Close()
+
+	var parent *models.Order
+	var p models.Order
+
+	seen_User := make(map[int64]struct{}, 4)
+	var r0_ID int64
+	var r0_Name string
+	var r0_Email string
+	var r0_CreatedAt time.Time
+	var r0_DeletedAt time.Time
+	var r0_Age models.Age
+
+	// scanArgs is built once and reused for every row the JOIN fans out.
+	// The query is scoped to a single parent id, so p only needs to be
+	// captured on the first row; every relation's scan targets are copied
+	// by value into a child struct before the next Scan call overwrites
+	// them. Reusing the same destinations avoids reallocating the []any
+	// slice and every scan target on each iteration.
+	scanArgs := []any{
+		&p.ID, &p.UserID, &p.Amount,
+
+		scanNullable(&r0_ID),
+		scanNullable(&r0_Name),
+		scanNullable(&r0_Email),
+		scanNullable(&r0_CreatedAt),
+		scanNullable(&r0_DeletedAt),
+		scanNullable(&r0_Age),
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("getOrdersByIDWithRelations(%v): scanning row: %w", id, err)
+		}
+
+		if parent == nil {
+			parent = &p
+		}
+
+		rPk0 := r0_ID
+		if !IsZero(rPk0) {
+			if _, ok := seen_User[rPk0]; !ok {
+				seen_User[rPk0] = struct{}{}
+				child := models.User{
+					ID:        r0_ID,
+					Name:      r0_Name,
+					Email:     r0_Email,
+					CreatedAt: r0_CreatedAt,
+					DeletedAt: toPtr(r0_DeletedAt),
+					Age:       r0_Age,
+				}
+
+				parent.User = &child
+
+			}
+		}
+
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("getOrdersByIDWithRelations(%v): iterating rows: %w", id, err)
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("getOrdersByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+	}
+
+	return parent, nil
+}
+
+func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.Order, error) {
+	query := `
+		WITH p AS (
+			SELECT p.order_id, p.user_id, p.amount
+			FROM orders p
+	` + clause + `
+		)
+		SELECT 
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
+		FROM p
+		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
+		ORDER BY p.order_id ASC
+	`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAllOrdersWithRelations: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]*models.Order, 0, 16)
+	itemsMap := make(map[int64]*models.Order, 16)
+
+	// seen_User de-duplicates the row fan-out produced by the
+	// User JOIN. It is keyed by (parent PK, child PK) in a
+	// single flat map instead of a map of maps, so discovering a new
+	// parent no longer allocates a fresh inner map, and all keys live in
+	// one hash table for better cache locality.
+	seen_User := make(map[seenKey[int64, int64]]struct{}, 64)
+	var r0_ID int64
+	var r0_Name string
+	var r0_Email string
+	var r0_CreatedAt time.Time
+	var r0_DeletedAt time.Time
+	var r0_Age models.Age
+
+	for rows.Next() {
+		// p must be a fresh variable on every iteration: when it turns out
+		// to be a new parent, its address is stored in itemsMap/items and
+		// must remain valid for the lifetime of the returned slice.
+		var p models.Order
+
+		scanArgs := []any{
+			&p.ID, &p.UserID, &p.Amount,
+
+			scanNullable(&r0_ID),
+			scanNullable(&r0_Name),
+			scanNullable(&r0_Email),
+			scanNullable(&r0_CreatedAt),
+			scanNullable(&r0_DeletedAt),
+			scanNullable(&r0_Age),
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("fetchAllOrdersWithRelations: scanning row: %w", err)
+		}
+
+		pPK := p.ID
+		parent, exists := itemsMap[pPK]
+		if !exists {
+			parent = &p
+			itemsMap[pPK] = parent
+			items = append(items, parent)
+		}
+
+		rPk0 := r0_ID
+		if !IsZero(rPk0) {
+			key0 := seenKey[int64, int64]{parent: pPK, child: rPk0}
+			if _, ok := seen_User[key0]; !ok {
+				seen_User[key0] = struct{}{}
+				child := models.User{
+					ID:        r0_ID,
+					Name:      r0_Name,
+					Email:     r0_Email,
+					CreatedAt: r0_CreatedAt,
+					DeletedAt: toPtr(r0_DeletedAt),
+					Age:       r0_Age,
+				}
+
+				parent.User = &child
+
+			}
+		}
+
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetchAllOrdersWithRelations: iterating rows: %w", err)
+	}
+
+	return items, nil
 }

@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// setupTestDB creates an in-memory SQLite database matching the example schema.
+// setupTestDB creates an in-memory SQLite database matching the updated example schema.
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 
@@ -27,8 +27,8 @@ func setupTestDB(t *testing.T) *sql.DB {
 		name TEXT NOT NULL,
 		email TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		deleted_at TIMESTAMPTZ,
-    	age varchar(20) NOT NULL
+		deleted_at DATETIME,
+		age VARCHAR(20) NOT NULL
 	);
 
 	CREATE TABLE IF NOT EXISTS orders (
@@ -36,6 +36,35 @@ func setupTestDB(t *testing.T) *sql.DB {
 		user_id INTEGER NOT NULL,
 		amount REAL NOT NULL,
 		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS projects (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		description TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		deleted_at DATETIME
+	);
+
+	CREATE TABLE IF NOT EXISTS tags (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL,
+		name TEXT NOT NULL,
+		FOREIGN KEY (project_id) REFERENCES projects(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS categories (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL,
+		name TEXT NOT NULL,
+		FOREIGN KEY (project_id) REFERENCES projects(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		FOREIGN KEY (project_id) REFERENCES projects(id)
 	);
 	`
 
@@ -860,4 +889,134 @@ func TestFilterOptions(t *testing.T) {
 			t.Errorf("Lte got %d orders, want 2 (err: %v)", len(lteOrders), err)
 		}
 	})
+}
+
+// ============ Many to many =========================
+func TestInsertAndGetProjectWithRelations(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := &models.Project{
+		Name:        "Query Generator Engine",
+		Description: "Type-safe SQL generator for Go",
+		CreatedAt:   time.Now().Truncate(time.Second),
+	}
+
+	if err := queries.InsertProject(ctx, db, project); err != nil {
+		t.Fatalf("InsertProject failed: %v", err)
+	}
+
+	tag1 := &models.Tag{ProjectID: project.ID, Name: "golang"}
+	tag2 := &models.Tag{ProjectID: project.ID, Name: "database"}
+	if err := queries.InsertTag(ctx, db, tag1); err != nil {
+		t.Fatalf("InsertTag failed: %v", err)
+	}
+	if err := queries.InsertTag(ctx, db, tag2); err != nil {
+		t.Fatalf("InsertTag failed: %v", err)
+	}
+
+	cat := &models.Category{ProjectID: project.ID, Name: "Developer Tools"}
+	if err := queries.InsertCategory(ctx, db, cat); err != nil {
+		t.Fatalf("InsertCategory failed: %v", err)
+	}
+
+	task1 := &models.Task{ProjectID: project.ID, Title: "Add batching support"}
+	task2 := &models.Task{ProjectID: project.ID, Title: "Write integration tests"}
+	if err := queries.InsertTask(ctx, db, task1); err != nil {
+		t.Fatalf("InsertTask failed: %v", err)
+	}
+	if err := queries.InsertTask(ctx, db, task2); err != nil {
+		t.Fatalf("InsertTask failed: %v", err)
+	}
+
+	fetched, err := queries.GetProjectByID(ctx, db, project.ID, queries.PreloadAssociations(true))
+	if err != nil {
+		t.Fatalf("GetProjectByID with preloading failed: %v", err)
+	}
+
+	if len(fetched.Tags) != 2 {
+		t.Errorf("expected 2 tags preloaded, got %d", len(fetched.Tags))
+	}
+	if len(fetched.Categories) != 1 {
+		t.Errorf("expected 1 category preloaded, got %d", len(fetched.Categories))
+	}
+	if len(fetched.Tasks) != 2 {
+		t.Errorf("expected 2 tasks preloaded, got %d", len(fetched.Tasks))
+	}
+}
+
+func TestFetchAllProjectsWithRelations(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	p1 := &models.Project{Name: "Project Alpha", Description: "First project"}
+	p2 := &models.Project{Name: "Project Beta", Description: "Second project"}
+	if err := queries.InsertProject(ctx, db, p1); err != nil {
+		t.Fatalf("InsertProject p1 failed: %v", err)
+	}
+	if err := queries.InsertProject(ctx, db, p2); err != nil {
+		t.Fatalf("InsertProject p2 failed: %v", err)
+	}
+
+	_ = queries.InsertTag(ctx, db, &models.Tag{ProjectID: p1.ID, Name: "backend"})
+	_ = queries.InsertTag(ctx, db, &models.Tag{ProjectID: p2.ID, Name: "frontend"})
+	_ = queries.InsertCategory(ctx, db, &models.Category{ProjectID: p1.ID, Name: "System"})
+	_ = queries.InsertTask(ctx, db, &models.Task{ProjectID: p1.ID, Title: "Task 1"})
+	_ = queries.InsertTask(ctx, db, &models.Task{ProjectID: p2.ID, Title: "Task 2"})
+
+	// PreloadAssociations triggers split IN-query batching for the 3 HasMany relations
+	projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(true))
+	if err != nil {
+		t.Fatalf("FetchAllProjects with preloading failed: %v", err)
+	}
+
+	if len(projects) != 2 {
+		t.Fatalf("expected 2 projects, got %d", len(projects))
+	}
+
+	projMap := make(map[int64]*models.Project, len(projects))
+	for _, p := range projects {
+		projMap[p.ID] = p
+	}
+
+	p1Fetched := projMap[p1.ID]
+	if len(p1Fetched.Tags) != 1 || len(p1Fetched.Categories) != 1 || len(p1Fetched.Tasks) != 1 {
+		t.Errorf("p1 association mismatch: tags=%d, categories=%d, tasks=%d",
+			len(p1Fetched.Tags), len(p1Fetched.Categories), len(p1Fetched.Tasks))
+	}
+
+	p2Fetched := projMap[p2.ID]
+	if len(p2Fetched.Tags) != 1 || len(p2Fetched.Tasks) != 1 {
+		t.Errorf("p2 association mismatch: tags=%d, tasks=%d",
+			len(p2Fetched.Tags), len(p2Fetched.Tasks))
+	}
+}
+
+func TestDeleteProject(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	p := &models.Project{Name: "Transient Project"}
+	if err := queries.InsertProject(ctx, db, p); err != nil {
+		t.Fatalf("InsertProject failed: %v", err)
+	}
+
+	// Test soft delete behavior
+	if err := queries.DeleteProject(ctx, db, p.ID); err != nil {
+		t.Fatalf("DeleteProject failed: %v", err)
+	}
+
+	exists, err := queries.ExistsProjectByID(ctx, db, p.ID)
+	if err != nil {
+		t.Fatalf("ExistsProjectByID failed: %v", err)
+	}
+	if exists {
+		t.Errorf("expected soft-deleted project to not exist in standard queries")
+	}
+
+	// Verify project remains visible with IncludeDeleted
+	existsDeleted, err := queries.ExistsProjectByID(ctx, db, p.ID, queries.IncludeDeleted())
+	if err != nil || !existsDeleted {
+		t.Errorf("expected soft-deleted project to exist when IncludeDeleted option is used")
+	}
 }

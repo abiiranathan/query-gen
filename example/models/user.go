@@ -18,3 +18,38 @@ type User struct {
 
 	Orders []Order `gorm:"foreignKey:UserID;references:ID"`
 }
+
+// Tag represents a label attached to a Project.
+type Tag struct {
+	ID        int64  `gorm:"primaryKey"`
+	ProjectID int64  `gorm:"not null;column:project_id"`
+	Name      string `gorm:"not null"`
+}
+
+// Category represents a classification group for a Project.
+type Category struct {
+	ID        int64  `gorm:"primaryKey"`
+	ProjectID int64  `gorm:"not null;column:project_id"`
+	Name      string `gorm:"not null"`
+}
+
+// Task represents a work item associated with a Project.
+type Task struct {
+	ID        int64  `gorm:"primaryKey"`
+	ProjectID int64  `gorm:"not null;column:project_id"`
+	Title     string `gorm:"not null"`
+}
+
+// Project represents a workspace entity containing multiple associated collections.
+// Because it has 3 HasMany relations, relation preloading uses separate batched IN queries.
+type Project struct {
+	ID          int64      `gorm:"primaryKey"`
+	Name        string     `gorm:"not null"`
+	Description string     `gorm:"column:description"`
+	CreatedAt   time.Time  `gorm:"column:created_at"`
+	DeletedAt   *time.Time `gorm:"null;column:deleted_at"`
+
+	Tags       []Tag      `gorm:"foreignKey:ProjectID"`
+	Categories []Category `gorm:"foreignKey:ProjectID"`
+	Tasks      []Task     `gorm:"foreignKey:ProjectID"`
+}
