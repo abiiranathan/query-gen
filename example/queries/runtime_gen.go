@@ -323,8 +323,8 @@ func Offset(offset int) QueryOption {
 	}
 }
 
-// PreloadAssociations enables or disables preloading associated model relations.
-func PreloadAssociations(preload bool) QueryOption {
+// Preload enables or disables preloading associated model relations.
+func Preload(preload bool) QueryOption {
 	return func(o *QueryOptions) {
 		o.PreloadAssociations = preload
 	}

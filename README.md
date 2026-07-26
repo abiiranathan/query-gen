@@ -121,7 +121,7 @@ func main() {
     }
 
     // 2. Fetch record by ID with preloaded orders (excluding soft-deleted)
-    fetchedUser, err := queries.GetUserByID(ctx, db, user.ID, queries.PreloadAssociations(true))
+    fetchedUser, err := queries.GetUserByID(ctx, db, user.ID, queries.Preload(true))
     if err != nil {
         log.Fatal(err)
     }
@@ -231,7 +231,7 @@ type PaginationResult[T any] struct {
 | **`GroupBy`**             | `GroupBy(groupBy string)`                 | `queries.GroupBy("user_id")`                                   |
 | **`Limit`**               | `Limit(limit int)`                        | `queries.Limit(25)`                                            |
 | **`Offset`**              | `Offset(offset int)`                      | `queries.Offset(50)`                                           |
-| **`PreloadAssociations`** | `PreloadAssociations(preload bool)`       | `queries.PreloadAssociations(true)`                            |
+| **`PreloadAssociations`** | `Preload(preload bool)`                   | `queries.Preload(true)`                                        |
 | **`IncludeDeleted`**      | `IncludeDeleted()`                        | `queries.IncludeDeleted()`                                     |
 | **`HardDelete`**          | `HardDelete()`                            | `queries.HardDelete()`                                         |
 

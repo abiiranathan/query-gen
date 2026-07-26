@@ -142,6 +142,20 @@ func (f Field) BaseType() string {
 	return strings.TrimPrefix(f.Type, "*")
 }
 
+// BulkInsertBatchSize returns the maximum number of model instances per bulk insert query
+// to keep total bind parameters safely under SQL variable limits (999).
+func (m Model) BulkInsertBatchSize() int {
+	numCols := len(m.WritableFields())
+	if numCols == 0 {
+		return 100
+	}
+	batchSize := 999 / numCols
+	if batchSize < 1 {
+		return 1
+	}
+	return batchSize
+}
+
 // builtinTypes lists Go predeclared types and common aliases that never
 // need a package qualifier when referenced from a generated package.
 var builtinTypes = map[string]bool{
@@ -1549,8 +1563,8 @@ func Offset(offset int) QueryOption {
 	}
 }
 
-// PreloadAssociations enables or disables preloading associated model relations.
-func PreloadAssociations(preload bool) QueryOption {
+// Preload enables or disables preloading associated model relations.
+func Preload(preload bool) QueryOption {
 	return func(o *QueryOptions) {
 		o.PreloadAssociations = preload
 	}
@@ -2194,6 +2208,103 @@ func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 	return nil
 }
 
+// ============ Bulk insert ========================
+
+// Insert{{.NamePlural}} inserts multiple {{.Name}} records into {{.Table}} in efficient parameter-bounded batches.
+// Automatically populates database-generated values (e.g., auto-increment primary keys, default values) back into input structs via RETURNING.
+func Insert{{.NamePlural}}(ctx context.Context, db DBTX, models []*{{.ModelPkgAlias}}.{{.Name}}) error {
+	if db == nil {
+		return errors.New("insert{{.NamePlural}}: db is nil")
+	}
+	if len(models) == 0 {
+		return nil
+	}
+		
+	const batchSize = {{.BulkInsertBatchSize}}
+	for i := 0; i < len(models); i += batchSize {
+		end := min((i + batchSize), len(models))
+		batch := models[i:end]
+		if err := insert{{.NamePlural}}Batch(ctx, db, batch); err != nil {
+			return fmt.Errorf("insert{{.NamePlural}}: batch [%d:%d]: %w", i, end, err)
+		}
+	}
+	return nil
+}
+
+func insert{{.NamePlural}}Batch(ctx context.Context, db DBTX, batch []*{{.ModelPkgAlias}}.{{.Name}}) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	{{$writable := .WritableFields -}}
+	{{$numCols := len $writable -}}
+	{{if eq $numCols 0 -}}
+	for i, m := range batch {
+		if m == nil {
+			return fmt.Errorf("insert{{$.NamePlural}}Batch: model at index %d is nil", i)
+		}
+		const query = "INSERT INTO {{$.Table}} DEFAULT VALUES RETURNING {{$.AllColumns ""}}"
+		if err := db.QueryRowContext(ctx, query).Scan({{$.AllScanArgs "m"}}); err != nil {
+			return fmt.Errorf("insert{{$.NamePlural}}Batch row %d: %w", i, err)
+		}
+	}
+	return nil
+	{{else -}}
+	args := make([]any, 0, len(batch)*{{$numCols}})
+	var sb strings.Builder
+	sb.Grow(128 + len(batch)*{{$numCols}}*8)
+	sb.WriteString("INSERT INTO {{.Table}} ({{.InsertColumns}}) VALUES ")
+
+	paramIdx := 1
+	for i, m := range batch {
+		if m == nil {
+			return fmt.Errorf("model at index %d is nil", i)
+		}
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('(')
+		{{range $j, $f := $writable -}}
+		{{if gt $j 0}}sb.WriteString(", "){{end}}
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.{{$f.Name}})
+		{{end -}}
+		sb.WriteByte(')')
+	}
+
+	sb.WriteString(" RETURNING {{.AllColumns ""}}")
+	rows, err := db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return fmt.Errorf("executing bulk insert: %w", err)
+	}
+	defer rows.Close()
+
+	idx := 0
+	for rows.Next() {
+		if idx >= len(batch) {
+			return errors.New("unexpected extra row returned from insert")
+		}
+		m := batch[idx]
+		if err := rows.Scan({{.AllScanArgs "m"}}); err != nil {
+			return fmt.Errorf("scanning row %d: %w", idx, err)
+		}
+		idx++
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating bulk insert rows: %w", err)
+	}
+
+	if idx < len(batch) {
+		return fmt.Errorf("expected %d inserted rows, got %d", len(batch), idx)
+	}
+
+	return nil
+	{{end -}}
+}
+
+
 // Get{{.Name}}ByID retrieves a single {{.Name}} record from {{.Table}} by its primary key.
 func Get{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	if db == nil {
@@ -2642,7 +2753,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 }
 {{else}}
 func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	opts := []QueryOption{PreloadAssociations(false)}
+	opts := []QueryOption{Preload(false)}
 	if cfg.IncludeDeleted {
 		opts = append(opts, IncludeDeleted())
 	}

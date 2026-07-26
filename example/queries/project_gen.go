@@ -59,6 +59,97 @@ func InsertProject(ctx context.Context, db DBTX, m *models.Project) error {
 	return nil
 }
 
+// ============ Bulk insert ========================
+
+// InsertProjects inserts multiple Project records into projects in efficient parameter-bounded batches.
+// Automatically populates database-generated values (e.g., auto-increment primary keys, default values) back into input structs via RETURNING.
+func InsertProjects(ctx context.Context, db DBTX, models []*models.Project) error {
+	if db == nil {
+		return errors.New("insertProjects: db is nil")
+	}
+	if len(models) == 0 {
+		return nil
+	}
+
+	const batchSize = 249
+	for i := 0; i < len(models); i += batchSize {
+		end := min((i + batchSize), len(models))
+		batch := models[i:end]
+		if err := insertProjectsBatch(ctx, db, batch); err != nil {
+			return fmt.Errorf("insertProjects: batch [%d:%d]: %w", i, end, err)
+		}
+	}
+	return nil
+}
+
+func insertProjectsBatch(ctx context.Context, db DBTX, batch []*models.Project) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	args := make([]any, 0, len(batch)*4)
+	var sb strings.Builder
+	sb.Grow(128 + len(batch)*4*8)
+	sb.WriteString("INSERT INTO projects (name, description, created_at, deleted_at) VALUES ")
+
+	paramIdx := 1
+	for i, m := range batch {
+		if m == nil {
+			return fmt.Errorf("model at index %d is nil", i)
+		}
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('(')
+
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.Name)
+		sb.WriteString(", ")
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.Description)
+		sb.WriteString(", ")
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.CreatedAt)
+		sb.WriteString(", ")
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.DeletedAt)
+		sb.WriteByte(')')
+	}
+
+	sb.WriteString(" RETURNING id, name, description, created_at, deleted_at")
+	rows, err := db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return fmt.Errorf("executing bulk insert: %w", err)
+	}
+	defer rows.Close()
+
+	idx := 0
+	for rows.Next() {
+		if idx >= len(batch) {
+			return errors.New("unexpected extra row returned from insert")
+		}
+		m := batch[idx]
+		if err := rows.Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+			return fmt.Errorf("scanning row %d: %w", idx, err)
+		}
+		idx++
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating bulk insert rows: %w", err)
+	}
+
+	if idx < len(batch) {
+		return fmt.Errorf("expected %d inserted rows, got %d", len(batch), idx)
+	}
+
+	return nil
+}
+
 // GetProjectByID retrieves a single Project record from projects by its primary key.
 func GetProjectByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*models.Project, error) {
 	if db == nil {
@@ -279,7 +370,7 @@ func DeleteProjects(ctx context.Context, db DBTX, opts ...QueryOption) (int64, e
 
 // ================= FETCHING RELATIONS ===============================
 func getProjectByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Project, error) {
-	opts := []QueryOption{PreloadAssociations(false)}
+	opts := []QueryOption{Preload(false)}
 	if cfg.IncludeDeleted {
 		opts = append(opts, IncludeDeleted())
 	}

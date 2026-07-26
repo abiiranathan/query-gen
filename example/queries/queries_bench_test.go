@@ -72,7 +72,7 @@ func BenchmarkPreload_SplitQueries(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		fetchedUsers, err := queries.FetchAllUsers(ctx, db, queries.PreloadAssociations(true))
+		fetchedUsers, err := queries.FetchAllUsers(ctx, db, queries.Preload(true))
 		if err != nil {
 			b.Fatalf("FetchAllUsers failed: %v", err)
 		}

@@ -58,6 +58,89 @@ func InsertOrder(ctx context.Context, db DBTX, m *models.Order) error {
 	return nil
 }
 
+// ============ Bulk insert ========================
+
+// InsertOrders inserts multiple Order records into orders in efficient parameter-bounded batches.
+// Automatically populates database-generated values (e.g., auto-increment primary keys, default values) back into input structs via RETURNING.
+func InsertOrders(ctx context.Context, db DBTX, models []*models.Order) error {
+	if db == nil {
+		return errors.New("insertOrders: db is nil")
+	}
+	if len(models) == 0 {
+		return nil
+	}
+
+	const batchSize = 499
+	for i := 0; i < len(models); i += batchSize {
+		end := min((i + batchSize), len(models))
+		batch := models[i:end]
+		if err := insertOrdersBatch(ctx, db, batch); err != nil {
+			return fmt.Errorf("insertOrders: batch [%d:%d]: %w", i, end, err)
+		}
+	}
+	return nil
+}
+
+func insertOrdersBatch(ctx context.Context, db DBTX, batch []*models.Order) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	args := make([]any, 0, len(batch)*2)
+	var sb strings.Builder
+	sb.Grow(128 + len(batch)*2*8)
+	sb.WriteString("INSERT INTO orders (user_id, amount) VALUES ")
+
+	paramIdx := 1
+	for i, m := range batch {
+		if m == nil {
+			return fmt.Errorf("model at index %d is nil", i)
+		}
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('(')
+
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.UserID)
+		sb.WriteString(", ")
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.Amount)
+		sb.WriteByte(')')
+	}
+
+	sb.WriteString(" RETURNING order_id, user_id, amount")
+	rows, err := db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return fmt.Errorf("executing bulk insert: %w", err)
+	}
+	defer rows.Close()
+
+	idx := 0
+	for rows.Next() {
+		if idx >= len(batch) {
+			return errors.New("unexpected extra row returned from insert")
+		}
+		m := batch[idx]
+		if err := rows.Scan(&m.ID, &m.UserID, &m.Amount); err != nil {
+			return fmt.Errorf("scanning row %d: %w", idx, err)
+		}
+		idx++
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating bulk insert rows: %w", err)
+	}
+
+	if idx < len(batch) {
+		return fmt.Errorf("expected %d inserted rows, got %d", len(batch), idx)
+	}
+
+	return nil
+}
+
 // GetOrderByID retrieves a single Order record from orders by its primary key.
 func GetOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*models.Order, error) {
 	if db == nil {

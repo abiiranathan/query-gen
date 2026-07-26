@@ -215,6 +215,57 @@ func TestInsertAndGetByID(t *testing.T) {
 	}
 }
 
+func TestInsertUsers_Bulk(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	const totalUsers = 1000
+	now := time.Now().Truncate(time.Second)
+
+	users := make([]*models.User, totalUsers)
+	for i := range totalUsers {
+		users[i] = &models.User{
+			Name:      fmt.Sprintf("User %d", i+1),
+			Email:     fmt.Sprintf("user%d@example.com", i+1),
+			CreatedAt: now,
+		}
+	}
+
+	// 1. Bulk insert 1000 users (exercises internal batching & parameter limits)
+	if err := queries.InsertUsers(ctx, db, users); err != nil {
+		t.Fatalf("InsertUsers failed: %v", err)
+	}
+
+	// 2. Verify all 1000 structs received a non-zero database primary key ID
+	for i, u := range users {
+		if u.ID == 0 {
+			t.Fatalf("expected non-zero user ID at index %d after bulk insert", i)
+		}
+	}
+
+	// 3. Verify total count in database
+	count, err := queries.CountUsers(ctx, db)
+	if err != nil {
+		t.Fatalf("CountUsers failed: %v", err)
+	}
+	if count != int64(totalUsers) {
+		t.Errorf("got total count %d, want %d", count, totalUsers)
+	}
+
+	// 4. Verify boundary and sample records (first, middle, last)
+	sampleIndices := []int{0, totalUsers / 2, totalUsers - 1}
+	for _, idx := range sampleIndices {
+		expected := users[idx]
+		fetched, err := queries.GetUserByID(ctx, db, expected.ID)
+		if err != nil {
+			t.Fatalf("GetUserByID failed for user ID %d (index %d): %v", expected.ID, idx, err)
+		}
+		if fetched.Name != expected.Name || fetched.Email != expected.Email {
+			t.Errorf("mismatch at index %d: got %+v, want %+v", idx, fetched, expected)
+		}
+	}
+}
+
 func TestExistsAndCount(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -332,7 +383,7 @@ func TestHasManyRelationPreloading(t *testing.T) {
 		}
 	}
 
-	t.Run("GetUserByID with PreloadAssociations false (default)", func(t *testing.T) {
+	t.Run("GetUserByID with Preload false (default)", func(t *testing.T) {
 		fetchedUser, err := queries.GetUserByID(ctx, db, user.ID)
 		if err != nil {
 			t.Fatalf("GetUserByID failed: %v", err)
@@ -342,8 +393,8 @@ func TestHasManyRelationPreloading(t *testing.T) {
 		}
 	})
 
-	t.Run("GetUserByID with PreloadAssociations true", func(t *testing.T) {
-		fetchedUser, err := queries.GetUserByID(ctx, db, user.ID, queries.PreloadAssociations(true))
+	t.Run("GetUserByID with Preload true", func(t *testing.T) {
+		fetchedUser, err := queries.GetUserByID(ctx, db, user.ID, queries.Preload(true))
 		if err != nil {
 			t.Fatalf("GetUserByID with preload failed: %v", err)
 		}
@@ -352,10 +403,10 @@ func TestHasManyRelationPreloading(t *testing.T) {
 		}
 	})
 
-	t.Run("FetchAllUsers with PreloadAssociations true", func(t *testing.T) {
+	t.Run("FetchAllUsers with Preload true", func(t *testing.T) {
 		users, err := queries.FetchAllUsers(ctx, db,
 			queries.Where("id = $1", user.ID),
-			queries.PreloadAssociations(true),
+			queries.Preload(true),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllUsers with preload failed: %v", err)
@@ -383,7 +434,7 @@ func TestBelongsToRelationPreloading(t *testing.T) {
 		t.Fatalf("failed to insert order: %v", err)
 	}
 
-	t.Run("GetOrderByID with PreloadAssociations false (default)", func(t *testing.T) {
+	t.Run("GetOrderByID with Preload false (default)", func(t *testing.T) {
 		fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID)
 		if err != nil {
 			t.Fatalf("GetOrderByID failed: %v", err)
@@ -393,8 +444,8 @@ func TestBelongsToRelationPreloading(t *testing.T) {
 		}
 	})
 
-	t.Run("GetOrderByID with PreloadAssociations true", func(t *testing.T) {
-		fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.PreloadAssociations(true))
+	t.Run("GetOrderByID with Preload true", func(t *testing.T) {
+		fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.Preload(true))
 		if err != nil {
 			t.Fatalf("GetOrderByID with preload failed: %v", err)
 		}
@@ -406,10 +457,10 @@ func TestBelongsToRelationPreloading(t *testing.T) {
 		}
 	})
 
-	t.Run("FetchAllOrders with PreloadAssociations true", func(t *testing.T) {
+	t.Run("FetchAllOrders with Preload true", func(t *testing.T) {
 		orders, err := queries.FetchAllOrders(ctx, db,
 			queries.Where("amount > $1", 200.00),
-			queries.PreloadAssociations(true),
+			queries.Preload(true),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllOrders with preload failed: %v", err)
@@ -504,7 +555,7 @@ func TestSoftDelete(t *testing.T) {
 		t.Fatalf("InsertOrder failed: %v", err)
 	}
 
-	fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.PreloadAssociations(true))
+	fetchedOrder, err := queries.GetOrderByID(ctx, db, order.ID, queries.Preload(true))
 	if err != nil {
 		t.Fatalf("GetOrderByID with preload failed: %v", err)
 	}
@@ -1023,7 +1074,7 @@ func TestInsertAndGetProjectWithRelations(t *testing.T) {
 		t.Fatalf("InsertTask failed: %v", err)
 	}
 
-	fetched, err := queries.GetProjectByID(ctx, db, project.ID, queries.PreloadAssociations(true))
+	fetched, err := queries.GetProjectByID(ctx, db, project.ID, queries.Preload(true))
 	if err != nil {
 		t.Fatalf("GetProjectByID with preloading failed: %v", err)
 	}
@@ -1110,7 +1161,7 @@ func TestFetchAllProjectsLargeScale(t *testing.T) {
 
 	seedLargeDataset(t, db, scaleProjectCount, scaleTagCount, scaleTaskCount)
 
-	projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(true))
+	projects, err := queries.FetchAllProjects(ctx, db, queries.Preload(true))
 	if err != nil {
 		t.Fatalf("FetchAllProjects with preloading failed: %v", err)
 	}
@@ -1146,7 +1197,7 @@ func BenchmarkFetchAllProjectsWithRelations(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(true))
+		projects, err := queries.FetchAllProjects(ctx, db, queries.Preload(true))
 		if err != nil {
 			b.Fatalf("BenchmarkFetchAllProjectsWithRelations failed: %v", err)
 		}
@@ -1167,7 +1218,7 @@ func BenchmarkFetchAllProjectsNoPreload(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(false))
+		projects, err := queries.FetchAllProjects(ctx, db, queries.Preload(false))
 		if err != nil {
 			b.Fatalf("BenchmarkFetchAllProjectsNoPreload failed: %v", err)
 		}
@@ -1196,8 +1247,8 @@ func TestFetchAllProjectsWithRelations(t *testing.T) {
 	_ = queries.InsertTask(ctx, db, &models.Task{ProjectID: p1.ID, Title: "Task 1"})
 	_ = queries.InsertTask(ctx, db, &models.Task{ProjectID: p2.ID, Title: "Task 2"})
 
-	// PreloadAssociations triggers split IN-query batching for the 3 HasMany relations
-	projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(true))
+	// Preload triggers split IN-query batching for the 3 HasMany relations
+	projects, err := queries.FetchAllProjects(ctx, db, queries.Preload(true))
 	if err != nil {
 		t.Fatalf("FetchAllProjects with preloading failed: %v", err)
 	}

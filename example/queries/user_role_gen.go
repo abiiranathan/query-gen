@@ -58,6 +58,93 @@ func InsertUserRole(ctx context.Context, db DBTX, m *models.UserRole) error {
 	return nil
 }
 
+// ============ Bulk insert ========================
+
+// InsertUserRoles inserts multiple UserRole records into user_roles in efficient parameter-bounded batches.
+// Automatically populates database-generated values (e.g., auto-increment primary keys, default values) back into input structs via RETURNING.
+func InsertUserRoles(ctx context.Context, db DBTX, models []*models.UserRole) error {
+	if db == nil {
+		return errors.New("insertUserRoles: db is nil")
+	}
+	if len(models) == 0 {
+		return nil
+	}
+
+	const batchSize = 333
+	for i := 0; i < len(models); i += batchSize {
+		end := min((i + batchSize), len(models))
+		batch := models[i:end]
+		if err := insertUserRolesBatch(ctx, db, batch); err != nil {
+			return fmt.Errorf("insertUserRoles: batch [%d:%d]: %w", i, end, err)
+		}
+	}
+	return nil
+}
+
+func insertUserRolesBatch(ctx context.Context, db DBTX, batch []*models.UserRole) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	args := make([]any, 0, len(batch)*3)
+	var sb strings.Builder
+	sb.Grow(128 + len(batch)*3*8)
+	sb.WriteString("INSERT INTO user_roles (user_id, role_id, assigned_at) VALUES ")
+
+	paramIdx := 1
+	for i, m := range batch {
+		if m == nil {
+			return fmt.Errorf("model at index %d is nil", i)
+		}
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('(')
+
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.UserID)
+		sb.WriteString(", ")
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.RoleID)
+		sb.WriteString(", ")
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.AssignedAt)
+		sb.WriteByte(')')
+	}
+
+	sb.WriteString(" RETURNING user_id, role_id, assigned_at")
+	rows, err := db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return fmt.Errorf("executing bulk insert: %w", err)
+	}
+	defer rows.Close()
+
+	idx := 0
+	for rows.Next() {
+		if idx >= len(batch) {
+			return errors.New("unexpected extra row returned from insert")
+		}
+		m := batch[idx]
+		if err := rows.Scan(&m.UserID, &m.RoleID, scanNullable(&m.AssignedAt)); err != nil {
+			return fmt.Errorf("scanning row %d: %w", idx, err)
+		}
+		idx++
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating bulk insert rows: %w", err)
+	}
+
+	if idx < len(batch) {
+		return fmt.Errorf("expected %d inserted rows, got %d", len(batch), idx)
+	}
+
+	return nil
+}
+
 // GetUserRoleByID retrieves a single UserRole record from user_roles by its primary key.
 func GetUserRoleByID(ctx context.Context, db DBTX, userID int64, roleID int64, opts ...QueryOption) (*models.UserRole, error) {
 	if db == nil {
