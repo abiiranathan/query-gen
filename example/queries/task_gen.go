@@ -50,7 +50,8 @@ func InsertTask(ctx context.Context, db DBTX, m *models.Task) error {
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.ProjectID, &m.Title); err != nil {
+	if err := db.QueryRowContext(ctx, query, args...).
+		Scan(&m.ID, &m.ProjectID, &m.Title); err != nil {
 		return fmt.Errorf("insertTask: %w", err)
 	}
 	return nil
@@ -98,11 +99,17 @@ func CountTasks(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 		return 0, errors.New("countTasks: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
-	query := "SELECT COUNT(*) FROM tasks" + clause
+	cfg := parseQueryOptions(opts...)
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	query := "SELECT COUNT(*) FROM tasks" + whereClause
 
 	var count int64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("countTasks: %w", err)
 	}
 	return count, nil
@@ -171,8 +178,6 @@ func UpdateTask(ctx context.Context, db DBTX, m *models.Task) error {
 }
 
 // DeleteTask deletes the Task record identified by id from tasks.
-// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
-// unless the HardDelete() query option is supplied.
 func DeleteTask(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteTask: db is nil")
@@ -196,8 +201,6 @@ func DeleteTask(ctx context.Context, db DBTX, id int64, opts ...QueryOption) err
 }
 
 // DeleteTasks deletes records from tasks matching the provided query options and returns the number of affected rows.
-// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
-// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
 func DeleteTasks(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
 	if db == nil {
 		return 0, errors.New("deleteTasks: db is nil")
@@ -211,7 +214,6 @@ func DeleteTasks(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 	clause, args, _ := applyQueryOptions("", "", opts...)
 
 	var query string
-
 	query = "DELETE FROM tasks" + clause
 
 	res, err := db.ExecContext(ctx, query, args...)

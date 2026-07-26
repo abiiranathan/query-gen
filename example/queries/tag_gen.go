@@ -50,7 +50,8 @@ func InsertTag(ctx context.Context, db DBTX, m *models.Tag) error {
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.ProjectID, &m.Name); err != nil {
+	if err := db.QueryRowContext(ctx, query, args...).
+		Scan(&m.ID, &m.ProjectID, &m.Name); err != nil {
 		return fmt.Errorf("insertTag: %w", err)
 	}
 	return nil
@@ -98,11 +99,17 @@ func CountTags(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error)
 		return 0, errors.New("countTags: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
-	query := "SELECT COUNT(*) FROM tags" + clause
+	cfg := parseQueryOptions(opts...)
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	query := "SELECT COUNT(*) FROM tags" + whereClause
 
 	var count int64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("countTags: %w", err)
 	}
 	return count, nil
@@ -171,8 +178,6 @@ func UpdateTag(ctx context.Context, db DBTX, m *models.Tag) error {
 }
 
 // DeleteTag deletes the Tag record identified by id from tags.
-// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
-// unless the HardDelete() query option is supplied.
 func DeleteTag(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteTag: db is nil")
@@ -196,8 +201,6 @@ func DeleteTag(ctx context.Context, db DBTX, id int64, opts ...QueryOption) erro
 }
 
 // DeleteTags deletes records from tags matching the provided query options and returns the number of affected rows.
-// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
-// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
 func DeleteTags(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
 	if db == nil {
 		return 0, errors.New("deleteTags: db is nil")
@@ -211,7 +214,6 @@ func DeleteTags(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 	clause, args, _ := applyQueryOptions("", "", opts...)
 
 	var query string
-
 	query = "DELETE FROM tags" + clause
 
 	res, err := db.ExecContext(ctx, query, args...)

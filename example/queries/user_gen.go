@@ -53,7 +53,8 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
+	if err := db.QueryRowContext(ctx, query, args...).
+		Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
 		return fmt.Errorf("insertUser: %w", err)
 	}
 	return nil
@@ -68,7 +69,7 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 	cfg := parseQueryOptions(opts...)
 
 	if cfg.PreloadAssociations {
-		return getUsersByIDWithRelations(ctx, db, id, cfg)
+		return getUserByIDWithRelations(ctx, db, id, cfg)
 	}
 
 	query := `
@@ -115,11 +116,25 @@ func CountUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 		return 0, errors.New("countUsers: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", "deleted_at", opts...)
-	query := "SELECT COUNT(*) FROM users" + clause
+	cfg := parseQueryOptions(opts...)
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	if !cfg.IncludeDeleted {
+		if whereClause != "" {
+			whereClause += " AND deleted_at IS NULL"
+		} else {
+			whereClause = " WHERE deleted_at IS NULL"
+		}
+	}
+
+	query := "SELECT COUNT(*) FROM users" + whereClause
 
 	var count int64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("countUsers: %w", err)
 	}
 	return count, nil
@@ -133,7 +148,7 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 
 	clause, args, cfg := applyQueryOptions("id", "deleted_at", opts...)
 	if cfg.PreloadAssociations {
-		return fetchAllUsersWithRelations(ctx, db, clause, args)
+		return fetchAllUsersWithRelations(ctx, db, clause, args, cfg)
 	}
 
 	query := "SELECT id, name, email, created_at, deleted_at, age FROM users" + clause
@@ -191,8 +206,6 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 }
 
 // DeleteUser deletes the User record identified by id from users.
-// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
-// unless the HardDelete() query option is supplied.
 func DeleteUser(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteUser: db is nil")
@@ -233,8 +246,6 @@ func DeleteUser(ctx context.Context, db DBTX, id int64, opts ...QueryOption) err
 }
 
 // DeleteUsers deletes records from users matching the provided query options and returns the number of affected rows.
-// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
-// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
 func DeleteUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
 	if db == nil {
 		return 0, errors.New("deleteUsers: db is nil")
@@ -248,7 +259,6 @@ func DeleteUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 	clause, args, cfg := applyQueryOptions("", "deleted_at", opts...)
 
 	var query string
-
 	if !cfg.HardDelete {
 		query = "UPDATE users SET deleted_at = CURRENT_TIMESTAMP" + clause
 	} else {
@@ -269,9 +279,7 @@ func DeleteUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 }
 
 // ================= FETCHING RELATIONS ===============================
-
-func getUsersByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.User, error) {
-
+func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.User, error) {
 	query := `
 		SELECT 
 			p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, r0.order_id, r0.user_id, r0.amount
@@ -285,7 +293,7 @@ func getUsersByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 
 	rows, err := db.QueryContext(ctx, query, id)
 	if err != nil {
-		return nil, fmt.Errorf("getUsersByIDWithRelations(%v): %w", id, err)
+		return nil, fmt.Errorf("getUserByIDWithRelations(%v): %w", id, err)
 	}
 	defer rows.Close()
 
@@ -296,16 +304,8 @@ func getUsersByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 	var r0_ID int64
 	var r0_UserID int64
 	var r0_Amount float64
-
-	// scanArgs is built once and reused for every row the JOIN fans out.
-	// The query is scoped to a single parent id, so p only needs to be
-	// captured on the first row; every relation's scan targets are copied
-	// by value into a child struct before the next Scan call overwrites
-	// them. Reusing the same destinations avoids reallocating the []any
-	// slice and every scan target on each iteration.
 	scanArgs := []any{
 		&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
-
 		scanNullable(&r0_ID),
 		scanNullable(&r0_UserID),
 		scanNullable(&r0_Amount),
@@ -313,7 +313,7 @@ func getUsersByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("getUsersByIDWithRelations(%v): scanning row: %w", id, err)
+			return nil, fmt.Errorf("getUserByIDWithRelations(%v): scanning row: %w", id, err)
 		}
 
 		if parent == nil {
@@ -329,25 +329,22 @@ func getUsersByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 					UserID: r0_UserID,
 					Amount: r0_Amount,
 				}
-
 				parent.Orders = append(parent.Orders, child)
-
 			}
 		}
-
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("getUsersByIDWithRelations(%v): iterating rows: %w", id, err)
+		return nil, fmt.Errorf("getUserByIDWithRelations(%v): iterating rows: %w", id, err)
 	}
 	if parent == nil {
-		return nil, fmt.Errorf("getUsersByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+		return nil, fmt.Errorf("getUserByIDWithRelations(%v): %w", id, sql.ErrNoRows)
 	}
 
 	return parent, nil
 }
 
-func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.User, error) {
+func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, args []any, cfg QueryOptions) ([]*models.User, error) {
 	query := `
 		WITH p AS (
 			SELECT p.id, p.name, p.email, p.created_at, p.deleted_at, p.age
@@ -370,25 +367,15 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 	items := make([]*models.User, 0, 16)
 	itemsMap := make(map[int64]*models.User, 16)
 
-	// seen_Orders de-duplicates the row fan-out produced by the
-	// Orders JOIN. It is keyed by (parent PK, child PK) in a
-	// single flat map instead of a map of maps, so discovering a new
-	// parent no longer allocates a fresh inner map, and all keys live in
-	// one hash table for better cache locality.
 	seen_Orders := make(map[seenKey[int64, int64]]struct{}, 64)
 	var r0_ID int64
 	var r0_UserID int64
 	var r0_Amount float64
-
 	for rows.Next() {
-		// p must be a fresh variable on every iteration: when it turns out
-		// to be a new parent, its address is stored in itemsMap/items and
-		// must remain valid for the lifetime of the returned slice.
 		var p models.User
 
 		scanArgs := []any{
 			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
-
 			scanNullable(&r0_ID),
 			scanNullable(&r0_UserID),
 			scanNullable(&r0_Amount),
@@ -416,12 +403,9 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 					UserID: r0_UserID,
 					Amount: r0_Amount,
 				}
-
 				parent.Orders = append(parent.Orders, child)
-
 			}
 		}
-
 	}
 
 	if err := rows.Err(); err != nil {

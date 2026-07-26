@@ -52,7 +52,8 @@ func InsertProject(ctx context.Context, db DBTX, m *models.Project) error {
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+	if err := db.QueryRowContext(ctx, query, args...).
+		Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
 		return fmt.Errorf("insertProject: %w", err)
 	}
 	return nil
@@ -67,7 +68,7 @@ func GetProjectByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption)
 	cfg := parseQueryOptions(opts...)
 
 	if cfg.PreloadAssociations {
-		return getProjectsByIDWithRelations(ctx, db, id, cfg)
+		return getProjectByIDWithRelations(ctx, db, id, cfg)
 	}
 
 	query := `
@@ -114,11 +115,25 @@ func CountProjects(ctx context.Context, db DBTX, opts ...QueryOption) (int64, er
 		return 0, errors.New("countProjects: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", "deleted_at", opts...)
-	query := "SELECT COUNT(*) FROM projects" + clause
+	cfg := parseQueryOptions(opts...)
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	if !cfg.IncludeDeleted {
+		if whereClause != "" {
+			whereClause += " AND deleted_at IS NULL"
+		} else {
+			whereClause = " WHERE deleted_at IS NULL"
+		}
+	}
+
+	query := "SELECT COUNT(*) FROM projects" + whereClause
 
 	var count int64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("countProjects: %w", err)
 	}
 	return count, nil
@@ -132,7 +147,7 @@ func FetchAllProjects(ctx context.Context, db DBTX, opts ...QueryOption) ([]*mod
 
 	clause, args, cfg := applyQueryOptions("id", "deleted_at", opts...)
 	if cfg.PreloadAssociations {
-		return fetchAllProjectsWithRelations(ctx, db, clause, args)
+		return fetchAllProjectsWithRelations(ctx, db, clause, args, cfg)
 	}
 
 	query := "SELECT id, name, description, created_at, deleted_at FROM projects" + clause
@@ -190,8 +205,6 @@ func UpdateProject(ctx context.Context, db DBTX, m *models.Project) error {
 }
 
 // DeleteProject deletes the Project record identified by id from projects.
-// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
-// unless the HardDelete() query option is supplied.
 func DeleteProject(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteProject: db is nil")
@@ -232,8 +245,6 @@ func DeleteProject(ctx context.Context, db DBTX, id int64, opts ...QueryOption) 
 }
 
 // DeleteProjects deletes records from projects matching the provided query options and returns the number of affected rows.
-// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
-// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
 func DeleteProjects(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
 	if db == nil {
 		return 0, errors.New("deleteProjects: db is nil")
@@ -247,7 +258,6 @@ func DeleteProjects(ctx context.Context, db DBTX, opts ...QueryOption) (int64, e
 	clause, args, cfg := applyQueryOptions("", "deleted_at", opts...)
 
 	var query string
-
 	if !cfg.HardDelete {
 		query = "UPDATE projects SET deleted_at = CURRENT_TIMESTAMP" + clause
 	} else {
@@ -268,15 +278,23 @@ func DeleteProjects(ctx context.Context, db DBTX, opts ...QueryOption) (int64, e
 }
 
 // ================= FETCHING RELATIONS ===============================
+func getProjectByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Project, error) {
+	opts := []QueryOption{PreloadAssociations(false)}
+	if cfg.IncludeDeleted {
+		opts = append(opts, IncludeDeleted())
+	}
 
-func getProjectsByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Project, error) {
-	m, err := GetProjectByID(ctx, db, id, PreloadAssociations(false))
+	m, err := GetProjectByID(ctx, db, id, opts...)
 	if err != nil {
 		return nil, err
 	}
 
 	{
-		children, err := FetchAllTags(ctx, db, Where("project_id = $1", m.ID))
+		preloadOpts := []QueryOption{Where("project_id = $1", m.ID)}
+		if cfg.IncludeDeleted {
+			preloadOpts = append(preloadOpts, IncludeDeleted())
+		}
+		children, err := FetchAllTags(ctx, db, preloadOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("getProjectByIDWithRelations: preloading Tags: %w", err)
 		}
@@ -287,7 +305,11 @@ func getProjectsByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Qu
 	}
 
 	{
-		children, err := FetchAllCategories(ctx, db, Where("project_id = $1", m.ID))
+		preloadOpts := []QueryOption{Where("project_id = $1", m.ID)}
+		if cfg.IncludeDeleted {
+			preloadOpts = append(preloadOpts, IncludeDeleted())
+		}
+		children, err := FetchAllCategories(ctx, db, preloadOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("getProjectByIDWithRelations: preloading Categories: %w", err)
 		}
@@ -298,7 +320,11 @@ func getProjectsByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Qu
 	}
 
 	{
-		children, err := FetchAllTasks(ctx, db, Where("project_id = $1", m.ID))
+		preloadOpts := []QueryOption{Where("project_id = $1", m.ID)}
+		if cfg.IncludeDeleted {
+			preloadOpts = append(preloadOpts, IncludeDeleted())
+		}
+		children, err := FetchAllTasks(ctx, db, preloadOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("getProjectByIDWithRelations: preloading Tasks: %w", err)
 		}
@@ -307,11 +333,10 @@ func getProjectsByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Qu
 			m.Tasks[i] = *child
 		}
 	}
-
 	return m, nil
 }
 
-func fetchAllProjectsWithRelations(ctx context.Context, db DBTX, clause string, args []any) ([]*models.Project, error) {
+func fetchAllProjectsWithRelations(ctx context.Context, db DBTX, clause string, args []any, cfg QueryOptions) ([]*models.Project, error) {
 	query := "SELECT id, name, description, created_at, deleted_at FROM projects" + clause
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -334,95 +359,73 @@ func fetchAllProjectsWithRelations(ctx context.Context, db DBTX, clause string, 
 		return items, nil
 	}
 
-	{
-		parentIDs := make([]any, 0, len(items))
-		parentMap := make(map[int64]*models.Project, len(items))
-		for _, item := range items {
-			pk := item.ID
-			if !IsZero(pk) {
-				if _, exists := parentMap[pk]; !exists {
-					parentMap[pk] = item
-					parentIDs = append(parentIDs, pk)
-				}
-			}
-		}
-
-		if len(parentIDs) > 0 {
-			children, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]*models.Tag, error) {
-				return FetchAllTags(ctx, db, In("project_id", batch...))
-			})
-			if err != nil {
-				return nil, fmt.Errorf("fetchAllProjectsWithRelations: preloading Tags: %w", err)
-			}
-			for _, child := range children {
-
-				if parent, ok := parentMap[child.ProjectID]; ok {
-					parent.Tags = append(parent.Tags, *child)
-				}
-
+	parentIDs := make([]any, 0, len(items))
+	parentMap := make(map[int64]*models.Project, len(items))
+	for _, item := range items {
+		pk := item.ID
+		if !IsZero(pk) {
+			if _, exists := parentMap[pk]; !exists {
+				parentMap[pk] = item
+				parentIDs = append(parentIDs, pk)
 			}
 		}
 	}
 
-	{
-		parentIDs := make([]any, 0, len(items))
-		parentMap := make(map[int64]*models.Project, len(items))
-		for _, item := range items {
-			pk := item.ID
-			if !IsZero(pk) {
-				if _, exists := parentMap[pk]; !exists {
-					parentMap[pk] = item
-					parentIDs = append(parentIDs, pk)
-				}
-			}
+	if len(parentIDs) > 0 {
+		preloadOpts := []QueryOption{}
+		if cfg.IncludeDeleted {
+			preloadOpts = append(preloadOpts, IncludeDeleted())
 		}
-
-		if len(parentIDs) > 0 {
-			children, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]*models.Category, error) {
-				return FetchAllCategories(ctx, db, In("project_id", batch...))
-			})
-			if err != nil {
-				return nil, fmt.Errorf("fetchAllProjectsWithRelations: preloading Categories: %w", err)
-			}
-			for _, child := range children {
-
-				if parent, ok := parentMap[child.ProjectID]; ok {
-					parent.Categories = append(parent.Categories, *child)
-				}
-
+		children, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]*models.Tag, error) {
+			opts := append([]QueryOption{In("project_id", batch...)}, preloadOpts...)
+			return FetchAllTags(ctx, db, opts...)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fetchAllProjectsWithRelations: preloading Tags: %w", err)
+		}
+		for _, child := range children {
+			if parent, ok := parentMap[child.ProjectID]; ok {
+				parent.Tags = append(parent.Tags, *child)
 			}
 		}
 	}
 
-	{
-		parentIDs := make([]any, 0, len(items))
-		parentMap := make(map[int64]*models.Project, len(items))
-		for _, item := range items {
-			pk := item.ID
-			if !IsZero(pk) {
-				if _, exists := parentMap[pk]; !exists {
-					parentMap[pk] = item
-					parentIDs = append(parentIDs, pk)
-				}
-			}
+	if len(parentIDs) > 0 {
+		preloadOpts := []QueryOption{}
+		if cfg.IncludeDeleted {
+			preloadOpts = append(preloadOpts, IncludeDeleted())
 		}
-
-		if len(parentIDs) > 0 {
-			children, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]*models.Task, error) {
-				return FetchAllTasks(ctx, db, In("project_id", batch...))
-			})
-			if err != nil {
-				return nil, fmt.Errorf("fetchAllProjectsWithRelations: preloading Tasks: %w", err)
-			}
-			for _, child := range children {
-
-				if parent, ok := parentMap[child.ProjectID]; ok {
-					parent.Tasks = append(parent.Tasks, *child)
-				}
-
+		children, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]*models.Category, error) {
+			opts := append([]QueryOption{In("project_id", batch...)}, preloadOpts...)
+			return FetchAllCategories(ctx, db, opts...)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fetchAllProjectsWithRelations: preloading Categories: %w", err)
+		}
+		for _, child := range children {
+			if parent, ok := parentMap[child.ProjectID]; ok {
+				parent.Categories = append(parent.Categories, *child)
 			}
 		}
 	}
 
+	if len(parentIDs) > 0 {
+		preloadOpts := []QueryOption{}
+		if cfg.IncludeDeleted {
+			preloadOpts = append(preloadOpts, IncludeDeleted())
+		}
+		children, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]*models.Task, error) {
+			opts := append([]QueryOption{In("project_id", batch...)}, preloadOpts...)
+			return FetchAllTasks(ctx, db, opts...)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fetchAllProjectsWithRelations: preloading Tasks: %w", err)
+		}
+		for _, child := range children {
+			if parent, ok := parentMap[child.ProjectID]; ok {
+				parent.Tasks = append(parent.Tasks, *child)
+			}
+		}
+	}
 	return items, nil
 }

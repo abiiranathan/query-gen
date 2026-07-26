@@ -24,7 +24,9 @@ const inBatchSize = 999
 
 // batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
 // concatenating results to avoid exceeding database SQL parameter limits.
-func batchIn[T any](ctx context.Context, db DBTX, ids []any, fetch func(ctx context.Context, db DBTX, batch []any) ([]T, error)) ([]T, error) {
+// batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
+// concatenating results to avoid exceeding database SQL parameter limits.
+func batchIn[T, K any](ctx context.Context, db DBTX, ids []K, fetch func(ctx context.Context, db DBTX, batch []K) ([]T, error)) ([]T, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -71,17 +73,15 @@ func Where(where string, args ...any) QueryOption {
 	}
 }
 
-// ILIKE performs a case-insensitive pattern match on a column using PostgreSQL ILIKE.
-// It wraps the provided value with wildcard characters ("%<value>%").
-// It does nothing if value is empty.
+// ILIKE performs a case-insensitive pattern match using ILIKE (or LOWER for cross-dialect compatibility).
 func ILIKE(column, value string) QueryOption {
 	return func(o *QueryOptions) {
 		if value == "" {
 			return
 		}
 
-		o.Args = append(o.Args, "%"+value+"%")
-		clause := fmt.Sprintf("%s LIKE $%d", column, len(o.Args))
+		o.Args = append(o.Args, "%"+strings.ToLower(value)+"%")
+		clause := fmt.Sprintf("LOWER(%s) LIKE $%d", column, len(o.Args))
 
 		if o.Where != "" {
 			o.Where += " AND " + clause
@@ -91,15 +91,44 @@ func ILIKE(column, value string) QueryOption {
 	}
 }
 
+// staticPlaceholders pre-computes "$1" through "$1000" to eliminate string formatting
+// allocations during query option construction and parameter binding.
+var staticPlaceholders = func() [1001]string {
+	var p [1001]string
+	for i := 1; i <= 1000; i++ {
+		p[i] = fmt.Sprintf("$%d", i)
+	}
+	return p
+}()
+
+// getPlaceholder returns a cached placeholder string for index <= 1000,
+// falling back to fmt.Sprintf for higher indices.
+func getPlaceholder(idx int) string {
+	if idx >= 1 && idx <= 1000 {
+		return staticPlaceholders[idx]
+	}
+	return fmt.Sprintf("$%d", idx)
+}
+
 // In filters a column matching any of the provided values.
-// It does nothing if values is empty.
+// It pre-allocates buffer memory and uses cached placeholder strings to minimize allocations.
 func In(column string, values ...any) QueryOption {
 	return func(o *QueryOptions) {
-		if len(values) == 0 {
+		n := len(values)
+		if n == 0 {
 			return
 		}
 
+		// Pre-allocate o.Args slice capacity in a single grow step
+		if cap(o.Args)-len(o.Args) < n {
+			newArgs := make([]any, len(o.Args), len(o.Args)+n)
+			copy(newArgs, o.Args)
+			o.Args = newArgs
+		}
+
+		// Pre-allocate string builder buffer capacity
 		var sb strings.Builder
+		sb.Grow(len(column) + 6 + (n * 6))
 		sb.WriteString(column)
 		sb.WriteString(" IN (")
 
@@ -108,8 +137,7 @@ func In(column string, values ...any) QueryOption {
 				sb.WriteString(", ")
 			}
 			o.Args = append(o.Args, v)
-			sb.WriteByte('$')
-			sb.WriteString(strconv.Itoa(len(o.Args)))
+			sb.WriteString(getPlaceholder(len(o.Args)))
 		}
 		sb.WriteByte(')')
 
@@ -297,7 +325,7 @@ func Offset(offset int) QueryOption {
 	}
 }
 
-// WithPreloadAssociations enables or disables preloading associated model relations.
+// PreloadAssociations enables or disables preloading associated model relations.
 func PreloadAssociations(preload bool) QueryOption {
 	return func(o *QueryOptions) {
 		o.PreloadAssociations = preload
@@ -463,25 +491,28 @@ func applyQueryOptions(defaultPK string, deletedAtCol string, opts ...QueryOptio
 		sb.WriteString(cfg.Having)
 	}
 
-	if cfg.OrderBy != "" {
-		sb.WriteString(" ORDER BY ")
-		sb.WriteString(cfg.OrderBy)
-	} else if defaultPK != "" {
-		sb.WriteString(" ORDER BY ")
-		sb.WriteString(defaultPK)
-		sb.WriteString(" ASC")
-	}
+	// ORDER BY, LIMIT, and OFFSET only apply to row-fetching queries (when defaultPK != ""),
+	// avoiding invalid ORDER BY clauses in aggregate COUNT(*) queries.
+	if defaultPK != "" {
+		if cfg.OrderBy != "" {
+			sb.WriteString(" ORDER BY ")
+			sb.WriteString(cfg.OrderBy)
+		} else {
+			sb.WriteString(" ORDER BY ")
+			sb.WriteString(defaultPK)
+			sb.WriteString(" ASC")
+		}
 
-	if cfg.Limit > 0 {
-		args = append(args, cfg.Limit)
-		fmt.Fprintf(&sb, " LIMIT $%d", len(args))
-	}
+		if cfg.Limit > 0 {
+			args = append(args, cfg.Limit)
+			fmt.Fprintf(&sb, " LIMIT $%d", len(args))
+		}
 
-	if cfg.Offset > 0 {
-		args = append(args, cfg.Offset)
-		fmt.Fprintf(&sb, " OFFSET $%d", len(args))
+		if cfg.Offset > 0 {
+			args = append(args, cfg.Offset)
+			fmt.Fprintf(&sb, " OFFSET $%d", len(args))
+		}
 	}
-
 	return sb.String(), args, cfg
 }
 
@@ -540,15 +571,23 @@ func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn Fe
 	}, nil
 }
 
-func scanNullable[T any](dst *T) *nullableScanner[T] {
-	return &nullableScanner[T]{dst: dst}
-}
-
+// nullableScanner adapts a *T destination to the sql.Scanner interface,
+// handling NULL source values by zeroing dst, and falling back to
+// sql.Scanner or convertAssign for types that don't directly assert to T.
+//
+// Uses a value receiver so instances can be constructed and passed inline
+// without a heap-allocating pointer-returning constructor, giving the
+// compiler a better chance of proving the value does not escape and can be
+// stack-allocated. See scanNullable for the intended call pattern.
 type nullableScanner[T any] struct {
-	dst *T
+	dst *T // Destination field. Not owned; caller retains ownership.
 }
 
-func (n *nullableScanner[T]) Scan(src any) error {
+// Scan implements sql.Scanner. Uses a value receiver (not pointer) so that
+// nullableScanner[T]{...} literals passed directly into rows.Scan can be
+// stack-allocated by escape analysis rather than forced onto the heap by a
+// pointer-returning helper.
+func (n nullableScanner[T]) Scan(src any) error {
 	if src == nil {
 		var zero T
 		*n.dst = zero
@@ -575,22 +614,37 @@ func (n *nullableScanner[T]) Scan(src any) error {
 	return convertAssign(n.dst, src)
 }
 
+// scanNullable returns a value (not a pointer) implementing sql.Scanner for
+// dst, allowing NULL source values to zero *dst instead of erroring. Pass
+// the result directly as an argument to rows.Scan; do not store it or take
+// its address, since doing so may force it onto the heap regardless of this
+// value-receiver design.
+func scanNullable[T any](dst *T) nullableScanner[T] {
+	return nullableScanner[T]{dst: dst}
+}
+
+// parseTimeString parses SQL and ISO 8601 timestamp strings by trying a
+// sequence of layouts, ordered by expected frequency for Postgres, SQLite,
+// and Unix date output. Returns an error if no layout matches.
 func parseTimeString(s string) (time.Time, error) {
 	formats := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02 15:04:05.999999999-07:00",
-		"2006-01-02 15:04:05-07:00",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
-		"2006-01-02",
+		"2006-01-02 15:04:05.999999999-07", // Postgres timestamptz default output
+		"2006-01-02 15:04:05-07",           // Postgres timestamptz, no fractional seconds
+		"2006-01-02 15:04:05.999999999",    // Postgres/SQLite timestamp (no tz)
+		"2006-01-02 15:04:05",              // SQLite CURRENT_TIMESTAMP, Postgres (no tz, no frac)
+		time.RFC3339Nano,                   // ISO 8601 with fractional seconds, e.g. JSON/API input
+		time.RFC3339,                       // ISO 8601, e.g. JSON/API input
+		"2006-01-02",                       // date-only
+		"Mon Jan 2 15:04:05 MST 2006",      // Unix date default output
+		"Mon Jan  2 15:04:05 MST 2006",     // Unix date output, single-digit day (extra space)
 	}
+
 	for _, fmtStr := range formats {
 		if t, err := time.Parse(fmtStr, s); err == nil {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("convertAssign: failed to parse time string %q", s)
+	return time.Time{}, fmt.Errorf("parseTimeString: failed to parse time string %q", s)
 }
 
 func convertAssign(dst any, src any) error {

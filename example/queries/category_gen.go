@@ -50,7 +50,8 @@ func InsertCategory(ctx context.Context, db DBTX, m *models.Category) error {
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&m.ID, &m.ProjectID, &m.Name); err != nil {
+	if err := db.QueryRowContext(ctx, query, args...).
+		Scan(&m.ID, &m.ProjectID, &m.Name); err != nil {
 		return fmt.Errorf("insertCategory: %w", err)
 	}
 	return nil
@@ -98,11 +99,17 @@ func CountCategories(ctx context.Context, db DBTX, opts ...QueryOption) (int64, 
 		return 0, errors.New("countCategories: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
-	query := "SELECT COUNT(*) FROM categories" + clause
+	cfg := parseQueryOptions(opts...)
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	query := "SELECT COUNT(*) FROM categories" + whereClause
 
 	var count int64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("countCategories: %w", err)
 	}
 	return count, nil
@@ -171,8 +178,6 @@ func UpdateCategory(ctx context.Context, db DBTX, m *models.Category) error {
 }
 
 // DeleteCategory deletes the Category record identified by id from categories.
-// If the model contains a DeletedAt column, it soft-deletes by setting DeletedAt to current timestamp
-// unless the HardDelete() query option is supplied.
 func DeleteCategory(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteCategory: db is nil")
@@ -196,8 +201,6 @@ func DeleteCategory(ctx context.Context, db DBTX, id int64, opts ...QueryOption)
 }
 
 // DeleteCategories deletes records from categories matching the provided query options and returns the number of affected rows.
-// Requires at least one filtering option (e.g. Where, In, Lt) to prevent accidental bulk deletion.
-// If the model contains a DeletedAt column, it soft-deletes records by default unless the HardDelete() option is supplied.
 func DeleteCategories(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
 	if db == nil {
 		return 0, errors.New("deleteCategories: db is nil")
@@ -211,7 +214,6 @@ func DeleteCategories(ctx context.Context, db DBTX, opts ...QueryOption) (int64,
 	clause, args, _ := applyQueryOptions("", "", opts...)
 
 	var query string
-
 	query = "DELETE FROM categories" + clause
 
 	res, err := db.ExecContext(ctx, query, args...)

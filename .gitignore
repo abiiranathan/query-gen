@@ -1,2 +1,4 @@
 query-gen
 schema.sql
+*.out
+*.test

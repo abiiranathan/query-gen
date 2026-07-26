@@ -65,12 +65,11 @@ func setupBenchmarkData(b *testing.B, userCount int) *sql.DB {
 // BenchmarkPreload_SplitQueries measures the performance of preloading 2,000 users
 // and 4,000 associated orders using 2 separate queries (WHERE IN).
 func BenchmarkPreload_SplitQueries(b *testing.B) {
-	const totalUsers = 2000
+	const totalUsers = 20000
 	db := setupBenchmarkData(b, totalUsers)
 	ctx := context.Background()
 
 	b.ReportAllocs()
-	// Reset timer after seeding 2,000 users and 4,000 orders
 
 	for b.Loop() {
 		fetchedUsers, err := queries.FetchAllUsers(ctx, db, queries.PreloadAssociations(true))
@@ -85,16 +84,10 @@ func BenchmarkPreload_SplitQueries(b *testing.B) {
 			b.Fatalf("expected 2 preloaded orders, got %d", len(fetchedUsers[0].Orders))
 		}
 	}
-
-	// preload joins
-	// 1. BenchmarkPreload_RawSQLJoinMap-8   	      63	  18563876 ns/op	 2954962 B/op	   98778 allocs/op
-	// 2. BenchmarkPreload_RawSQLJoinMap-8   	      76	  15180410 ns/op	 2954838 B/op	   98778 allocs/op
 }
 
-// BenchmarkPreload_RawSQLJoinMap measures the performance of fetching 2,000 users
-// and 4,000 associated orders using a single raw SQL LEFT JOIN and map deduplication in Go.
 func BenchmarkPreload_RawSQLJoinMap(b *testing.B) {
-	const totalUsers = 2000
+	const totalUsers = 20000
 	db := setupBenchmarkData(b, totalUsers)
 	ctx := context.Background()
 
@@ -182,6 +175,4 @@ func BenchmarkPreload_RawSQLJoinMap(b *testing.B) {
 			b.Fatalf("expected 2 preloaded orders, got %d", len(items[0].Orders))
 		}
 	}
-
-	// BenchmarkPreload_RawSQLJoinMap-8   	      76	  15180410 ns/op	 2954838 B/op	   98778 allocs/op
 }

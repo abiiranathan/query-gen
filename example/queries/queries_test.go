@@ -4,75 +4,161 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/abiiranathan/query-gen/example/models"
 	"github.com/abiiranathan/query-gen/example/queries"
-	_ "modernc.org/sqlite"
+
+	// _ "github.com/mattn/go-sqlite3"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// setupTestDB creates an in-memory SQLite database matching the updated example schema.
-func setupTestDB(t *testing.T) *sql.DB {
-	t.Helper()
+// // setupTestDB creates an in-memory SQLite database matching the updated example schema.
+// func setupTestDB(tb testing.TB) *sql.DB {
+// 	tb.Helper()
 
-	db, err := sql.Open("sqlite", "file::memory:?mode=memory&cache=shared")
+// 	db, err := sql.Open("sqlite3", "file::memory:?mode=memory&cache=shared")
+// 	if err != nil {
+// 		tb.Fatalf("failed to open in-memory sqlite3 db: %v", err)
+// 	}
+// 	if err != nil {
+// 		tb.Fatalf("failed to open in-memory sqlite db: %v", err)
+// 	}
+
+// 	schema := `
+// 	CREATE TABLE IF NOT EXISTS users (
+// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+// 		name TEXT NOT NULL,
+// 		email TEXT,
+// 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+// 		deleted_at DATETIME,
+// 		age VARCHAR(20) NOT NULL
+// 	);
+
+// 	CREATE TABLE IF NOT EXISTS orders (
+// 		order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+// 		user_id INTEGER NOT NULL,
+// 		amount REAL NOT NULL,
+// 		FOREIGN KEY (user_id) REFERENCES users(id)
+// 	);
+
+// 	CREATE TABLE IF NOT EXISTS projects (
+// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+// 		name TEXT NOT NULL,
+// 		description TEXT,
+// 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+// 		deleted_at DATETIME
+// 	);
+
+// 	CREATE TABLE IF NOT EXISTS tags (
+// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+// 		project_id INTEGER NOT NULL,
+// 		name TEXT NOT NULL,
+// 		FOREIGN KEY (project_id) REFERENCES projects(id)
+// 	);
+
+// 	CREATE TABLE IF NOT EXISTS categories (
+// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+// 		project_id INTEGER NOT NULL,
+// 		name TEXT NOT NULL,
+// 		FOREIGN KEY (project_id) REFERENCES projects(id)
+// 	);
+
+// 	CREATE TABLE IF NOT EXISTS tasks (
+// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+// 		project_id INTEGER NOT NULL,
+// 		title TEXT NOT NULL,
+// 		FOREIGN KEY (project_id) REFERENCES projects(id)
+// 	);
+// 	`
+
+// 	if _, err := db.Exec(schema); err != nil {
+// 		tb.Fatalf("failed to execute test schema: %v", err)
+// 	}
+
+// 	tb.Cleanup(func() {
+// 		_ = db.Close()
+// 	})
+
+// 	return db
+// }
+
+// setupPostgresDB connects to a local PostgreSQL instance using pgx stdlib driver.
+// Skips automatically if the PostgreSQL database is not reachable.
+func setupTestDB(tb testing.TB) *sql.DB {
+	tb.Helper()
+
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = "postgres://postgres@localhost:5432/testdb?sslmode=disable"
+	}
+
+	db, err := sql.Open("pgx", connStr)
 	if err != nil {
-		t.Fatalf("failed to open in-memory sqlite db: %v", err)
+		tb.Skipf("skipping postgres benchmark: connection error: %v", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		tb.Skipf("skipping postgres benchmark: database unreachable at %s: %v", connStr, err)
 	}
 
 	schema := `
-	CREATE TABLE IF NOT EXISTS users (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+	DROP TABLE IF EXISTS tasks CASCADE;
+	DROP TABLE IF EXISTS categories CASCADE;
+	DROP TABLE IF EXISTS tags CASCADE;
+	DROP TABLE IF EXISTS projects CASCADE;
+	DROP TABLE IF EXISTS orders CASCADE;
+	DROP TABLE IF EXISTS users CASCADE;
+
+	CREATE TABLE users (
+		id BIGSERIAL PRIMARY KEY,
 		name TEXT NOT NULL,
 		email TEXT,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		deleted_at DATETIME,
+		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+		deleted_at TIMESTAMPTZ,
 		age VARCHAR(20) NOT NULL
 	);
 
-	CREATE TABLE IF NOT EXISTS orders (
-		order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-		user_id INTEGER NOT NULL,
-		amount REAL NOT NULL,
-		FOREIGN KEY (user_id) REFERENCES users(id)
+	CREATE TABLE orders (
+		order_id BIGSERIAL PRIMARY KEY,
+		user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		amount DOUBLE PRECISION NOT NULL
 	);
 
-	CREATE TABLE IF NOT EXISTS projects (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+	CREATE TABLE projects (
+		id BIGSERIAL PRIMARY KEY,
 		name TEXT NOT NULL,
 		description TEXT,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		deleted_at DATETIME
+		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+		deleted_at TIMESTAMPTZ
 	);
 
-	CREATE TABLE IF NOT EXISTS tags (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		project_id INTEGER NOT NULL,
-		name TEXT NOT NULL,
-		FOREIGN KEY (project_id) REFERENCES projects(id)
+	CREATE TABLE tags (
+		id BIGSERIAL PRIMARY KEY,
+		project_id BIGINT NOT NULL REFERENCES projects(id),
+		name TEXT NOT NULL
 	);
 
-	CREATE TABLE IF NOT EXISTS categories (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		project_id INTEGER NOT NULL,
-		name TEXT NOT NULL,
-		FOREIGN KEY (project_id) REFERENCES projects(id)
+	CREATE TABLE categories (
+		id BIGSERIAL PRIMARY KEY,
+		project_id BIGINT NOT NULL REFERENCES projects(id),
+		name TEXT NOT NULL
 	);
 
-	CREATE TABLE IF NOT EXISTS tasks (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		project_id INTEGER NOT NULL,
-		title TEXT NOT NULL,
-		FOREIGN KEY (project_id) REFERENCES projects(id)
+	CREATE TABLE tasks (
+		id BIGSERIAL PRIMARY KEY,
+		project_id BIGINT NOT NULL REFERENCES projects(id),
+		title TEXT NOT NULL
 	);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
-		t.Fatalf("failed to execute test schema: %v", err)
+		tb.Fatalf("failed to execute postgres schema: %v", err)
 	}
 
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		_ = db.Close()
 	})
 
@@ -724,24 +810,25 @@ func TestWithHavingClause(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed users and orders to test aggregate filtering.
-	u1 := &models.User{Name: "Heavy Spender", Email: "heavy@test.com"}
-	u2 := &models.User{Name: "Light Spender", Email: "light@test.com"}
+	u1 := &models.User{Name: "Heavy Spender", Email: "heavy@test.com", Age: "30"}
+	u2 := &models.User{Name: "Light Spender", Email: "light@test.com", Age: "25"}
 	_ = queries.InsertUser(ctx, db, u1)
 	_ = queries.InsertUser(ctx, db, u2)
 
-	// User 1 gets 3 orders
+	// User 1 gets 3 orders: 100, 150, 200
 	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 100.00})
 	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 150.00})
 	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 200.00})
 
-	// User 2 gets 1 order
+	// User 2 gets 1 order: 20
 	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u2.ID, Amount: 20.00})
 
 	t.Run("Group By and Having Clause", func(t *testing.T) {
-		// Select orders grouped by user_id having total amount > 50
+		// Include all selected columns in GROUP BY for ANSI SQL / Postgres compliance.
+		// Filter for individual order rows where SUM(amount) > 180.00 (matches only the $200 order).
 		orders, err := queries.FetchAllOrders(ctx, db,
-			queries.GroupBy("user_id"),
-			queries.Having("SUM(amount) > $1", 50.00),
+			queries.GroupBy("user_id, order_id, amount"),
+			queries.Having("SUM(amount) > $1", 180.00),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllOrders with HAVING failed: %v", err)
@@ -753,14 +840,18 @@ func TestWithHavingClause(t *testing.T) {
 		if orders[0].UserID != u1.ID {
 			t.Errorf("got user_id %d, want %d", orders[0].UserID, u1.ID)
 		}
+		if orders[0].Amount != 200.00 {
+			t.Errorf("got amount %f, want 200.00", orders[0].Amount)
+		}
 	})
 
 	t.Run("Multiple Having Clauses Combined", func(t *testing.T) {
-		// Combining multiple WithHaving calls should join them with AND
+		// Combining multiple HAVING calls joins them with AND.
+		// Matches only the single order with amount >= 100 AND SUM(amount) > 180.00.
 		orders, err := queries.FetchAllOrders(ctx, db,
-			queries.GroupBy("user_id"),
-			queries.Having("COUNT(*) >= $1", 2),
-			queries.Having("SUM(amount) > $2", 100.00),
+			queries.GroupBy("user_id, order_id, amount"),
+			queries.Having("amount >= $1", 100.00),
+			queries.Having("SUM(amount) > $2", 180.00),
 		)
 		if err != nil {
 			t.Fatalf("FetchAllOrders with multiple HAVING failed: %v", err)
@@ -768,6 +859,9 @@ func TestWithHavingClause(t *testing.T) {
 
 		if len(orders) != 1 {
 			t.Fatalf("got %d orders, want 1 matching both HAVING clauses", len(orders))
+		}
+		if orders[0].Amount != 200.00 {
+			t.Errorf("got amount %f, want 200.00", orders[0].Amount)
 		}
 	})
 }
@@ -942,6 +1036,144 @@ func TestInsertAndGetProjectWithRelations(t *testing.T) {
 	}
 	if len(fetched.Tasks) != 2 {
 		t.Errorf("expected 2 tasks preloaded, got %d", len(fetched.Tasks))
+	}
+}
+
+// Named constants for scale testing and benchmarking datasets.
+const (
+	scaleProjectCount = 10000
+	scaleTagCount     = 1000
+	scaleTaskCount    = 1000
+)
+
+// seedLargeDataset inserts projectCount projects and tagCount/taskCount associated
+// records inside a single transaction to allow fast in-memory database setup.
+func seedLargeDataset(tb testing.TB, db *sql.DB, projectCount, tagCount, taskCount int) {
+	tb.Helper()
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		tb.Fatalf("seedLargeDataset: failed to begin transaction: %v", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	for i := 1; i <= projectCount; i++ {
+		p := &models.Project{
+			Name:        fmt.Sprintf("Project %d", i),
+			Description: "Bulk workload benchmark description",
+		}
+		if err := queries.InsertProject(ctx, tx, p); err != nil {
+			tb.Fatalf("seedLargeDataset: InsertProject failed at index %d: %v", i, err)
+		}
+	}
+
+	for i := 1; i <= tagCount; i++ {
+		// Distribute tags across created projects
+		projectID := int64((i % projectCount) + 1)
+		tag := &models.Tag{
+			ProjectID: projectID,
+			Name:      fmt.Sprintf("tag-%d", i),
+		}
+		if err := queries.InsertTag(ctx, tx, tag); err != nil {
+			tb.Fatalf("seedLargeDataset: InsertTag failed at index %d: %v", i, err)
+		}
+	}
+
+	for i := 1; i <= taskCount; i++ {
+		// Distribute tasks across created projects
+		projectID := int64((i % projectCount) + 1)
+		task := &models.Task{
+			ProjectID: projectID,
+			Title:     fmt.Sprintf("Task item %d", i),
+		}
+		if err := queries.InsertTask(ctx, tx, task); err != nil {
+			tb.Fatalf("seedLargeDataset: InsertTask failed at index %d: %v", i, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		tb.Fatalf("seedLargeDataset: failed to commit transaction: %v", err)
+	}
+}
+
+// TestFetchAllProjectsLargeScale verifies relation preloading correctness at scale with 10,000 projects.
+func TestFetchAllProjectsLargeScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping scale test in short mode")
+	}
+
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	seedLargeDataset(t, db, scaleProjectCount, scaleTagCount, scaleTaskCount)
+
+	projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(true))
+	if err != nil {
+		t.Fatalf("FetchAllProjects with preloading failed: %v", err)
+	}
+
+	if len(projects) != scaleProjectCount {
+		t.Fatalf("FetchAllProjects count mismatch: got %d, want %d", len(projects), scaleProjectCount)
+	}
+
+	totalTags := 0
+	totalTasks := 0
+	for _, p := range projects {
+		totalTags += len(p.Tags)
+		totalTasks += len(p.Tasks)
+	}
+
+	if totalTags != scaleTagCount {
+		t.Errorf("preloaded tags count mismatch: got %d, want %d", totalTags, scaleTagCount)
+	}
+	if totalTasks != scaleTaskCount {
+		t.Errorf("preloaded tasks count mismatch: got %d, want %d", totalTasks, scaleTaskCount)
+	}
+}
+
+// BenchmarkFetchAllProjectsWithRelations measures query throughput and memory allocations
+// when fetching and preloading associations across 10,000 records.
+func BenchmarkFetchAllProjectsWithRelations(b *testing.B) {
+	db := setupTestDB(b)
+	ctx := context.Background()
+
+	seedLargeDataset(b, db, scaleProjectCount, scaleTagCount, scaleTaskCount)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(true))
+		if err != nil {
+			b.Fatalf("BenchmarkFetchAllProjectsWithRelations failed: %v", err)
+		}
+		if len(projects) != scaleProjectCount {
+			b.Fatalf("unexpected project count: got %d, want %d", len(projects), scaleProjectCount)
+		}
+	}
+}
+
+// BenchmarkFetchAllProjectsNoPreload measures baseline fetch throughput without preloading associations.
+func BenchmarkFetchAllProjectsNoPreload(b *testing.B) {
+	db := setupTestDB(b)
+	ctx := context.Background()
+
+	seedLargeDataset(b, db, scaleProjectCount, scaleTagCount, scaleTaskCount)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		projects, err := queries.FetchAllProjects(ctx, db, queries.PreloadAssociations(false))
+		if err != nil {
+			b.Fatalf("BenchmarkFetchAllProjectsNoPreload failed: %v", err)
+		}
+		if len(projects) != scaleProjectCount {
+			b.Fatalf("unexpected project count: got %d, want %d", len(projects), scaleProjectCount)
+		}
 	}
 }
 
