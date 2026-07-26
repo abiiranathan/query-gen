@@ -53,3 +53,15 @@ type Project struct {
 	Categories []Category `gorm:"foreignKey:ProjectID"`
 	Tasks      []Task     `gorm:"foreignKey:ProjectID"`
 }
+
+// UserRole represents a model/junction table with a composite primary key (UserID + RoleID).
+type UserRole struct {
+	UserID     int64     `gorm:"primaryKey;column:user_id"`
+	RoleID     int64     `gorm:"primaryKey;column:role_id"`
+	AssignedAt time.Time `gorm:"column:assigned_at"`
+}
+
+// TableName returns the explicit table name for the UserRole model.
+func (UserRole) TableName() string {
+	return "user_roles"
+}

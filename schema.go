@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -165,11 +166,9 @@ type checkInfo struct {
 // model, supporting composite primary keys (multiple fields tagged
 // gorm:"primaryKey").
 func (m Model) pkColumns() []string {
-	cols := make([]string, 0, 1)
-	for _, f := range m.Fields {
-		if f.IsPK {
-			cols = append(cols, f.Column)
-		}
+	cols := make([]string, 0, len(m.PK))
+	for _, pk := range m.PK {
+		cols = append(cols, pk.Column)
 	}
 	return cols
 }
@@ -268,12 +267,16 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 			continue
 		}
 		target, ok := m.AllKnownModels[rel.TargetModel]
-		if !ok || target.PK == nil {
+		if !ok || len(target.PK) == 0 {
 			continue
 		}
 		refCol := rel.References
 		if refCol == "" {
-			refCol = target.PK.Column
+			if target.isCompositePK() {
+				log.Fatalf("query-gen: model %q relation %q references model %q which has a composite primary key, but no explicit 'references' tag was specified",
+					m.Name, rel.FieldName, target.Name)
+			}
+			refCol = target.PK[0].Column
 		}
 
 		fkLine := fmt.Sprintf("    CONSTRAINT fk_%s_%s FOREIGN KEY (%s) REFERENCES %s(%s)",

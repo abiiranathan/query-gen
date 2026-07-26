@@ -191,7 +191,7 @@ func UpdateProject(ctx context.Context, db DBTX, m *models.Project) error {
 
 	res, err := db.ExecContext(ctx, query, &m.Name, &m.Description, &m.CreatedAt, &m.DeletedAt, m.ID)
 	if err != nil {
-		return fmt.Errorf("updateProject(%v): %w", m.ID, err)
+		return fmt.Errorf("updateProject(%v): %w", fmt.Sprint(m.ID), err)
 	}
 
 	n, err := res.RowsAffected()
@@ -199,12 +199,12 @@ func UpdateProject(ctx context.Context, db DBTX, m *models.Project) error {
 		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("updateProject(%v): %w", m.ID, sql.ErrNoRows)
+		return fmt.Errorf("updateProject(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
 	}
 	return nil
 }
 
-// DeleteProject deletes the Project record identified by id from projects.
+// DeleteProject deletes the Project record identified by primary key from projects.
 func DeleteProject(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteProject: db is nil")

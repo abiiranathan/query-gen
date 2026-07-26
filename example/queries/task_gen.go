@@ -164,7 +164,7 @@ func UpdateTask(ctx context.Context, db DBTX, m *models.Task) error {
 
 	res, err := db.ExecContext(ctx, query, &m.ProjectID, &m.Title, m.ID)
 	if err != nil {
-		return fmt.Errorf("updateTask(%v): %w", m.ID, err)
+		return fmt.Errorf("updateTask(%v): %w", fmt.Sprint(m.ID), err)
 	}
 
 	n, err := res.RowsAffected()
@@ -172,12 +172,12 @@ func UpdateTask(ctx context.Context, db DBTX, m *models.Task) error {
 		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("updateTask(%v): %w", m.ID, sql.ErrNoRows)
+		return fmt.Errorf("updateTask(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
 	}
 	return nil
 }
 
-// DeleteTask deletes the Task record identified by id from tasks.
+// DeleteTask deletes the Task record identified by primary key from tasks.
 func DeleteTask(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteTask: db is nil")

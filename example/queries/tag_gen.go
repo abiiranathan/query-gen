@@ -164,7 +164,7 @@ func UpdateTag(ctx context.Context, db DBTX, m *models.Tag) error {
 
 	res, err := db.ExecContext(ctx, query, &m.ProjectID, &m.Name, m.ID)
 	if err != nil {
-		return fmt.Errorf("updateTag(%v): %w", m.ID, err)
+		return fmt.Errorf("updateTag(%v): %w", fmt.Sprint(m.ID), err)
 	}
 
 	n, err := res.RowsAffected()
@@ -172,12 +172,12 @@ func UpdateTag(ctx context.Context, db DBTX, m *models.Tag) error {
 		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("updateTag(%v): %w", m.ID, sql.ErrNoRows)
+		return fmt.Errorf("updateTag(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
 	}
 	return nil
 }
 
-// DeleteTag deletes the Tag record identified by id from tags.
+// DeleteTag deletes the Tag record identified by primary key from tags.
 func DeleteTag(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteTag: db is nil")

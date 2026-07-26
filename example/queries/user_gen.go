@@ -192,7 +192,7 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt, &m.Age, m.ID)
 	if err != nil {
-		return fmt.Errorf("updateUser(%v): %w", m.ID, err)
+		return fmt.Errorf("updateUser(%v): %w", fmt.Sprint(m.ID), err)
 	}
 
 	n, err := res.RowsAffected()
@@ -200,12 +200,12 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("updateUser(%v): %w", m.ID, sql.ErrNoRows)
+		return fmt.Errorf("updateUser(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
 	}
 	return nil
 }
 
-// DeleteUser deletes the User record identified by id from users.
+// DeleteUser deletes the User record identified by primary key from users.
 func DeleteUser(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteUser: db is nil")
@@ -321,7 +321,7 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 		}
 
 		rPk0 := r0_ID
-		if !IsZero(rPk0) {
+		if !(IsZero(r0_ID)) {
 			if _, ok := seen_Orders[rPk0]; !ok {
 				seen_Orders[rPk0] = struct{}{}
 				child := models.Order{
@@ -394,7 +394,7 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 		}
 
 		rPk0 := r0_ID
-		if !IsZero(rPk0) {
+		if !(IsZero(r0_ID)) {
 			key0 := seenKey[int64, int64]{parent: pPK, child: rPk0}
 			if _, ok := seen_Orders[key0]; !ok {
 				seen_Orders[key0] = struct{}{}

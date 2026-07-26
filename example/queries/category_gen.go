@@ -164,7 +164,7 @@ func UpdateCategory(ctx context.Context, db DBTX, m *models.Category) error {
 
 	res, err := db.ExecContext(ctx, query, &m.ProjectID, &m.Name, m.ID)
 	if err != nil {
-		return fmt.Errorf("updateCategory(%v): %w", m.ID, err)
+		return fmt.Errorf("updateCategory(%v): %w", fmt.Sprint(m.ID), err)
 	}
 
 	n, err := res.RowsAffected()
@@ -172,12 +172,12 @@ func UpdateCategory(ctx context.Context, db DBTX, m *models.Category) error {
 		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("updateCategory(%v): %w", m.ID, sql.ErrNoRows)
+		return fmt.Errorf("updateCategory(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
 	}
 	return nil
 }
 
-// DeleteCategory deletes the Category record identified by id from categories.
+// DeleteCategory deletes the Category record identified by primary key from categories.
 func DeleteCategory(ctx context.Context, db DBTX, id int64, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("deleteCategory: db is nil")

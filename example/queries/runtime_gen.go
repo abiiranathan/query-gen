@@ -24,8 +24,6 @@ const inBatchSize = 999
 
 // batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
 // concatenating results to avoid exceeding database SQL parameter limits.
-// batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
-// concatenating results to avoid exceeding database SQL parameter limits.
 func batchIn[T, K any](ctx context.Context, db DBTX, ids []K, fetch func(ctx context.Context, db DBTX, batch []K) ([]T, error)) ([]T, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -574,19 +572,11 @@ func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn Fe
 // nullableScanner adapts a *T destination to the sql.Scanner interface,
 // handling NULL source values by zeroing dst, and falling back to
 // sql.Scanner or convertAssign for types that don't directly assert to T.
-//
-// Uses a value receiver so instances can be constructed and passed inline
-// without a heap-allocating pointer-returning constructor, giving the
-// compiler a better chance of proving the value does not escape and can be
-// stack-allocated. See scanNullable for the intended call pattern.
 type nullableScanner[T any] struct {
 	dst *T // Destination field. Not owned; caller retains ownership.
 }
 
-// Scan implements sql.Scanner. Uses a value receiver (not pointer) so that
-// nullableScanner[T]{...} literals passed directly into rows.Scan can be
-// stack-allocated by escape analysis rather than forced onto the heap by a
-// pointer-returning helper.
+// Scan implements sql.Scanner.
 func (n nullableScanner[T]) Scan(src any) error {
 	if src == nil {
 		var zero T
@@ -614,29 +604,23 @@ func (n nullableScanner[T]) Scan(src any) error {
 	return convertAssign(n.dst, src)
 }
 
-// scanNullable returns a value (not a pointer) implementing sql.Scanner for
-// dst, allowing NULL source values to zero *dst instead of erroring. Pass
-// the result directly as an argument to rows.Scan; do not store it or take
-// its address, since doing so may force it onto the heap regardless of this
-// value-receiver design.
+// scanNullable returns a value implementing sql.Scanner for dst.
 func scanNullable[T any](dst *T) nullableScanner[T] {
 	return nullableScanner[T]{dst: dst}
 }
 
-// parseTimeString parses SQL and ISO 8601 timestamp strings by trying a
-// sequence of layouts, ordered by expected frequency for Postgres, SQLite,
-// and Unix date output. Returns an error if no layout matches.
+// parseTimeString parses SQL and ISO 8601 timestamp strings.
 func parseTimeString(s string) (time.Time, error) {
 	formats := []string{
-		"2006-01-02 15:04:05.999999999-07", // Postgres timestamptz default output
-		"2006-01-02 15:04:05-07",           // Postgres timestamptz, no fractional seconds
-		"2006-01-02 15:04:05.999999999",    // Postgres/SQLite timestamp (no tz)
-		"2006-01-02 15:04:05",              // SQLite CURRENT_TIMESTAMP, Postgres (no tz, no frac)
-		time.RFC3339Nano,                   // ISO 8601 with fractional seconds, e.g. JSON/API input
-		time.RFC3339,                       // ISO 8601, e.g. JSON/API input
-		"2006-01-02",                       // date-only
-		"Mon Jan 2 15:04:05 MST 2006",      // Unix date default output
-		"Mon Jan  2 15:04:05 MST 2006",     // Unix date output, single-digit day (extra space)
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02",
+		"Mon Jan 2 15:04:05 MST 2006",
+		"Mon Jan  2 15:04:05 MST 2006",
 	}
 
 	for _, fmtStr := range formats {
@@ -890,8 +874,7 @@ func toPtr[T any](v T) *T {
 	return &v
 }
 
-// seenKey uniquely identifies a (parent, child) primary key pair, used to
-// de-duplicate JOIN fan-out without allocating a nested map per parent.
+// seenKey uniquely identifies a (parent, child) primary key pair.
 type seenKey[P comparable, C comparable] struct {
 	parent P
 	child  C

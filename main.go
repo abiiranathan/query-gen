@@ -73,7 +73,7 @@ type Field struct {
 	Name            string     // Go struct field name, e.g. "Email".
 	Type            string     // Go type as written in source, e.g. "string" or "*string".
 	Column          string     // Database column name, e.g. "email".
-	IsPK            bool       // True if this field is the primary key.
+	IsPK            bool       // True if this field is a primary key.
 	IsIgnore        bool       // True if the field is excluded entirely (gorm:"-").
 	Nullable        bool       // True if the column may return SQL NULL (gorm:"null" or a pointer type).
 	Permission      Permission // Read/write visibility permission.
@@ -102,13 +102,32 @@ func (f Field) IsTimestamp() bool {
 }
 
 // Writable reports whether this field should appear in an INSERT statement.
-func (f Field) Writable() bool {
-	return !f.IsPK && f.Permission != PermReadOnly && f.Permission != PermUpdateOnly
+// If isCompositePK is true, primary key fields are included because composite
+// keys must be explicitly supplied on insert. Single primary key fields are
+// omitted so the database can auto-generate their sequence/identity values.
+func (f Field) Writable(isCompositePK bool) bool {
+	if f.IsPK {
+		return isCompositePK
+	}
+	return f.Permission != PermReadOnly && f.Permission != PermUpdateOnly
 }
 
-// Updatable reports whether this field should appear in an UPDATE statement.
+// Updatable reports whether this field should appear in an UPDATE statement SET clause.
+// Primary key fields are always excluded because they form the WHERE clause.
 func (f Field) Updatable() bool {
 	return !f.IsPK && f.Permission != PermReadOnly && f.Permission != PermCreateOnly
+}
+
+// WritableFields returns the slice of fields participating in INSERT statements.
+func (m Model) WritableFields() []Field {
+	isComposite := len(m.PK) > 1
+	fields := make([]Field, 0, len(m.Fields))
+	for _, f := range m.Fields {
+		if f.Writable(isComposite) {
+			fields = append(fields, f)
+		}
+	}
+	return fields
 }
 
 // Selectable reports whether this field should appear in a SELECT statement.
@@ -177,7 +196,7 @@ type Model struct {
 	NamePlural     string           // Plural of name.
 	Table          string           // Database table name, e.g. "users".
 	Fields         []Field          // List of scalar database fields.
-	PK             *Field           // Primary key field reference.
+	PK             []*Field         // Primary key field references (supports single & composite primary keys).
 	Relations      []Relation       // Discovered HasMany and BelongsTo relations.
 	AllKnownModels map[string]Model // All models in the parsed package, keyed by type name.
 	TableChecks    []checkInfo      // Struct-level CHECK constraints not scoped to a single column.
@@ -208,22 +227,165 @@ func (m Model) FieldByColumn(col string) *Field {
 	return nil
 }
 
+// --- Composite PK Helper Methods ---
+
+// toLowerCamel converts a Go field name to lower camelCase.
+// E.g., "UserID" -> "userID", "ID" -> "id", "TenantCode" -> "tenantCode".
+func toLowerCamel(s string) string {
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	i := 0
+	for i < len(runes) && unicode.IsUpper(runes[i]) {
+		i++
+	}
+	if i == 0 {
+		return s
+	}
+	if i == len(runes) {
+		return strings.ToLower(s)
+	}
+	if i > 1 {
+		for j := 0; j < i-1; j++ {
+			runes[j] = unicode.ToLower(runes[j])
+		}
+	} else {
+		runes[0] = unicode.ToLower(runes[0])
+	}
+	return string(runes)
+}
+
+// --- Composite PK Helper Methods ---
+
+// FirstPK returns the first primary key field (or nil).
+func (m Model) FirstPK() *Field {
+	if len(m.PK) > 0 {
+		return m.PK[0]
+	}
+	return nil
+}
+
+// PKColumns returns a comma-separated list of primary key database columns,
+// optionally prefixed with prefix (e.g. "p.col1, p.col2").
+func (m Model) PKColumns(prefix string) string {
+	cols := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		if prefix != "" {
+			cols[i] = prefix + "." + pk.Column
+		} else {
+			cols[i] = pk.Column
+		}
+	}
+	return strings.Join(cols, ", ")
+}
+
+// PKWhereClause generates a SQL WHERE condition for primary keys starting at parameter index startIdx.
+// E.g., startIdx=1 -> "col1 = $1 AND col2 = $2"
+func (m Model) PKWhereClause(prefix string, startIdx int) string {
+	clauses := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		col := pk.Column
+		if prefix != "" {
+			col = prefix + "." + col
+		}
+		clauses[i] = fmt.Sprintf("%s = $%d", col, startIdx+i)
+	}
+	return strings.Join(clauses, " AND ")
+}
+
+// PKParams returns Go parameter definitions for primary key fields in function signatures,
+// using lower-camelCase parameter names derived from field names.
+// E.g., single PK: "id string" or "userID int64", composite PK: "userID int64, roleID int64"
+func (m Model) PKParams(pkgAlias string) string {
+	params := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		params[i] = fmt.Sprintf("%s %s", toLowerCamel(pk.Name), pk.QualifiedType(pkgAlias))
+	}
+	return strings.Join(params, ", ")
+}
+
+// PKArgs returns a comma-separated list of primary key argument names or field accesses.
+// If prefix is empty, returns lower-camelCase argument names (e.g. "id" or "userID, roleID").
+// If prefix is non-empty (e.g. "m."), returns struct field accesses (e.g. "m.UserID, m.RoleID").
+func (m Model) PKArgs(prefix string) string {
+	args := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		if prefix != "" {
+			args[i] = prefix + pk.Name
+		} else {
+			args[i] = toLowerCamel(pk.Name)
+		}
+	}
+	return strings.Join(args, ", ")
+}
+
+// PKZeroCheck returns a Go boolean expression checking if any PK field is zero.
+// E.g., "IsZero(m.UserID) || IsZero(m.RoleID)"
+func (m Model) PKZeroCheck(varName string) string {
+	checks := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		checks[i] = fmt.Sprintf("IsZero(%s.%s)", varName, pk.Name)
+	}
+	return strings.Join(checks, " || ")
+}
+
+// PKType returns the Go type used for map keys representing this model's primary key.
+func (m Model) PKType(pkgAlias string) string {
+	if len(m.PK) == 1 {
+		return m.PK[0].QualifiedType(pkgAlias)
+	}
+	fields := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		fields[i] = fmt.Sprintf("%s %s", pk.Name, pk.QualifiedType(pkgAlias))
+	}
+	return fmt.Sprintf("struct{ %s }", strings.Join(fields, "; "))
+}
+
+// PKValue returns a Go expression evaluating to the primary key map key value for varName.
+func (m Model) PKValue(varName string, pkgAlias string) string {
+	if len(m.PK) == 1 {
+		return fmt.Sprintf("%s.%s", varName, m.PK[0].Name)
+	}
+	fields := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		fields[i] = fmt.Sprintf("%s: %s.%s", pk.Name, varName, pk.Name)
+	}
+	return fmt.Sprintf("%s{%s}", m.PKType(pkgAlias), strings.Join(fields, ", "))
+}
+
+// PKValueFromVars constructs a PK key value from local variables named with varPrefix (e.g. "r0_").
+func (m Model) PKValueFromVars(varPrefix string, pkgAlias string) string {
+	if len(m.PK) == 1 {
+		return fmt.Sprintf("%s%s", varPrefix, m.PK[0].Name)
+	}
+	fields := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		fields[i] = fmt.Sprintf("%s: %s%s", pk.Name, varPrefix, pk.Name)
+	}
+	return fmt.Sprintf("%s{%s}", m.PKType(pkgAlias), strings.Join(fields, ", "))
+}
+
+// PKZeroCheckFromVars checks if any PK variable with varPrefix is zero.
+func (m Model) PKZeroCheckFromVars(varPrefix string) string {
+	checks := make([]string, len(m.PK))
+	for i, pk := range m.PK {
+		checks[i] = fmt.Sprintf("IsZero(%s%s)", varPrefix, pk.Name)
+	}
+	return strings.Join(checks, " || ")
+}
+
+// UpdatePKPlaceholderStartIdx returns the starting parameter index for the UPDATE WHERE clause.
+func (m Model) UpdatePKPlaceholderStartIdx() int {
+	return len(m.UpdatableFields()) + 1
+}
+
 // --- Template method helpers ---
 
 func (m Model) SelectableFields() []Field {
 	fields := make([]Field, 0, len(m.Fields))
 	for _, f := range m.Fields {
 		if f.Selectable() {
-			fields = append(fields, f)
-		}
-	}
-	return fields
-}
-
-func (m Model) WritableFields() []Field {
-	fields := make([]Field, 0, len(m.Fields))
-	for _, f := range m.Fields {
-		if f.Writable() {
 			fields = append(fields, f)
 		}
 	}
@@ -299,10 +461,6 @@ func (m Model) UpdateSetClause() string {
 	return sb.String()
 }
 
-func (m Model) UpdatePKPlaceholderIdx() int {
-	return len(m.UpdatableFields()) + 1
-}
-
 func scanTarget(varName string, f Field) string {
 	if f.IsPointer() || f.Nullable || f.IsTimestamp() {
 		return fmt.Sprintf("scanNullable(&%s.%s)", varName, f.Name)
@@ -371,10 +529,10 @@ func (m Model) AllRelationJoins(parentPrefix string) string {
 		switch rel.Type {
 		case RelHasMany:
 			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
-				target.Table, alias, alias, rel.ForeignKey, parentPrefix, m.PK.Column)
+				target.Table, alias, alias, rel.ForeignKey, parentPrefix, m.FirstPK().Column)
 		case RelBelongsTo:
 			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
-				target.Table, alias, alias, target.PK.Column, parentPrefix, rel.ForeignKey)
+				target.Table, alias, alias, target.FirstPK().Column, parentPrefix, rel.ForeignKey)
 		}
 
 		if target.HasDeletedAt() {
@@ -409,26 +567,17 @@ func (m Model) BelongsToRelations() []Relation {
 }
 
 // UseJoinStrategy reports whether relation preloading should be generated as
-// a single LEFT JOIN query. BelongsTo relations never fan out a parent row
-// (at most one match), so any number of them is safe to join. HasMany
-// relations do fan out; joining two or more HasMany relations in the same
-// query multiplies row counts against each other (cartesian explosion)
-// rather than simply adding them, so once there are 2+ HasMany relations,
-// each one is fetched with a separate IN-based query instead and merged
-// in Go.
+// a single LEFT JOIN query.
 func (m Model) UseJoinStrategy() bool {
 	return len(m.HasManyRelations()) <= 1
 }
 
-// JoinRelations returns the relations that participate in the LEFT JOIN
-// query when UseJoinStrategy is true: all BelongsTo relations plus the
-// single HasMany relation, if any.
+// JoinRelations returns the relations that participate in the LEFT JOIN query.
 func (m Model) JoinRelations() []Relation {
 	return m.Relations
 }
 
-// SplitHasManyRelations returns the HasMany relations that must be fetched
-// via separate IN queries when UseJoinStrategy is false.
+// SplitHasManyRelations returns the HasMany relations that must be fetched via separate IN queries.
 func (m Model) SplitHasManyRelations() []Relation {
 	return m.HasManyRelations()
 }
@@ -456,13 +605,16 @@ func main() {
 
 	// Re-link PK pointers in modelMap entries after all value copies
 	for name, m := range modelMap {
+		m.PK = nil
 		for i := range m.Fields {
 			if m.Fields[i].IsPK {
-				m.PK = &m.Fields[i]
-				modelMap[name] = m
-				break
+				m.PK = append(m.PK, &m.Fields[i])
 			}
 		}
+		if len(m.PK) == 0 {
+			log.Fatalf("query-gen: model %q has no primary key field; models without a primary key are prohibited", name)
+		}
+		modelMap[name] = m
 	}
 
 	if *schemaOut != "" {
@@ -492,9 +644,8 @@ func main() {
 	pkgAlias := filepath.Base(fullPkgPath)
 
 	for _, model := range parsedModels {
-		if model.PK == nil {
-			log.Printf("query-gen: skipping %q: no primary key field found", model.Name)
-			continue
+		if len(model.PK) == 0 {
+			log.Fatalf("query-gen: model %q has no primary key field; models without a primary key are prohibited", model.Name)
 		}
 
 		model.Package = *outPkg
@@ -560,10 +711,6 @@ func parsePackage(pattern string) ([]Model, string, error) {
 	fullPkgPath := pkgs[0].PkgPath
 
 	for _, pkg := range pkgs {
-		// First pass: collect explicit table names from any TableName()
-		// methods, keyed by receiver type name. This must run before model
-		// construction below so the table name is available immediately,
-		// regardless of declaration order within the file/package.
 		tableNames := collectTableNameMethods(pkg.Syntax)
 		customDataTypes := collectDataTypeMethods(pkg.Syntax)
 
@@ -585,8 +732,6 @@ func parsePackage(pattern string) ([]Model, string, error) {
 					Table:      pluralize(toSnakeCase(typeSpec.Name.Name)),
 				}
 
-				// Override the default pluralized snake_case table name if
-				// the model declares an explicit TableName() method.
 				if explicit, ok := tableNames[model.Name]; ok {
 					model.Table = explicit
 				}
@@ -614,7 +759,6 @@ func parsePackage(pattern string) ([]Model, string, error) {
 						continue
 					}
 
-					// If no explicit type tag was provided, check for a DataType/GormDataType method on the type.
 					if parsedField.RawSQLType == "" {
 						baseType := strings.TrimPrefix(fieldType, "*")
 						if dt, ok := customDataTypes[baseType]; ok {
@@ -624,22 +768,26 @@ func parsePackage(pattern string) ([]Model, string, error) {
 					model.Fields = append(model.Fields, parsedField)
 				}
 
-				// Assign PK pointer after all fields are appended to avoid slice reallocation invalidation
+				// Assign PK pointers after all fields are appended
+				model.PK = nil
 				for i := range model.Fields {
 					if model.Fields[i].IsPK {
-						model.PK = &model.Fields[i]
-						break
+						model.PK = append(model.PK, &model.Fields[i])
 					}
 				}
 
-				if model.PK == nil {
+				if len(model.PK) == 0 {
 					for i := range model.Fields {
 						if strings.EqualFold(model.Fields[i].Name, "ID") {
 							model.Fields[i].IsPK = true
-							model.PK = &model.Fields[i]
+							model.PK = append(model.PK, &model.Fields[i])
 							break
 						}
 					}
+				}
+
+				if len(model.PK) == 0 {
+					log.Fatalf("query-gen: model %q has no primary key field; models without a primary key are prohibited", model.Name)
 				}
 
 				result = append(result, model)
@@ -691,7 +839,6 @@ func collectDataTypeMethods(files []*ast.File) map[string]string {
 				continue
 			}
 
-			// GormDataType takes precedence over DataType if both are defined.
 			if methodName == "GormDataType" || dataTypes[receiverType] == "" {
 				dataTypes[receiverType] = literal
 			}
@@ -705,11 +852,6 @@ func collectDataTypeMethods(files []*ast.File) map[string]string {
 // the signature `func (r ReceiverType) TableName() string` (value or
 // pointer receiver) that return a single constant string literal, and
 // returns a map of receiver type name to that literal table name.
-//
-// Only a bare `return "literal"` body is recognized; methods that compute
-// the name dynamically (concatenation, conditionals, a field lookup, etc.)
-// are skipped, since query-gen resolves table names at generate-time, not
-// at runtime.
 func collectTableNameMethods(files []*ast.File) map[string]string {
 	names := make(map[string]string)
 
@@ -723,7 +865,6 @@ func collectTableNameMethods(files []*ast.File) map[string]string {
 				continue
 			}
 
-			// Method must take no parameters and return a single string.
 			sig := funcDecl.Type
 			if sig.Params != nil && len(sig.Params.List) > 0 {
 				continue
@@ -752,9 +893,7 @@ func collectTableNameMethods(files []*ast.File) map[string]string {
 	return names
 }
 
-// receiverTypeName extracts the bare type name from a method receiver
-// expression, stripping one level of pointer indirection if present
-// (e.g. *User -> "User", User -> "User").
+// receiverTypeName extracts the bare type name from a method receiver expression.
 func receiverTypeName(expr ast.Expr) string {
 	if starExpr, ok := expr.(*ast.StarExpr); ok {
 		expr = starExpr.X
@@ -765,9 +904,7 @@ func receiverTypeName(expr ast.Expr) string {
 	return ""
 }
 
-// extractReturnedStringLiteral looks for a single, unconditional
-// `return "literal"` statement in a function body and returns its
-// unquoted value. Returns "" if the body doesn't match that exact shape.
+// extractReturnedStringLiteral looks for a single, unconditional `return "literal"` statement.
 func extractReturnedStringLiteral(body *ast.BlockStmt) string {
 	if body == nil || len(body.List) != 1 {
 		return ""
@@ -800,7 +937,6 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 
 	fieldType := field.Type
 
-	// Detect HasMany (slice) vs BelongsTo (scalar)
 	if arrayType, ok := fieldType.(*ast.ArrayType); ok {
 		rel.Type = RelHasMany
 		fieldType = arrayType.Elt
@@ -808,21 +944,16 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 		rel.Type = RelBelongsTo
 	}
 
-	// Detect if pointer (*User or []*User)
 	if starExpr, ok := fieldType.(*ast.StarExpr); ok {
 		rel.IsPointer = true
 		fieldType = starExpr.X
 	}
 
-	// Relations within the same package are Identifiers (e.g. User or Order).
-	// Imported types like time.Time or uuid.UUID are SelectorExpr and NOT model relations.
 	ident, ok := fieldType.(*ast.Ident)
 	if !ok || !ident.IsExported() {
 		return rel, false
 	}
 
-	// Verify that the target type's underlying type is actually a struct.
-	// Custom scalar types (e.g. type Age string) are scalar fields, not model relations.
 	if typesInfo != nil {
 		if t := typesInfo.TypeOf(fieldType); t != nil {
 			if _, isStruct := t.Underlying().(*types.Struct); !isStruct {
@@ -894,7 +1025,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 
 	notNullSeen := false
 
-	// First pass: look for column tag explicitly so it overrides default toSnakeCase(fieldName)
 	for part := range strings.SplitSeq(gormTag, ";") {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(strings.ToLower(part), "column:") {
@@ -903,7 +1033,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		}
 	}
 
-	// Permission tracking flags
 	canRead := true
 	canCreate := true
 	canUpdate := true
@@ -920,7 +1049,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			return f
 
 		case lower == "-:migration":
-			// Ignore migration tag clause; keep field for read/write.
 
 		case lower == "primarykey" || lower == "primary_key":
 			f.IsPK = true
@@ -988,7 +1116,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case lower == "null":
 			f.Nullable = true
 
-		// Read permission tags
 		case lower == "->" || lower == "->:true" || lower == "->:rw" || lower == "->:r":
 			canRead = true
 			hasReadTag = true
@@ -997,7 +1124,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			canRead = false
 			hasReadTag = true
 
-		// Write permission tags
 		case lower == "<-" || lower == "<-:true" || lower == "<-:rw":
 			canCreate = true
 			canUpdate = true
@@ -1020,13 +1146,11 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		}
 	}
 
-	// GORM rule: if `->` (readonly) is present without any `<-` tag, write permissions are disabled
 	if hasReadTag && !hasWriteTag && canRead {
 		canCreate = false
 		canUpdate = false
 	}
 
-	// Resolve composite permissions enum/bitmask
 	switch {
 	case canRead && canCreate && canUpdate:
 		f.Permission = PermReadWrite
@@ -1100,8 +1224,6 @@ func toSnakeCase(str string) string {
 
 // --- Runtime Helper Template ---
 
-// --- Runtime Helper Template ---
-
 const runtimeTemplate = `// Code generated by query-gen. DO NOT EDIT.
 package {{.Package}}
 
@@ -1126,8 +1248,6 @@ type DBTX interface {
 // 999 is chosen to conform to SQLite3's default maximum limit (SQLITE_MAX_VARIABLE_NUMBER).
 const inBatchSize = 999
 
-// batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
-// concatenating results to avoid exceeding database SQL parameter limits.
 // batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
 // concatenating results to avoid exceeding database SQL parameter limits.
 func batchIn[T, K any](ctx context.Context, db DBTX, ids []K, fetch func(ctx context.Context, db DBTX, batch []K) ([]T, error)) ([]T, error) {
@@ -1678,19 +1798,11 @@ func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn Fe
 // nullableScanner adapts a *T destination to the sql.Scanner interface,
 // handling NULL source values by zeroing dst, and falling back to
 // sql.Scanner or convertAssign for types that don't directly assert to T.
-//
-// Uses a value receiver so instances can be constructed and passed inline
-// without a heap-allocating pointer-returning constructor, giving the
-// compiler a better chance of proving the value does not escape and can be
-// stack-allocated. See scanNullable for the intended call pattern.
 type nullableScanner[T any] struct {
 	dst *T // Destination field. Not owned; caller retains ownership.
 }
 
-// Scan implements sql.Scanner. Uses a value receiver (not pointer) so that
-// nullableScanner[T]{...} literals passed directly into rows.Scan can be
-// stack-allocated by escape analysis rather than forced onto the heap by a
-// pointer-returning helper.
+// Scan implements sql.Scanner.
 func (n nullableScanner[T]) Scan(src any) error {
 	if src == nil {
 		var zero T
@@ -1718,29 +1830,23 @@ func (n nullableScanner[T]) Scan(src any) error {
 	return convertAssign(n.dst, src)
 }
 
-// scanNullable returns a value (not a pointer) implementing sql.Scanner for
-// dst, allowing NULL source values to zero *dst instead of erroring. Pass
-// the result directly as an argument to rows.Scan; do not store it or take
-// its address, since doing so may force it onto the heap regardless of this
-// value-receiver design.
+// scanNullable returns a value implementing sql.Scanner for dst.
 func scanNullable[T any](dst *T) nullableScanner[T] {
 	return nullableScanner[T]{dst: dst}
 }
 	
-// parseTimeString parses SQL and ISO 8601 timestamp strings by trying a
-// sequence of layouts, ordered by expected frequency for Postgres, SQLite,
-// and Unix date output. Returns an error if no layout matches.
+// parseTimeString parses SQL and ISO 8601 timestamp strings.
 func parseTimeString(s string) (time.Time, error) {
 	formats := []string{
-		"2006-01-02 15:04:05.999999999-07", // Postgres timestamptz default output
-		"2006-01-02 15:04:05-07",           // Postgres timestamptz, no fractional seconds
-		"2006-01-02 15:04:05.999999999",    // Postgres/SQLite timestamp (no tz)
-		"2006-01-02 15:04:05",              // SQLite CURRENT_TIMESTAMP, Postgres (no tz, no frac)
-		time.RFC3339Nano,                   // ISO 8601 with fractional seconds, e.g. JSON/API input
-		time.RFC3339,                       // ISO 8601, e.g. JSON/API input
-		"2006-01-02",                       // date-only
-		"Mon Jan 2 15:04:05 MST 2006",      // Unix date default output
-		"Mon Jan  2 15:04:05 MST 2006",     // Unix date output, single-digit day (extra space)
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02",
+		"Mon Jan 2 15:04:05 MST 2006",
+		"Mon Jan  2 15:04:05 MST 2006",
 	}
 
 	for _, fmtStr := range formats {
@@ -1994,8 +2100,7 @@ func toPtr[T any](v T) *T {
 	return &v
 }
 
-// seenKey uniquely identifies a (parent, child) primary key pair, used to
-// de-duplicate JOIN fan-out without allocating a nested map per parent.
+// seenKey uniquely identifies a (parent, child) primary key pair.
 type seenKey[P comparable, C comparable] struct {
 	parent P
 	child  C
@@ -2090,7 +2195,7 @@ func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 }
 
 // Get{{.Name}}ByID retrieves a single {{.Name}} record from {{.Table}} by its primary key.
-func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+func Get{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	if db == nil {
 		return nil, errors.New("get{{.Name}}ByID: db is nil")
 	}
@@ -2101,7 +2206,7 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.QualifiedType .Mode
 	{{- if .Relations}}
 
 	if cfg.PreloadAssociations {
-		return get{{.Name}}ByIDWithRelations(ctx, db, id, cfg)
+		return get{{.Name}}ByIDWithRelations(ctx, db, {{.PKArgs ""}}, cfg)
 	}
 	{{- end}}
 	{{- if .HasDeletedAt}}
@@ -2109,7 +2214,7 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.QualifiedType .Mode
 	query := ` + "`" + `
 		SELECT {{.AllColumns ""}}
 		FROM {{.Table}}
-		WHERE {{.PK.Column}} = $1
+		WHERE {{.PKWhereClause "" 1}}
 	` + "`" + `
 	if !cfg.IncludeDeleted {
 		query += " AND {{.DeletedAtField.Column}} IS NULL"
@@ -2119,40 +2224,40 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.QualifiedType .Mode
 	const query = ` + "`" + `
 		SELECT {{.AllColumns ""}}
 		FROM {{.Table}}
-		WHERE {{.PK.Column}} = $1
+		WHERE {{.PKWhereClause "" 1}}
 	` + "`" + `
 	{{- end}}
 
-	row := db.QueryRowContext(ctx, query, id)
+	row := db.QueryRowContext(ctx, query, {{.PKArgs ""}})
 	var m {{.ModelPkgAlias}}.{{.Name}}
 	if err := row.Scan({{.AllScanArgs "m"}}); err != nil {
-		return nil, fmt.Errorf("get{{.Name}}ByID(%v): %w", id, err)
+		return nil, fmt.Errorf("get{{.Name}}ByID(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
 	}
 
 	return &m, nil
 }
 
 // Exists{{.Name}}ByID reports whether a {{.Name}} record with the given primary key exists.
-func Exists{{.Name}}ByID(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, opts ...QueryOption) (bool, error) {
+func Exists{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (bool, error) {
 	if db == nil {
 		return false, errors.New("exists{{.Name}}ByID: db is nil")
 	}
 	{{- if .HasDeletedAt}}
 
 	cfg := parseQueryOptions(opts...)
-	query := ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PK.Column}} = $1` + "`" + `
+	query := ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PKWhereClause "" 1}}` + "`" + `
 	if !cfg.IncludeDeleted {
 		query += " AND {{.DeletedAtField.Column}} IS NULL"
 	}
 	query += ")"
 	{{- else}}
 
-	const query = ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PK.Column}} = $1)` + "`" + `
+	const query = ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PKWhereClause "" 1}})` + "`" + `
 	{{- end}}
 
 	var exists bool
-	if err := db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
-		return false, fmt.Errorf("exists{{.Name}}ByID(%v): %w", id, err)
+	if err := db.QueryRowContext(ctx, query, {{.PKArgs ""}}).Scan(&exists); err != nil {
+		return false, fmt.Errorf("exists{{.Name}}ByID(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
 	}
 	return exists, nil
 }
@@ -2196,13 +2301,13 @@ func FetchAll{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) 
 	}
 	{{- if .Relations}}
 
-	clause, args, cfg := applyQueryOptions("{{.PK.Column}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
+	clause, args, cfg := applyQueryOptions("{{.PKColumns ""}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	if cfg.PreloadAssociations {
 		return fetchAll{{.NamePlural}}WithRelations(ctx, db, clause, args, cfg)
 	}
 	{{- else}}
 
-	clause, args, _ := applyQueryOptions("{{.PK.Column}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
+	clause, args, _ := applyQueryOptions("{{.PKColumns ""}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	{{- end}}
 
 	query := "SELECT {{.AllColumns ""}} FROM {{.Table}}" + clause
@@ -2241,12 +2346,12 @@ func Update{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 	const query = ` + "`" + `
 		UPDATE {{.Table}}
 		SET {{.UpdateSetClause}}
-		WHERE {{.PK.Column}} = ${{.UpdatePKPlaceholderIdx}}
+		WHERE {{.PKWhereClause "" .UpdatePKPlaceholderStartIdx}}
 	` + "`" + `
 
-	res, err := db.ExecContext(ctx, query, {{.UpdatableScanArgs "m"}}, m.{{.PK.Name}})
+	res, err := db.ExecContext(ctx, query, {{.UpdatableScanArgs "m"}}, {{.PKArgs "m."}})
 	if err != nil {
-		return fmt.Errorf("update{{.Name}}(%v): %w", m.{{.PK.Name}}, err)
+		return fmt.Errorf("update{{.Name}}(%v): %w", fmt.Sprint({{.PKArgs "m."}}), err)
 	}
 
 	n, err := res.RowsAffected()
@@ -2254,13 +2359,13 @@ func Update{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name
 		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("update{{.Name}}(%v): %w", m.{{.PK.Name}}, sql.ErrNoRows)
+		return fmt.Errorf("update{{.Name}}(%v): %w", fmt.Sprint({{.PKArgs "m."}}), sql.ErrNoRows)
 	}
 	return nil
 }
 
-// Delete{{.Name}} deletes the {{.Name}} record identified by id from {{.Table}}.
-func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, opts ...QueryOption) error {
+// Delete{{.Name}} deletes the {{.Name}} record identified by primary key from {{.Table}}.
+func Delete{{.Name}}(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) error {
 	if db == nil {
 		return errors.New("delete{{.Name}}: db is nil")
 	}
@@ -2268,27 +2373,27 @@ func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.QualifiedType .Model
 
 	cfg := parseQueryOptions(opts...)
 	if !cfg.HardDelete {
-		const query = ` + "`" + `UPDATE {{.Table}} SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP WHERE {{.PK.Column}} = $1 AND {{.DeletedAtField.Column}} IS NULL` + "`" + `
-		res, err := db.ExecContext(ctx, query, id)
+		const query = ` + "`" + `UPDATE {{.Table}} SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP WHERE {{.PKWhereClause "" 1}} AND {{.DeletedAtField.Column}} IS NULL` + "`" + `
+		res, err := db.ExecContext(ctx, query, {{.PKArgs ""}})
 		if err != nil {
-			return fmt.Errorf("delete{{.Name}}(%v): %w", id, err)
+			return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
 			return fmt.Errorf("detect rows affected: %w", err)
 		}
 		if n == 0 {
-			return fmt.Errorf("delete{{.Name}}(%v): %w", id, sql.ErrNoRows)
+			return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, sql.ErrNoRows)
 		}
 		return nil
 	}
 	{{- end}}
 
-	const query = ` + "`" + `DELETE FROM {{.Table}} WHERE {{.PK.Column}} = $1` + "`" + `
+	const query = ` + "`" + `DELETE FROM {{.Table}} WHERE {{.PKWhereClause "" 1}}` + "`" + `
 
-	res, err := db.ExecContext(ctx, query, id)
+	res, err := db.ExecContext(ctx, query, {{.PKArgs ""}})
 	if err != nil {
-		return fmt.Errorf("delete{{.Name}}(%v): %w", id, err)
+		return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
 	}
 
 	n, err := res.RowsAffected()
@@ -2296,7 +2401,7 @@ func Delete{{.Name}}(ctx context.Context, db DBTX, id {{.PK.QualifiedType .Model
 		return fmt.Errorf("detect rows affected: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("delete{{.Name}}(%v): %w", id, sql.ErrNoRows)
+		return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, sql.ErrNoRows)
 	}
 	return nil
 }
@@ -2346,14 +2451,14 @@ func Delete{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) (i
 // ================= FETCHING RELATIONS ===============================
 {{- if .Relations}}
 {{- if .UseJoinStrategy}}
-func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	{{- if .HasDeletedAt}}
 	query := ` + "`" + `
 		SELECT 
 			{{.AllColumns "p"}}{{.AllRelationColumns}}
 		FROM {{.Table}} p
 		{{.AllRelationJoins "p"}}
-		WHERE p.{{.PK.Column}} = $1
+		WHERE {{.PKWhereClause "p" 1}}
 	` + "`" + `
 	if !cfg.IncludeDeleted {
 		query += " AND p.{{.DeletedAtField.Column}} IS NULL"
@@ -2364,13 +2469,13 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Qualif
 			{{.AllColumns "p"}}{{.AllRelationColumns}}
 		FROM {{.Table}} p
 		{{.AllRelationJoins "p"}}
-		WHERE p.{{.PK.Column}} = $1
+		WHERE {{.PKWhereClause "p" 1}}
 	` + "`" + `
 	{{- end}}
 
-	rows, err := db.QueryContext(ctx, query, id)
+	rows, err := db.QueryContext(ctx, query, {{.PKArgs ""}})
 	if err != nil {
-		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", id, err)
+		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
 	}
 	defer rows.Close()
 
@@ -2379,7 +2484,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Qualif
 
 	{{range $idx, $rel := .Relations -}}
 	{{$target := index $.AllKnownModels $rel.TargetModel -}}
-	seen_{{$rel.FieldName}} := make(map[{{$target.PK.Type}}]struct{}, 4)
+	seen_{{$rel.FieldName}} := make(map[{{$target.PKType $.ModelPkgAlias}}]struct{}, 4)
 	{{range $target.SelectableFields -}}
 	var r{{$idx}}_{{.Name}} {{.QualifiedBaseType $.ModelPkgAlias}}
 	{{end -}}
@@ -2397,7 +2502,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Qualif
 
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): scanning row: %w", id, err)
+			return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): scanning row: %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
 		}
 
 		if parent == nil {
@@ -2406,8 +2511,8 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Qualif
 
 		{{range $idx, $rel := .Relations -}}
 		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		rPk{{$idx}} := r{{$idx}}_{{$target.PK.Name}}
-		if !IsZero(rPk{{$idx}}) {
+		rPk{{$idx}} := {{$target.PKValueFromVars (print "r" $idx "_") $.ModelPkgAlias}}
+		if !({{$target.PKZeroCheckFromVars (print "r" $idx "_")}}) {
 			if _, ok := seen_{{$rel.FieldName}}[rPk{{$idx}}]; !ok {
 				seen_{{$rel.FieldName}}[rPk{{$idx}}] = struct{}{}
 				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
@@ -2434,10 +2539,10 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Qualif
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): iterating rows: %w", id, err)
+		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): iterating rows: %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
 	}
 	if parent == nil {
-		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, sql.ErrNoRows)
 	}
 
 	return parent, nil
@@ -2454,7 +2559,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 			{{.AllColumns "p"}}{{.AllRelationColumns}}
 		FROM p
 		{{.AllRelationJoins "p"}}
-		ORDER BY p.{{.PK.Column}} ASC
+		ORDER BY {{.PKColumns "p"}} ASC
 	` + "`" + `
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -2464,11 +2569,11 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 	defer rows.Close()
 
 	items := make([]*{{.ModelPkgAlias}}.{{.Name}}, 0, 16)
-	itemsMap := make(map[{{.PK.Type}}]*{{.ModelPkgAlias}}.{{.Name}}, 16)
+	itemsMap := make(map[{{.PKType .ModelPkgAlias}}]*{{.ModelPkgAlias}}.{{.Name}}, 16)
 
 	{{range $idx, $rel := .Relations -}}
 	{{$target := index $.AllKnownModels $rel.TargetModel -}}
-	seen_{{$rel.FieldName}} := make(map[seenKey[{{$.PK.Type}}, {{$target.PK.Type}}]]struct{}, 64)
+	seen_{{$rel.FieldName}} := make(map[seenKey[{{$.PKType $.ModelPkgAlias}}, {{$target.PKType $.ModelPkgAlias}}]]struct{}, 64)
 	{{range $target.SelectableFields -}}
 	var r{{$idx}}_{{.Name}} {{.QualifiedBaseType $.ModelPkgAlias}}
 	{{end -}}
@@ -2491,7 +2596,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 			return nil, fmt.Errorf("fetchAll{{.NamePlural}}WithRelations: scanning row: %w", err)
 		}
 
-		pPK := p.{{.PK.Name}}
+		pPK := {{.PKValue "p" .ModelPkgAlias}}
 		parent, exists := itemsMap[pPK]
 		if !exists {
 			parent = &p
@@ -2501,9 +2606,9 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 
 		{{range $idx, $rel := .Relations -}}
 		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		rPk{{$idx}} := r{{$idx}}_{{$target.PK.Name}}
-		if !IsZero(rPk{{$idx}}) {
-			key{{$idx}} := seenKey[{{$.PK.Type}}, {{$target.PK.Type}}]{parent: pPK, child: rPk{{$idx}}}
+		rPk{{$idx}} := {{$target.PKValueFromVars (print "r" $idx "_") $.ModelPkgAlias}}
+		if !({{$target.PKZeroCheckFromVars (print "r" $idx "_")}}) {
+			key{{$idx}} := seenKey[{{$.PKType $.ModelPkgAlias}}, {{$target.PKType $.ModelPkgAlias}}]{parent: pPK, child: rPk{{$idx}}}
 			if _, ok := seen_{{$rel.FieldName}}[key{{$idx}}]; !ok {
 				seen_{{$rel.FieldName}}[key{{$idx}}] = struct{}{}
 				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
@@ -2536,13 +2641,13 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 	return items, nil
 }
 {{else}}
-func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.QualifiedType .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	opts := []QueryOption{PreloadAssociations(false)}
 	if cfg.IncludeDeleted {
 		opts = append(opts, IncludeDeleted())
 	}
 
-	m, err := Get{{.Name}}ByID(ctx, db, id, opts...)
+	m, err := Get{{.Name}}ByID(ctx, db, {{.PKArgs ""}}, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2551,7 +2656,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, id {{.PK.Qualif
 	{{$target := index $.AllKnownModels $rel.TargetModel -}}
 	{{if eq $rel.Type "HasMany"}}
 	{
-		preloadOpts := []QueryOption{Where("{{$rel.ForeignKey}} = $1", m.{{$.PK.Name}})}
+		preloadOpts := []QueryOption{Where("{{$rel.ForeignKey}} = $1", m.{{$.FirstPK.Name}})}
 		if cfg.IncludeDeleted {
 			preloadOpts = append(preloadOpts, IncludeDeleted())
 		}
@@ -2640,9 +2745,9 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 
 	{{if .HasManyRelations -}}
 	parentIDs := make([]any, 0, len(items))
-	parentMap := make(map[{{.PK.Type}}]*{{.ModelPkgAlias}}.{{.Name}}, len(items))
+	parentMap := make(map[{{.FirstPK.QualifiedType .ModelPkgAlias}}]*{{.ModelPkgAlias}}.{{.Name}}, len(items))
 	for _, item := range items {
-		pk := item.{{.PK.Name}}
+		pk := item.{{.FirstPK.Name}}
 		if !IsZero(pk) {
 			if _, exists := parentMap[pk]; !exists {
 				parentMap[pk] = item
@@ -2697,7 +2802,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 	{{if $parentFK}}
 	{
 		fkIDs := make([]any, 0, len(items))
-		fkMap := make(map[{{$target.PK.Type}}][]*{{$.ModelPkgAlias}}.{{$.Name}}, len(items))
+		fkMap := make(map[{{$target.FirstPK.QualifiedType $.ModelPkgAlias}}][]*{{$.ModelPkgAlias}}.{{$.Name}}, len(items))
 		for _, item := range items {
 			{{if $parentFK.IsPointer -}}
 			if item.{{$parentFK.Name}} != nil {
@@ -2724,14 +2829,14 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 				preloadOpts = append(preloadOpts, IncludeDeleted())
 			}
 			children, err := batchIn(ctx, db, fkIDs, func(ctx context.Context, db DBTX, batch []any) ([]*{{$.ModelPkgAlias}}.{{$target.Name}}, error) {
-				opts := append([]QueryOption{In("{{$target.PK.Column}}", batch...)}, preloadOpts...)
+				opts := append([]QueryOption{In("{{$target.FirstPK.Column}}", batch...)}, preloadOpts...)
 				return FetchAll{{$target.NamePlural}}(ctx, db, opts...)
 			})
 			if err != nil {
 				return nil, fmt.Errorf("fetchAll{{$.NamePlural}}WithRelations: preloading {{$rel.FieldName}}: %w", err)
 			}
 			for _, child := range children {
-				parents := fkMap[child.{{$target.PK.Name}}]
+				parents := fkMap[child.{{$target.FirstPK.Name}}]
 				for _, parent := range parents {
 					{{if $rel.IsPointer -}}
 					parent.{{$rel.FieldName}} = child
