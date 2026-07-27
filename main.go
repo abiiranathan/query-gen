@@ -1015,53 +1015,91 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 	return rel, true
 }
 
-// parseFieldTags parses a field's struct tags according to GORM specifications.
+// parseFieldTags parses a struct field's name, type, and raw tag string into a
+// Field description, interpreting `gorm:"..."` tag syntax per GORM's tag
+// specification (https://gorm.io/docs/models.html#Fields-Tags).
+//
+// fieldName is the Go struct field's identifier (e.g. "UserID"), fieldType is
+// its textual Go type (e.g. "*string"), and rawTag is the field's full raw
+// struct tag string (e.g. `gorm:"column:user_id;not null"`), as obtained from
+// reflect.StructField.Tag.
+//
+// The returned Field has sensible defaults derived from fieldName and
+// fieldType even when rawTag contains no "gorm" key, or is empty.
 func parseFieldTags(fieldName, fieldType, rawTag string) Field {
+	// Seed the result with defaults inferred purely from the field's Go-level
+	// name and type, before any tag parsing occurs. These are overridden below
+	// as relevant gorm tag options are discovered.
 	f := Field{
 		Name:       fieldName,
 		Type:       fieldType,
-		Column:     toSnakeCase(fieldName),
-		IsPK:       strings.EqualFold(fieldName, "ID"),
-		Permission: PermReadWrite,
+		Column:     toSnakeCase(fieldName),             // default column name, e.g. "UserID" -> "user_id"
+		IsPK:       strings.EqualFold(fieldName, "ID"), // GORM convention: a field literally named "ID" (any case) is the primary key
+		Permission: PermReadWrite,                      // fields are read/write unless a tag says otherwise
 	}
 
+	// A Go pointer type (e.g. "*string") signals a nullable column by GORM
+	// convention, independent of any explicit "null"/"not null" tag.
 	f.Nullable = strings.HasPrefix(fieldType, "*")
 
+	// No struct tag at all: nothing further to parse, return the type-derived defaults.
 	if rawTag == "" {
 		return f
 	}
 
+	// Wrap the raw tag string in reflect.StructTag so we can extract just the
+	// "gorm" key's value (GORM tags are namespaced under gorm:"...").
 	structTag := reflect.StructTag(rawTag)
 	gormTag := structTag.Get("gorm")
 	if gormTag == "" {
+		// The field has other tags (e.g. json:"...") but no gorm tag; nothing
+		// GORM-specific to apply.
 		return f
 	}
 
-	notNullSeen := false
-
+	// --- First pass: column name only -----------------------------------
+	// GORM tag options are semicolon-separated. This first pass scans only
+	// for "column:" so that f.Column is resolved before anything else,
+	// independent of where "column:" appears relative to other options.
+	// It stops at the first match via break, so only the first "column:"
+	// segment found takes effect if there are (invalidly) multiple.
 	for part := range strings.SplitSeq(gormTag, ";") {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(strings.ToLower(part), "column:") {
+			// NOTE: uses the original-case `part`, not `lower`, so the actual
+			// column name preserves the case the user wrote after "column:".
 			f.Column = part[len("column:"):]
 			break
 		}
 	}
 
+	// Local accumulators for read/create/update permission bits, combined
+	// into f.Permission after the main loop. All default to true (readable
+	// and writable) and are narrowed by "->" / "<-" style tags below.
 	canRead := true
 	canCreate := true
 	canUpdate := true
+	// Track whether a "->" (read) or "<-" (write) style tag was seen at all,
+	// distinguishing "explicitly set to true" from "never mentioned".
 	hasReadTag := false
 	hasWriteTag := false
 
+	// --- Second pass: every other option ---------------------------------
 	for part := range strings.SplitSeq(gormTag, ";") {
 		part = strings.TrimSpace(part)
 		lower := strings.ToLower(part)
 
 		switch {
+		// "-" ignores the field entirely (read, write, and migration); "-:all"
+		// is the explicit long form of the same thing. Either way, return
+		// immediately: no other tag option can matter once the field is ignored.
 		case part == "-" || lower == "-:all":
 			f.IsIgnore = true
 			return f
 
+		// "-:migration" excludes the field from auto-migration only; it still
+		// participates in normal read/write. No field on Field models this
+		// distinction here, so the case is present but intentionally a no-op.
 		case lower == "-:migration":
 
 		case lower == "primarykey" || lower == "primary_key":
@@ -1073,9 +1111,12 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case lower == "index":
 			f.HasIndex = true
 
+		// "index:name" — a named index. Checked after the bare "index" case;
+		// since lower == "index" won't match this HasPrefix branch (no colon),
+		// order between the two doesn't actually matter here.
 		case strings.HasPrefix(lower, "index:"):
 			f.HasIndex = true
-			f.IndexName = part[len("index:"):]
+			f.IndexName = part[len("index:"):] // preserves original case of the name
 
 		case lower == "uniqueindex" || lower == "unique_index":
 			f.HasUniqueIndex = true
@@ -1084,6 +1125,9 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			f.HasUniqueIndex = true
 			f.UniqueIndexName = part[len("uniqueindex:"):]
 
+		// GORM accepts both "uniqueIndex:" and "unique_index:" spellings for a
+		// named unique index; handled as two separate prefix cases since the
+		// prefix lengths differ.
 		case strings.HasPrefix(lower, "unique_index:"):
 			f.HasUniqueIndex = true
 			f.UniqueIndexName = part[len("unique_index:"):]
@@ -1095,11 +1139,16 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case strings.HasPrefix(lower, "type:"):
 			f.RawSQLType = part[len("type:"):]
 
+		// "datatype:" is an alternate/legacy spelling for an explicit SQL
+		// type. Only applied if "type:" hasn't already set RawSQLType, so
+		// "type:" takes priority when both are present.
 		case strings.HasPrefix(lower, "datatype:"):
 			if f.RawSQLType == "" {
 				f.RawSQLType = part[len("datatype:"):]
 			}
 
+		// "size:N" — malformed/non-numeric values are silently ignored
+		// (err != nil skips the assignment) rather than causing a parse failure.
 		case strings.HasPrefix(lower, "size:"):
 			if n, err := strconv.Atoi(part[len("size:"):]); err == nil {
 				f.Size = n
@@ -1115,21 +1164,30 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 				f.Scale = n
 			}
 
+		// "check:constraint" or "check:name,constraint". Uses the
+		// case-preserving `part` (not `lower`) since SQL check expressions
+		// are case-sensitive. If a comma is present, everything before the
+		// first comma is treated as an optional constraint name and
+		// discarded; everything after is the constraint expression itself.
+		// Index is used (rather than LastIndex) so a constraint expression
+		// that itself contains a comma doesn't get truncated.
 		case strings.HasPrefix(part, "check:"):
 			raw := part[len("check:"):]
-			if idx := strings.LastIndex(raw, ","); idx != -1 {
-				f.CheckConstraint = strings.TrimSpace(raw[idx+1:])
+			if _, after, ok := strings.Cut(raw, ","); ok {
+				f.CheckConstraint = strings.TrimSpace(after)
 			} else {
 				f.CheckConstraint = strings.TrimSpace(raw)
 			}
 
 		case lower == "not null" || lower == "notnull":
-			notNullSeen = true
 			f.Nullable = false
 
 		case lower == "null":
 			f.Nullable = true
 
+		// "->" family: read permission tags. Bare "->", "->:true", "->:rw",
+		// and "->:r" are all treated as "readable" (GORM's finer-grained
+		// distinctions between these forms aren't modeled separately here).
 		case lower == "->" || lower == "->:true" || lower == "->:rw" || lower == "->:r":
 			canRead = true
 			hasReadTag = true
@@ -1138,6 +1196,8 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			canRead = false
 			hasReadTag = true
 
+		// "<-" family: write permission tags. Bare "<-" and "<-:true" both
+		// mean fully writable (create + update).
 		case lower == "<-" || lower == "<-:true" || lower == "<-:rw":
 			canCreate = true
 			canUpdate = true
@@ -1160,11 +1220,25 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		}
 	}
 
+	// If a read-permission tag was given but no write-permission tag was
+	// given, and the field is still marked readable, GORM's semantics treat
+	// this as "read-only unless writability is separately declared" — so
+	// creation/update are turned off. Without this adjustment, a bare "->"
+	// tag (meaning "readable") would otherwise leave canCreate/canUpdate at
+	// their true defaults and incorrectly produce PermReadWrite.
 	if hasReadTag && !hasWriteTag && canRead {
 		canCreate = false
 		canUpdate = false
 	}
 
+	// Collapse the three canRead/canCreate/canUpdate booleans into the
+	// Field's single Permission value. The first five cases cover the
+	// "clean" combinations with dedicated named constants; anything else
+	// (i.e. the remaining three of the eight possible boolean combinations,
+	// including "all false") falls through to the default branch, which
+	// OR-bits together whichever of PermReadOnly/PermCreateOnly/PermUpdateOnly
+	// apply. Note this presumes Permission is a bitmask type where those
+	// single-capability constants can be safely combined with |.
 	switch {
 	case canRead && canCreate && canUpdate:
 		f.Permission = PermReadWrite
@@ -1190,9 +1264,8 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		f.Permission = perm
 	}
 
+	// Primary keys are never nullable.
 	if f.IsPK {
-		f.Nullable = false
-	} else if !notNullSeen && !f.Nullable {
 		f.Nullable = false
 	}
 
@@ -1772,6 +1845,7 @@ type FetchFunc[T any] func(ctx context.Context, db DBTX, opts ...QueryOption) ([
 type CountFunc func(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error)
 
 // Paginate executes a paginated query using DBTX, counting total rows and retrieving the requested page.
+// Page is constrained to (1, 10) if page < 1 or pageSize < 1.
 func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn FetchFunc[T], page, pageSize int, opts ...QueryOption) (*PaginationResult[T], error) {
 	if page < 1 {
 		page = 1
@@ -1829,6 +1903,10 @@ func (n nullableScanner[T]) Scan(src any) error {
 		return nil
 	}
 
+	if err := convertAssign(n.dst, src); err == nil {
+		return nil
+	}
+
 	if scanner, ok := any(n.dst).(sql.Scanner); ok {
 		return scanner.Scan(src)
 	}
@@ -1841,7 +1919,7 @@ func (n nullableScanner[T]) Scan(src any) error {
 		return convertAssign(vDst.Interface(), src)
 	}
 
-	return convertAssign(n.dst, src)
+	return fmt.Errorf("scanNullable: cannot scan %T into %T", src, n.dst)
 }
 
 // scanNullable returns a value implementing sql.Scanner for dst.
