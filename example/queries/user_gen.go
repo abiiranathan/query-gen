@@ -28,7 +28,6 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 		{col: "name", val: m.Name, omitIfZero: false},
 		{col: "email", val: m.Email, omitIfZero: false},
 		{col: "created_at", val: m.CreatedAt, omitIfZero: true},
-		{col: "deleted_at", val: m.DeletedAt, omitIfZero: false},
 		{col: "age", val: m.Age, omitIfZero: false},
 	}
 
@@ -72,7 +71,7 @@ func InsertUsers(ctx context.Context, db DBTX, models []*models.User) error {
 		return nil
 	}
 
-	const batchSize = 199
+	const batchSize = 249
 	for i := 0; i < len(models); i += batchSize {
 		end := min((i + batchSize), len(models))
 		batch := models[i:end]
@@ -88,10 +87,10 @@ func insertUsersBatch(ctx context.Context, db DBTX, batch []*models.User) error 
 		return nil
 	}
 
-	args := make([]any, 0, len(batch)*5)
+	args := make([]any, 0, len(batch)*4)
 	var sb strings.Builder
-	sb.Grow(128 + len(batch)*5*8)
-	sb.WriteString("INSERT INTO users (name, email, created_at, deleted_at, age) VALUES ")
+	sb.Grow(128 + len(batch)*4*8)
+	sb.WriteString("INSERT INTO users (name, email, created_at, age) VALUES ")
 
 	paramIdx := 1
 	for i, m := range batch {
@@ -114,10 +113,6 @@ func insertUsersBatch(ctx context.Context, db DBTX, batch []*models.User) error 
 		sb.WriteString(getPlaceholder(paramIdx))
 		paramIdx++
 		args = append(args, m.CreatedAt)
-		sb.WriteString(", ")
-		sb.WriteString(getPlaceholder(paramIdx))
-		paramIdx++
-		args = append(args, m.DeletedAt)
 		sb.WriteString(", ")
 		sb.WriteString(getPlaceholder(paramIdx))
 		paramIdx++
@@ -281,11 +276,11 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	const query = `
 		UPDATE users
-		SET name = $1, email = $2, created_at = $3, deleted_at = $4, age = $5
-		WHERE id = $6
+		SET name = $1, email = $2, created_at = $3, age = $4
+		WHERE id = $5
 	`
 
-	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.DeletedAt, &m.Age, m.ID)
+	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.Age, m.ID)
 	if err != nil {
 		return fmt.Errorf("updateUser(%v): %w", fmt.Sprint(m.ID), err)
 	}
@@ -396,14 +391,12 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 	var p models.User
 
 	seen_Orders := make(map[int64]struct{}, 4)
-	var r0_ID int64
-	var r0_UserID int64
-	var r0_Amount float64
+	var c0 models.Order
 	scanArgs := []any{
 		&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
-		scanNullable(&r0_ID),
-		scanNullable(&r0_UserID),
-		scanNullable(&r0_Amount),
+		scanNullable(&c0.ID),
+		scanNullable(&c0.UserID),
+		scanNullable(&c0.Amount),
 	}
 
 	for rows.Next() {
@@ -415,15 +408,11 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 			parent = &p
 		}
 
-		rPk0 := r0_ID
-		if !(IsZero(r0_ID)) {
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
 			if _, ok := seen_Orders[rPk0]; !ok {
 				seen_Orders[rPk0] = struct{}{}
-				child := models.Order{
-					ID:     r0_ID,
-					UserID: r0_UserID,
-					Amount: r0_Amount,
-				}
+				child := c0
 				parent.Orders = append(parent.Orders, child)
 			}
 		}
@@ -463,17 +452,14 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 	itemsMap := make(map[int64]*models.User, 16)
 
 	seen_Orders := make(map[seenKey[int64, int64]]struct{}, 64)
-	var r0_ID int64
-	var r0_UserID int64
-	var r0_Amount float64
 	for rows.Next() {
 		var p models.User
-
+		var c0 models.Order
 		scanArgs := []any{
 			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
-			scanNullable(&r0_ID),
-			scanNullable(&r0_UserID),
-			scanNullable(&r0_Amount),
+			scanNullable(&c0.ID),
+			scanNullable(&c0.UserID),
+			scanNullable(&c0.Amount),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -488,16 +474,12 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 			items = append(items, parent)
 		}
 
-		rPk0 := r0_ID
-		if !(IsZero(r0_ID)) {
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
 			key0 := seenKey[int64, int64]{parent: pPK, child: rPk0}
 			if _, ok := seen_Orders[key0]; !ok {
 				seen_Orders[key0] = struct{}{}
-				child := models.Order{
-					ID:     r0_ID,
-					UserID: r0_UserID,
-					Amount: r0_Amount,
-				}
+				child := c0
 				parent.Orders = append(parent.Orders, child)
 			}
 		}

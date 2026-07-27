@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/abiiranathan/query-gen/example/models"
 )
@@ -342,20 +341,15 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 	var p models.Order
 
 	seen_User := make(map[int64]struct{}, 4)
-	var r0_ID int64
-	var r0_Name string
-	var r0_Email string
-	var r0_CreatedAt time.Time
-	var r0_DeletedAt time.Time
-	var r0_Age models.Age
+	var c0 models.User
 	scanArgs := []any{
 		&p.ID, &p.UserID, &p.Amount,
-		scanNullable(&r0_ID),
-		scanNullable(&r0_Name),
-		scanNullable(&r0_Email),
-		scanNullable(&r0_CreatedAt),
-		scanNullable(&r0_DeletedAt),
-		scanNullable(&r0_Age),
+		scanNullable(&c0.ID),
+		scanNullable(&c0.Name),
+		scanNullable(&c0.Email),
+		scanNullable(&c0.CreatedAt),
+		scanNullable(&c0.DeletedAt),
+		scanNullable(&c0.Age),
 	}
 
 	for rows.Next() {
@@ -367,18 +361,11 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 			parent = &p
 		}
 
-		rPk0 := r0_ID
-		if !(IsZero(r0_ID)) {
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
 			if _, ok := seen_User[rPk0]; !ok {
 				seen_User[rPk0] = struct{}{}
-				child := models.User{
-					ID:        r0_ID,
-					Name:      r0_Name,
-					Email:     r0_Email,
-					CreatedAt: r0_CreatedAt,
-					DeletedAt: toPtr(r0_DeletedAt),
-					Age:       r0_Age,
-				}
+				child := c0
 				parent.User = &child
 			}
 		}
@@ -418,23 +405,17 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 	itemsMap := make(map[int64]*models.Order, 16)
 
 	seen_User := make(map[seenKey[int64, int64]]struct{}, 64)
-	var r0_ID int64
-	var r0_Name string
-	var r0_Email string
-	var r0_CreatedAt time.Time
-	var r0_DeletedAt time.Time
-	var r0_Age models.Age
 	for rows.Next() {
 		var p models.Order
-
+		var c0 models.User
 		scanArgs := []any{
 			&p.ID, &p.UserID, &p.Amount,
-			scanNullable(&r0_ID),
-			scanNullable(&r0_Name),
-			scanNullable(&r0_Email),
-			scanNullable(&r0_CreatedAt),
-			scanNullable(&r0_DeletedAt),
-			scanNullable(&r0_Age),
+			scanNullable(&c0.ID),
+			scanNullable(&c0.Name),
+			scanNullable(&c0.Email),
+			scanNullable(&c0.CreatedAt),
+			scanNullable(&c0.DeletedAt),
+			scanNullable(&c0.Age),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -449,19 +430,12 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 			items = append(items, parent)
 		}
 
-		rPk0 := r0_ID
-		if !(IsZero(r0_ID)) {
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
 			key0 := seenKey[int64, int64]{parent: pPK, child: rPk0}
 			if _, ok := seen_User[key0]; !ok {
 				seen_User[key0] = struct{}{}
-				child := models.User{
-					ID:        r0_ID,
-					Name:      r0_Name,
-					Email:     r0_Email,
-					CreatedAt: r0_CreatedAt,
-					DeletedAt: toPtr(r0_DeletedAt),
-					Age:       r0_Age,
-				}
+				child := c0
 				parent.User = &child
 			}
 		}

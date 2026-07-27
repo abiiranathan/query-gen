@@ -532,6 +532,7 @@ type FetchFunc[T any] func(ctx context.Context, db DBTX, opts ...QueryOption) ([
 type CountFunc func(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error)
 
 // Paginate executes a paginated query using DBTX, counting total rows and retrieving the requested page.
+// Page is constrained to (1, 10) if page < 1 or pageSize < 1.
 func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn FetchFunc[T], page, pageSize int, opts ...QueryOption) (*PaginationResult[T], error) {
 	if page < 1 {
 		page = 1
@@ -589,19 +590,25 @@ func (n nullableScanner[T]) Scan(src any) error {
 		return nil
 	}
 
+	if err := convertAssign(n.dst, src); err == nil {
+		return nil
+	}
+
 	if scanner, ok := any(n.dst).(sql.Scanner); ok {
 		return scanner.Scan(src)
 	}
 
+	// n.dst is like **string, so vDst is *string
 	vDst := reflect.ValueOf(n.dst).Elem()
 	if vDst.Kind() == reflect.Pointer {
 		if vDst.IsNil() {
+			// Automatically allocates a new type: e.g new(string)
 			vDst.Set(reflect.New(vDst.Type().Elem()))
 		}
+		// Passes the inner *string to convertAssign
 		return convertAssign(vDst.Interface(), src)
 	}
-
-	return convertAssign(n.dst, src)
+	return fmt.Errorf("scanNullable: cannot scan %T into %T", src, n.dst)
 }
 
 // scanNullable returns a value implementing sql.Scanner for dst.

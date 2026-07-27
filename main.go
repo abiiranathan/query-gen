@@ -101,6 +101,11 @@ func (f Field) IsTimestamp() bool {
 	return f.BaseType() == "time.Time"
 }
 
+// IsDeletedAt reports whether this field represents a soft-delete timestamp.
+func (f Field) IsDeletedAt() bool {
+	return strings.EqualFold(f.Name, "DeletedAt") || f.Column == "deleted_at"
+}
+
 // Writable reports whether this field should appear in an INSERT statement.
 // If isCompositePK is true, primary key fields are included because composite
 // keys must be explicitly supplied on insert. Single primary key fields are
@@ -109,12 +114,18 @@ func (f Field) Writable(isCompositePK bool) bool {
 	if f.IsPK {
 		return isCompositePK
 	}
+	if f.IsDeletedAt() {
+		return false
+	}
 	return f.Permission != PermReadOnly && f.Permission != PermUpdateOnly
 }
 
 // Updatable reports whether this field should appear in an UPDATE statement SET clause.
 // Primary key fields are always excluded because they form the WHERE clause.
 func (f Field) Updatable() bool {
+	if f.IsDeletedAt() {
+		return false
+	}
 	return !f.IsPK && f.Permission != PermReadOnly && f.Permission != PermCreateOnly
 }
 
@@ -1911,14 +1922,16 @@ func (n nullableScanner[T]) Scan(src any) error {
 		return scanner.Scan(src)
 	}
 
-	vDst := reflect.ValueOf(n.dst).Elem()
+	// n.dst is like **string, so vDst is *string
+	vDst := reflect.ValueOf(n.dst).Elem() 
 	if vDst.Kind() == reflect.Pointer {
 		if vDst.IsNil() {
+			// Automatically allocates a new type: e.g new(string)
 			vDst.Set(reflect.New(vDst.Type().Elem()))
 		}
+		// Passes the inner *string to convertAssign
 		return convertAssign(vDst.Interface(), src)
 	}
-
 	return fmt.Errorf("scanNullable: cannot scan %T into %T", src, n.dst)
 }
 
@@ -1926,7 +1939,7 @@ func (n nullableScanner[T]) Scan(src any) error {
 func scanNullable[T any](dst *T) nullableScanner[T] {
 	return nullableScanner[T]{dst: dst}
 }
-	
+
 // parseTimeString parses SQL and ISO 8601 timestamp strings.
 func parseTimeString(s string) (time.Time, error) {
 	formats := []string{
@@ -2674,9 +2687,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .Mo
 	{{range $idx, $rel := .Relations -}}
 	{{$target := index $.AllKnownModels $rel.TargetModel -}}
 	seen_{{$rel.FieldName}} := make(map[{{$target.PKType $.ModelPkgAlias}}]struct{}, 4)
-	{{range $target.SelectableFields -}}
-	var r{{$idx}}_{{.Name}} {{.QualifiedBaseType $.ModelPkgAlias}}
-	{{end -}}
+	var c{{$idx}} {{$.ModelPkgAlias}}.{{$target.Name}}
 	{{end -}}
 
 	scanArgs := []any{
@@ -2684,7 +2695,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .Mo
 		{{range $idx, $rel := .Relations -}}
 		{{$target := index $.AllKnownModels $rel.TargetModel -}}
 		{{range $target.SelectableFields -}}
-		scanNullable(&r{{$idx}}_{{.Name}}),
+		scanNullable(&c{{$idx}}.{{.Name}}),
 		{{end -}}
 		{{end -}}
 	}
@@ -2700,15 +2711,11 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .Mo
 
 		{{range $idx, $rel := .Relations -}}
 		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		rPk{{$idx}} := {{$target.PKValueFromVars (print "r" $idx "_") $.ModelPkgAlias}}
-		if !({{$target.PKZeroCheckFromVars (print "r" $idx "_")}}) {
+		if !({{$target.PKZeroCheck (print "c" $idx)}}) {
+			rPk{{$idx}} := {{$target.PKValue (print "c" $idx) $.ModelPkgAlias}}
 			if _, ok := seen_{{$rel.FieldName}}[rPk{{$idx}}]; !ok {
 				seen_{{$rel.FieldName}}[rPk{{$idx}}] = struct{}{}
-				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-					{{range $target.SelectableFields -}}
-					{{.Name}}: {{if .IsPointer}}toPtr(r{{$idx}}_{{.Name}}){{else}}r{{$idx}}_{{.Name}}{{end}},
-					{{end -}}
-				}
+				child := c{{$idx}}
 				{{if eq $rel.Type "HasMany" -}}
 				{{if $rel.IsPointer -}}
 				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, &child)
@@ -2763,20 +2770,21 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 	{{range $idx, $rel := .Relations -}}
 	{{$target := index $.AllKnownModels $rel.TargetModel -}}
 	seen_{{$rel.FieldName}} := make(map[seenKey[{{$.PKType $.ModelPkgAlias}}, {{$target.PKType $.ModelPkgAlias}}]]struct{}, 64)
-	{{range $target.SelectableFields -}}
-	var r{{$idx}}_{{.Name}} {{.QualifiedBaseType $.ModelPkgAlias}}
-	{{end -}}
 	{{end -}}
 
 	for rows.Next() {
 		var p {{.ModelPkgAlias}}.{{.Name}}
+		{{range $idx, $rel := .Relations -}}
+		{{$target := index $.AllKnownModels $rel.TargetModel -}}
+		var c{{$idx}} {{$.ModelPkgAlias}}.{{$target.Name}}
+		{{end -}}
 
 		scanArgs := []any{
 			{{.AllScanArgs "p"}},
 			{{range $idx, $rel := .Relations -}}
 			{{$target := index $.AllKnownModels $rel.TargetModel -}}
 			{{range $target.SelectableFields -}}
-			scanNullable(&r{{$idx}}_{{.Name}}),
+			scanNullable(&c{{$idx}}.{{.Name}}),
 			{{end -}}
 			{{end -}}
 		}
@@ -2795,16 +2803,12 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 
 		{{range $idx, $rel := .Relations -}}
 		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		rPk{{$idx}} := {{$target.PKValueFromVars (print "r" $idx "_") $.ModelPkgAlias}}
-		if !({{$target.PKZeroCheckFromVars (print "r" $idx "_")}}) {
+		if !({{$target.PKZeroCheck (print "c" $idx)}}) {
+			rPk{{$idx}} := {{$target.PKValue (print "c" $idx) $.ModelPkgAlias}}
 			key{{$idx}} := seenKey[{{$.PKType $.ModelPkgAlias}}, {{$target.PKType $.ModelPkgAlias}}]{parent: pPK, child: rPk{{$idx}}}
 			if _, ok := seen_{{$rel.FieldName}}[key{{$idx}}]; !ok {
 				seen_{{$rel.FieldName}}[key{{$idx}}] = struct{}{}
-				child := {{$.ModelPkgAlias}}.{{$target.Name}}{
-					{{range $target.SelectableFields -}}
-					{{.Name}}: {{if .IsPointer}}toPtr(r{{$idx}}_{{.Name}}){{else}}r{{$idx}}_{{.Name}}{{end}},
-					{{end -}}
-				}
+				child := c{{$idx}}
 				{{if eq $rel.Type "HasMany" -}}
 				{{if $rel.IsPointer -}}
 				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, &child)

@@ -28,7 +28,6 @@ func InsertProject(ctx context.Context, db DBTX, m *models.Project) error {
 		{col: "name", val: m.Name, omitIfZero: false},
 		{col: "description", val: m.Description, omitIfZero: false},
 		{col: "created_at", val: m.CreatedAt, omitIfZero: true},
-		{col: "deleted_at", val: m.DeletedAt, omitIfZero: false},
 	}
 
 	cols := make([]string, 0, len(fields))
@@ -71,7 +70,7 @@ func InsertProjects(ctx context.Context, db DBTX, models []*models.Project) erro
 		return nil
 	}
 
-	const batchSize = 249
+	const batchSize = 333
 	for i := 0; i < len(models); i += batchSize {
 		end := min((i + batchSize), len(models))
 		batch := models[i:end]
@@ -87,10 +86,10 @@ func insertProjectsBatch(ctx context.Context, db DBTX, batch []*models.Project) 
 		return nil
 	}
 
-	args := make([]any, 0, len(batch)*4)
+	args := make([]any, 0, len(batch)*3)
 	var sb strings.Builder
-	sb.Grow(128 + len(batch)*4*8)
-	sb.WriteString("INSERT INTO projects (name, description, created_at, deleted_at) VALUES ")
+	sb.Grow(128 + len(batch)*3*8)
+	sb.WriteString("INSERT INTO projects (name, description, created_at) VALUES ")
 
 	paramIdx := 1
 	for i, m := range batch {
@@ -113,10 +112,6 @@ func insertProjectsBatch(ctx context.Context, db DBTX, batch []*models.Project) 
 		sb.WriteString(getPlaceholder(paramIdx))
 		paramIdx++
 		args = append(args, m.CreatedAt)
-		sb.WriteString(", ")
-		sb.WriteString(getPlaceholder(paramIdx))
-		paramIdx++
-		args = append(args, m.DeletedAt)
 		sb.WriteByte(')')
 	}
 
@@ -276,11 +271,11 @@ func UpdateProject(ctx context.Context, db DBTX, m *models.Project) error {
 
 	const query = `
 		UPDATE projects
-		SET name = $1, description = $2, created_at = $3, deleted_at = $4
-		WHERE id = $5
+		SET name = $1, description = $2, created_at = $3
+		WHERE id = $4
 	`
 
-	res, err := db.ExecContext(ctx, query, &m.Name, &m.Description, &m.CreatedAt, &m.DeletedAt, m.ID)
+	res, err := db.ExecContext(ctx, query, &m.Name, &m.Description, &m.CreatedAt, m.ID)
 	if err != nil {
 		return fmt.Errorf("updateProject(%v): %w", fmt.Sprint(m.ID), err)
 	}
