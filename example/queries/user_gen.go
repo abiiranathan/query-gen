@@ -29,6 +29,7 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 		{col: "email", val: m.Email, omitIfZero: false},
 		{col: "created_at", val: m.CreatedAt, omitIfZero: true},
 		{col: "age", val: m.Age, omitIfZero: false},
+		{col: "permissions", val: m.Permissions, omitIfZero: false},
 	}
 
 	cols := make([]string, 0, len(fields))
@@ -46,14 +47,14 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	var query string
 	if len(cols) == 0 {
-		query = "INSERT INTO users DEFAULT VALUES RETURNING id, name, email, created_at, deleted_at, age"
+		query = "INSERT INTO users DEFAULT VALUES RETURNING id, name, email, created_at, deleted_at, age, permissions"
 	} else {
-		query = fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING id, name, email, created_at, deleted_at, age",
+		query = fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING id, name, email, created_at, deleted_at, age, permissions",
 			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	}
 
 	if err := db.QueryRowContext(ctx, query, args...).
-		Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
+		Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 		return fmt.Errorf("insertUser: %w", err)
 	}
 	return nil
@@ -71,7 +72,7 @@ func InsertUsers(ctx context.Context, db DBTX, models []*models.User) error {
 		return nil
 	}
 
-	const batchSize = 249
+	const batchSize = 199
 	for i := 0; i < len(models); i += batchSize {
 		end := min((i + batchSize), len(models))
 		batch := models[i:end]
@@ -87,10 +88,10 @@ func insertUsersBatch(ctx context.Context, db DBTX, batch []*models.User) error 
 		return nil
 	}
 
-	args := make([]any, 0, len(batch)*4)
+	args := make([]any, 0, len(batch)*5)
 	var sb strings.Builder
-	sb.Grow(128 + len(batch)*4*8)
-	sb.WriteString("INSERT INTO users (name, email, created_at, age) VALUES ")
+	sb.Grow(128 + len(batch)*5*8)
+	sb.WriteString("INSERT INTO users (name, email, created_at, age, permissions) VALUES ")
 
 	paramIdx := 1
 	for i, m := range batch {
@@ -117,10 +118,14 @@ func insertUsersBatch(ctx context.Context, db DBTX, batch []*models.User) error 
 		sb.WriteString(getPlaceholder(paramIdx))
 		paramIdx++
 		args = append(args, m.Age)
+		sb.WriteString(", ")
+		sb.WriteString(getPlaceholder(paramIdx))
+		paramIdx++
+		args = append(args, m.Permissions)
 		sb.WriteByte(')')
 	}
 
-	sb.WriteString(" RETURNING id, name, email, created_at, deleted_at, age")
+	sb.WriteString(" RETURNING id, name, email, created_at, deleted_at, age, permissions")
 	rows, err := db.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return fmt.Errorf("executing bulk insert: %w", err)
@@ -133,7 +138,7 @@ func insertUsersBatch(ctx context.Context, db DBTX, batch []*models.User) error 
 			return errors.New("unexpected extra row returned from insert")
 		}
 		m := batch[idx]
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 			return fmt.Errorf("scanning row %d: %w", idx, err)
 		}
 		idx++
@@ -163,7 +168,7 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 	}
 
 	query := `
-		SELECT id, name, email, created_at, deleted_at, age
+		SELECT id, name, email, created_at, deleted_at, age, permissions
 		FROM users
 		WHERE id = $1
 	`
@@ -173,7 +178,7 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m models.User
-	if err := row.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
+	if err := row.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 		return nil, fmt.Errorf("getUserByID(%v): %w", id, err)
 	}
 
@@ -241,7 +246,7 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 		return fetchAllUsersWithRelations(ctx, db, clause, args, cfg)
 	}
 
-	query := "SELECT id, name, email, created_at, deleted_at, age FROM users" + clause
+	query := "SELECT id, name, email, created_at, deleted_at, age, permissions FROM users" + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -252,7 +257,7 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 	items := make([]*models.User, 0, 16)
 	for rows.Next() {
 		var m models.User
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 			return nil, fmt.Errorf("fetchAllUsers: scanning row: %w", err)
 		}
 		items = append(items, &m)
@@ -276,11 +281,11 @@ func UpdateUser(ctx context.Context, db DBTX, m *models.User) error {
 
 	const query = `
 		UPDATE users
-		SET name = $1, email = $2, created_at = $3, age = $4
-		WHERE id = $5
+		SET name = $1, email = $2, created_at = $3, age = $4, permissions = $5
+		WHERE id = $6
 	`
 
-	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.Age, m.ID)
+	res, err := db.ExecContext(ctx, query, &m.Name, &m.Email, &m.CreatedAt, &m.Age, &m.Permissions, m.ID)
 	if err != nil {
 		return fmt.Errorf("updateUser(%v): %w", fmt.Sprint(m.ID), err)
 	}
@@ -372,7 +377,7 @@ func DeleteUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.User, error) {
 	query := `
 		SELECT 
-			p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, r0.order_id, r0.user_id, r0.amount
+			p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, p.permissions, r0.order_id, r0.user_id, r0.amount
 		FROM users p
 		LEFT JOIN orders r0 ON r0.user_id = p.id
 		WHERE p.id = $1
@@ -393,7 +398,7 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 	seen_Orders := make(map[int64]struct{}, 4)
 	var c0 models.Order
 	scanArgs := []any{
-		&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
+		&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age, &p.Permissions,
 		scanNullable(&c0.ID),
 		scanNullable(&c0.UserID),
 		scanNullable(&c0.Amount),
@@ -431,12 +436,12 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, args []any, cfg QueryOptions) ([]*models.User, error) {
 	query := `
 		WITH p AS (
-			SELECT p.id, p.name, p.email, p.created_at, p.deleted_at, p.age
+			SELECT p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, p.permissions
 			FROM users p
 	` + clause + `
 		)
 		SELECT 
-			p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, r0.order_id, r0.user_id, r0.amount
+			p.id, p.name, p.email, p.created_at, p.deleted_at, p.age, p.permissions, r0.order_id, r0.user_id, r0.amount
 		FROM p
 		LEFT JOIN orders r0 ON r0.user_id = p.id
 		ORDER BY p.id ASC
@@ -456,7 +461,7 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 		var p models.User
 		var c0 models.Order
 		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age,
+			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age, &p.Permissions,
 			scanNullable(&c0.ID),
 			scanNullable(&c0.UserID),
 			scanNullable(&c0.Amount),

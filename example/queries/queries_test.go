@@ -10,6 +10,7 @@ import (
 
 	"github.com/abiiranathan/query-gen/example/models"
 	"github.com/abiiranathan/query-gen/example/queries"
+	"github.com/abiiranathan/query-gen/perms"
 
 	// _ "github.com/mattn/go-sqlite3"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -32,9 +33,10 @@ import (
 // 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 // 		name TEXT NOT NULL,
 // 		email TEXT,
-// 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+// 		created_at DATE DEFAULT CURRENT_DATE,
 // 		deleted_at DATETIME,
-// 		age VARCHAR(20) NOT NULL
+// 		age VARCHAR(20) NOT NULL,
+//      permissions INT
 // 	);
 
 // 	CREATE TABLE IF NOT EXISTS orders (
@@ -116,9 +118,10 @@ func setupTestDB(tb testing.TB) *sql.DB {
 		id BIGSERIAL PRIMARY KEY,
 		name TEXT NOT NULL,
 		email TEXT,
-		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+		created_at DATE DEFAULT CURRENT_DATE,
 		deleted_at TIMESTAMPTZ,
-		age VARCHAR(20) NOT NULL
+		age VARCHAR(20) NOT NULL,
+		permissions BIGINT
 	);
 
 	CREATE TABLE orders (
@@ -173,7 +176,7 @@ func TestInsertAndGetByID(t *testing.T) {
 	user := &models.User{
 		Name:      "Alice",
 		Email:     "alice@example.com",
-		CreatedAt: now,
+		CreatedAt: perms.Date(now),
 	}
 
 	// 1. Test InsertUser
@@ -227,7 +230,7 @@ func TestInsertUsers_Bulk(t *testing.T) {
 		users[i] = &models.User{
 			Name:      fmt.Sprintf("User %d", i+1),
 			Email:     fmt.Sprintf("user%d@example.com", i+1),
-			CreatedAt: now,
+			CreatedAt: perms.Date(now),
 		}
 	}
 

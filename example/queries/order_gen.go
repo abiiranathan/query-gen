@@ -325,7 +325,7 @@ func DeleteOrders(ctx context.Context, db DBTX, opts ...QueryOption) (int64, err
 func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Order, error) {
 	const query = `
 		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age, r0.permissions
 		FROM orders p
 		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
 		WHERE p.order_id = $1
@@ -350,6 +350,7 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 		scanNullable(&c0.CreatedAt),
 		scanNullable(&c0.DeletedAt),
 		scanNullable(&c0.Age),
+		scanNullable(&c0.Permissions),
 	}
 
 	for rows.Next() {
@@ -389,7 +390,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 	` + clause + `
 		)
 		SELECT 
-			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age
+			p.order_id, p.user_id, p.amount, r0.id, r0.name, r0.email, r0.created_at, r0.deleted_at, r0.age, r0.permissions
 		FROM p
 		LEFT JOIN users r0 ON r0.id = p.user_id AND r0.deleted_at IS NULL
 		ORDER BY p.order_id ASC
@@ -416,6 +417,7 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 			scanNullable(&c0.CreatedAt),
 			scanNullable(&c0.DeletedAt),
 			scanNullable(&c0.Age),
+			scanNullable(&c0.Permissions),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {

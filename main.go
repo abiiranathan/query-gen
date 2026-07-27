@@ -72,6 +72,7 @@ type Relation struct {
 type Field struct {
 	Name            string     // Go struct field name, e.g. "Email".
 	Type            string     // Go type as written in source, e.g. "string" or "*string".
+	UnderlyingType  string     // Underlying Go primitive type, e.g. "uint64" or "*uint64".
 	Column          string     // Database column name, e.g. "email".
 	IsPK            bool       // True if this field is a primary key.
 	IsIgnore        bool       // True if the field is excluded entirely (gorm:"-").
@@ -91,6 +92,15 @@ type Field struct {
 	CheckConstraint string     // Column-level CHECK expression from gorm:"check:expr". Empty means none.
 }
 
+// UnderlyingBaseType returns the underlying primitive Go type with pointer indirections stripped.
+// E.g., "*permissions.Permission" (where Permission = uint64) -> "uint64".
+func (f Field) UnderlyingBaseType() string {
+	if f.UnderlyingType != "" {
+		return strings.TrimPrefix(f.UnderlyingType, "*")
+	}
+	return strings.TrimPrefix(f.Type, "*")
+}
+
 // IsPointer reports whether the field is a pointer type.
 func (f Field) IsPointer() bool {
 	return strings.HasPrefix(f.Type, "*")
@@ -98,7 +108,7 @@ func (f Field) IsPointer() bool {
 
 // IsTimestamp reports whether the field represents a time.Time struct.
 func (f Field) IsTimestamp() bool {
-	return f.BaseType() == "time.Time"
+	return f.UnderlyingBaseType() == "time.Time"
 }
 
 // IsDeletedAt reports whether this field represents a soft-delete timestamp.
@@ -144,13 +154,6 @@ func (m Model) WritableFields() []Field {
 // Selectable reports whether this field should appear in a SELECT statement.
 func (f Field) Selectable() bool {
 	return f.Permission != PermWriteOnly
-}
-
-// BaseType strips one leading pointer indirection, so callers can tell a
-// *string field apart from its underlying string type for scan-target
-// construction.
-func (f Field) BaseType() string {
-	return strings.TrimPrefix(f.Type, "*")
 }
 
 // BulkInsertBatchSize returns the maximum number of model instances per bulk insert query
@@ -712,13 +715,99 @@ func pluralize(s string) string {
 	return s + "s"
 }
 
+func isTimeType(t types.Type) bool {
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+
+	st, ok := t.Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+
+	if isTimeStruct(st) {
+		return true
+	}
+
+	// struct { time.Time } (embedded)
+	for field := range st.Fields() {
+		if field.Embedded() && isTimeType(field.Type()) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTimeStruct reports whether st matches time.Time's known underlying
+// struct shape by field name and type string, avoiding any dependency on
+// which type-checking session/importer produced the type.
+func isTimeStruct(st *types.Struct) bool {
+	if st.NumFields() != 3 {
+		return false
+	}
+	wantNames := [3]string{"wall", "ext", "loc"}
+	wantTypes := [3]string{"uint64", "int64", "*time.Location"}
+	for i := range 3 {
+		f := st.Field(i)
+		if f.Name() != wantNames[i] || f.Type().String() != wantTypes[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveUnderlyingType(expr ast.Expr, fieldType string, typesInfo *types.Info) string {
+	if typesInfo == nil {
+		return fieldType
+	}
+
+	t := typesInfo.TypeOf(expr)
+	if t == nil {
+		return fieldType
+	}
+
+	isPointer := false
+	if ptr, ok := t.(*types.Pointer); ok {
+		isPointer = true
+		t = ptr.Elem()
+	}
+
+	if basic, ok := t.Underlying().(*types.Basic); ok {
+		if isPointer {
+			return "*" + basic.String()
+		}
+		return basic.String()
+	}
+
+	if isTimeType(t) {
+		if isPointer {
+			return "*time.Time"
+		}
+		return "time.Time"
+	}
+
+	return fieldType
+}
+
+// bareTypeName strips pointer indirections and package qualifiers from a type name.
+// E.g., "*perms.Date" -> "Date", "models.User" -> "User", "string" -> "string".
+func bareTypeName(s string) string {
+	s = strings.TrimPrefix(s, "*")
+	if idx := strings.LastIndex(s, "."); idx != -1 {
+		return s[idx+1:]
+	}
+	return s
+}
+
 func parsePackage(pattern string) ([]Model, string, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
 			packages.NeedSyntax |
 			packages.NeedTypes |
-			packages.NeedTypesInfo,
+			packages.NeedTypesInfo |
+			packages.NeedImports |
+			packages.NeedDeps,
 	}
 
 	pkgs, err := packages.Load(cfg, pattern)
@@ -737,7 +826,7 @@ func parsePackage(pattern string) ([]Model, string, error) {
 
 	for _, pkg := range pkgs {
 		tableNames := collectTableNameMethods(pkg.Syntax)
-		customDataTypes := collectDataTypeMethods(pkg.Syntax)
+		customDataTypes := collectDataTypeMethods(pkg)
 
 		for _, file := range pkg.Syntax {
 			ast.Inspect(file, func(n ast.Node) bool {
@@ -784,10 +873,22 @@ func parsePackage(pattern string) ([]Model, string, error) {
 						continue
 					}
 
+					// Resolve underlying primitive Go type using type-checker info
+					parsedField.UnderlyingType = resolveUnderlyingType(field.Type, fieldType, pkg.TypesInfo)
+
 					if parsedField.RawSQLType == "" {
 						baseType := strings.TrimPrefix(fieldType, "*")
-						if dt, ok := customDataTypes[baseType]; ok {
-							parsedField.RawSQLType = dt
+						bareType := bareTypeName(baseType)
+						underlyingBase := parsedField.UnderlyingBaseType()
+						bareUnderlying := bareTypeName(underlyingBase)
+
+						for _, t := range []string{baseType, underlyingBase, bareType, bareUnderlying} {
+							if t != "" {
+								if dt, ok := customDataTypes[t]; ok {
+									parsedField.RawSQLType = dt
+									break
+								}
+							}
 						}
 					}
 					model.Fields = append(model.Fields, parsedField)
@@ -824,52 +925,72 @@ func parsePackage(pattern string) ([]Model, string, error) {
 	return result, fullPkgPath, nil
 }
 
-// collectDataTypeMethods scans a package's syntax trees for methods with
+// collectDataTypeMethods scans a package and its imported packages for methods with
 // the signature `func (r ReceiverType) DataType() string` or
 // `func (r ReceiverType) GormDataType() string` that return a single constant
 // string literal, returning a map of receiver type name to custom data type.
-func collectDataTypeMethods(files []*ast.File) map[string]string {
+func collectDataTypeMethods(pkg *packages.Package) map[string]string {
 	dataTypes := make(map[string]string)
+	visited := make(map[string]bool)
 
-	for _, file := range files {
-		for _, decl := range file.Decls {
-			funcDecl, ok := decl.(*ast.FuncDecl)
-			if !ok || funcDecl.Recv == nil || len(funcDecl.Recv.List) != 1 {
-				continue
-			}
+	var collect func(p *packages.Package)
+	collect = func(p *packages.Package) {
+		if p == nil || visited[p.PkgPath] {
+			return
+		}
+		visited[p.PkgPath] = true
 
-			methodName := funcDecl.Name.Name
-			if methodName != "DataType" && methodName != "GormDataType" {
-				continue
-			}
+		for _, imp := range p.Imports {
+			collect(imp)
+		}
 
-			sig := funcDecl.Type
-			if sig.Params != nil && len(sig.Params.List) > 0 {
-				continue
-			}
-			if sig.Results == nil || len(sig.Results.List) != 1 {
-				continue
-			}
-			if resultIdent, ok := sig.Results.List[0].Type.(*ast.Ident); !ok || resultIdent.Name != "string" {
-				continue
-			}
+		pkgName := p.Name
 
-			receiverType := receiverTypeName(funcDecl.Recv.List[0].Type)
-			if receiverType == "" {
-				continue
-			}
+		for _, file := range p.Syntax {
+			for _, decl := range file.Decls {
+				funcDecl, ok := decl.(*ast.FuncDecl)
+				if !ok || funcDecl.Recv == nil || len(funcDecl.Recv.List) != 1 {
+					continue
+				}
 
-			literal := extractReturnedStringLiteral(funcDecl.Body)
-			if literal == "" {
-				continue
-			}
+				methodName := funcDecl.Name.Name
+				if methodName != "DataType" && methodName != "GormDataType" {
+					continue
+				}
 
-			if methodName == "GormDataType" || dataTypes[receiverType] == "" {
-				dataTypes[receiverType] = literal
+				sig := funcDecl.Type
+				if sig.Params != nil && len(sig.Params.List) > 0 {
+					continue
+				}
+				if sig.Results == nil || len(sig.Results.List) != 1 {
+					continue
+				}
+				if resultIdent, ok := sig.Results.List[0].Type.(*ast.Ident); !ok || resultIdent.Name != "string" {
+					continue
+				}
+
+				receiverType := receiverTypeName(funcDecl.Recv.List[0].Type)
+				if receiverType == "" {
+					continue
+				}
+
+				literal := extractReturnedStringLiteral(funcDecl.Body)
+				if literal == "" {
+					continue
+				}
+
+				// Store both bare name ("Date") and qualified name ("mytypes.Date")
+				qualType := pkgName + "." + receiverType
+
+				if methodName == "GormDataType" || dataTypes[receiverType] == "" {
+					dataTypes[receiverType] = literal
+					dataTypes[qualType] = literal
+				}
 			}
 		}
 	}
 
+	collect(pkg)
 	return dataTypes
 }
 

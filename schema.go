@@ -28,7 +28,7 @@ func sqlType(f Field, dialect SchemaDialect) string {
 		return f.RawSQLType
 	}
 
-	base := f.BaseType()
+	base := f.UnderlyingBaseType()
 
 	switch dialect {
 	case DialectPostgres:
@@ -199,7 +199,7 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 			// Single-column PK: use auto-increment identity types where applicable.
 			switch dialect {
 			case DialectPostgres:
-				switch f.BaseType() {
+				switch f.UnderlyingBaseType() {
 				case "int", "int64", "uint", "uint64":
 					col.Reset()
 					col.WriteString("    ")
@@ -214,7 +214,7 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 					col.WriteString(" PRIMARY KEY")
 				}
 			case DialectSQLite:
-				switch f.BaseType() {
+				switch f.UnderlyingBaseType() {
 				case "int", "int64", "int32", "uint", "uint64", "uint32":
 					col.Reset()
 					col.WriteString("    ")
@@ -240,11 +240,20 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 				col.WriteByte(' ')
 				col.WriteString(formatDefaultValue(f.DefaultVal, f, dialect))
 			} else if strings.EqualFold(f.Name, "CreatedAt") && f.IsTimestamp() {
+				rawType := strings.TrimSpace(strings.ToLower(f.RawSQLType))
 				switch dialect {
 				case DialectPostgres:
-					col.WriteString(" DEFAULT now()")
+					if rawType == "date" {
+						col.WriteString(" DEFAULT CURRENT_DATE")
+					} else {
+						col.WriteString(" DEFAULT CURRENT_TIMESTAMP") // or " DEFAULT now()"
+					}
 				case DialectSQLite:
-					col.WriteString(" DEFAULT CURRENT_TIMESTAMP")
+					if rawType == "date" {
+						col.WriteString(" DEFAULT CURRENT_DATE")
+					} else {
+						col.WriteString(" DEFAULT CURRENT_TIMESTAMP")
+					}
 				}
 			}
 

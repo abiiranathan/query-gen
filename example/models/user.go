@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"github.com/abiiranathan/query-gen/perms"
+)
 
 type Age string
 
@@ -9,14 +13,14 @@ func (Age) DataType() string {
 }
 
 type User struct {
-	ID        int64 `gorm:"primaryKey"`
-	Name      string
-	Email     string
-	CreatedAt time.Time
-	DeletedAt *time.Time `gorm:"null"`
-	Age       Age
-
-	Orders []Order `gorm:"foreignKey:UserID;references:ID"`
+	ID          int64 `gorm:"primaryKey"`
+	Name        string
+	Email       string
+	CreatedAt   perms.Date // Tests resolution of underlying types for time.Time
+	DeletedAt   *time.Time `gorm:"null"`
+	Age         Age
+	Permissions perms.Permission // Tests resolution of underlying primitive types
+	Orders      []Order          `gorm:"foreignKey:UserID;references:ID"`
 }
 
 // Tag represents a label attached to a Project.

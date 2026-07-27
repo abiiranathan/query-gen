@@ -8,6 +8,7 @@ import (
 
 	"github.com/abiiranathan/query-gen/example/models"
 	"github.com/abiiranathan/query-gen/example/queries"
+	"github.com/abiiranathan/query-gen/perms"
 )
 
 // setupBenchmarkData creates an in-memory database pre-populated with count users
@@ -137,7 +138,7 @@ func BenchmarkPreload_RawSQLJoinMap(b *testing.B) {
 			u.Email = uEmail.String
 			u.Age = models.Age(uAge.String)
 			if uCreatedAt.Valid {
-				u.CreatedAt = uCreatedAt.Time
+				u.CreatedAt = perms.Date(uCreatedAt.Time)
 			}
 			if uDeletedAt.Valid {
 				u.DeletedAt = &uDeletedAt.Time
