@@ -776,6 +776,15 @@ func resolveUnderlyingType(expr ast.Expr, fieldType string, typesInfo *types.Inf
 	return fieldType
 }
 
+func safePlural(s string) string {
+	plural := inflection.Plural(s)
+	if plural == s {
+		// "Information" -> "InformationList"
+		return s + "List"
+	}
+	return plural
+}
+
 // bareTypeName strips pointer indirections and package qualifiers from a type name.
 // E.g., "*perms.Date" -> "Date", "models.User" -> "User", "string" -> "string".
 func bareTypeName(s string) string {
@@ -829,7 +838,7 @@ func parsePackage(pattern string) ([]Model, string, error) {
 
 				model := Model{
 					Name:       typeSpec.Name.Name,
-					NamePlural: inflection.Plural(typeSpec.Name.Name),
+					NamePlural: safePlural(typeSpec.Name.Name),
 					Table:      inflection.Plural(toSnakeCase(typeSpec.Name.Name)),
 				}
 
