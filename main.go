@@ -16,6 +16,7 @@ import (
 	"text/template"
 	"unicode"
 
+	"github.com/abiiranathan/query-gen/inflection"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/imports"
 )
@@ -701,20 +702,6 @@ func main() {
 	}
 }
 
-// pluralize returns a pluralized table name for a snake_case identifier.
-// Words ending in a consonant + "y" (e.g., "category") become "-ies" ("categories").
-func pluralize(s string) string {
-	if strings.HasSuffix(s, "y") && len(s) > 1 {
-		switch s[len(s)-2] {
-		case 'a', 'e', 'i', 'o', 'u':
-			return s + "s"
-		default:
-			return strings.TrimSuffix(s, "y") + "ies"
-		}
-	}
-	return s + "s"
-}
-
 func isTimeType(t types.Type) bool {
 	if ptr, ok := t.(*types.Pointer); ok {
 		t = ptr.Elem()
@@ -842,8 +829,8 @@ func parsePackage(pattern string) ([]Model, string, error) {
 
 				model := Model{
 					Name:       typeSpec.Name.Name,
-					NamePlural: pluralize(typeSpec.Name.Name),
-					Table:      pluralize(toSnakeCase(typeSpec.Name.Name)),
+					NamePlural: inflection.Plural(typeSpec.Name.Name),
+					Table:      inflection.Plural(toSnakeCase(typeSpec.Name.Name)),
 				}
 
 				if explicit, ok := tableNames[model.Name]; ok {
