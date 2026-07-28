@@ -2556,6 +2556,99 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}
 	return &m, nil
 }
 
+// Get{{.Name}} retrieves a single {{.Name}} record matching mandatory query options/where clause.
+// Returns sql.ErrNoRows if no matching record is found.
+func Get{{.Name}}(ctx context.Context, db DBTX, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
+	if db == nil {
+		return nil, errors.New("get{{.Name}}: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return nil, errors.New("get{{.Name}}: query options/where clause required to prevent returning arbitrary row")
+	}
+
+	pOpts := append([]QueryOption(nil), opts...)
+	pOpts = append(pOpts, Limit(1))
+
+	items, err := FetchAll{{.NamePlural}}(ctx, db, pOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("get{{.Name}}: %w", err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("get{{.Name}}: %w", sql.ErrNoRows)
+	}
+	return items[0], nil
+}
+
+// Update{{.Name}}Columns updates only the specified updatable columns/fields for an existing {{.Name}} record in {{.Table}}.
+// Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
+func Update{{.Name}}Columns(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}, cols ...string) error {
+	if db == nil {
+		return errors.New("update{{.Name}}Columns: db is nil")
+	}
+	if m == nil {
+		return errors.New("update{{.Name}}Columns: m is nil")
+	}
+	if len(cols) == 0 {
+		return errors.New("update{{.Name}}Columns: at least one column/field must be specified")
+	}
+
+	allowedColumns := []string{
+		{{range .UpdatableFields -}}
+		"{{.Column}}", "{{.Name}}",
+		{{end -}}
+	}
+
+	setClauses := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols)+{{len .PK}})
+
+	for _, col := range cols {
+		if !slices.Contains(allowedColumns, col) {
+			return fmt.Errorf("update{{.Name}}Columns: column or field %q is not updatable", col)
+		}
+
+		var dbCol string
+		var val any
+
+		switch col {
+		{{range .UpdatableFields -}}
+		case "{{.Column}}", "{{.Name}}":
+			dbCol = "{{.Column}}"
+			val = m.{{.Name}}
+		{{end -}}
+		}
+
+		args = append(args, val)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", dbCol, len(args)))
+	}
+
+	pkClauses := make([]string, 0, {{len .PK}})
+	{{range $i, $pk := .PK -}}
+	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "{{$pk.Column}}", len(args)+{{$i}}+1))
+	{{end -}}
+
+	query := fmt.Sprintf("UPDATE {{.Table}} SET %s WHERE %s",
+		strings.Join(setClauses, ", "), strings.Join(pkClauses, " AND "))
+
+	args = append(args, {{.PKArgs "m."}})
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("update{{.Name}}Columns(%v): %w", fmt.Sprint({{.PKArgs "m."}}), err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("detect rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("update{{.Name}}Columns(%v): %w", fmt.Sprint({{.PKArgs "m."}}), sql.ErrNoRows)
+	}
+	return nil
+}
+
+
 // Exists{{.Name}}ByID reports whether a {{.Name}} record with the given primary key exists.
 func Exists{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (bool, error) {
 	if db == nil {
@@ -2577,6 +2670,41 @@ func Exists{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlia
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, {{.PKArgs ""}}).Scan(&exists); err != nil {
 		return false, fmt.Errorf("exists{{.Name}}ByID(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
+	}
+	return exists, nil
+}
+
+// Exists{{.Name}} reports whether a {{.Name}} record matching the mandatory query options/where clause exists.
+func Exists{{.Name}}(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
+	if db == nil {
+		return false, errors.New("exists{{.Name}}: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return false, errors.New("exists{{.Name}}: query options/where clause required")
+	}
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+	{{- if .HasDeletedAt}}
+
+	if !cfg.IncludeDeleted {
+		if whereClause != "" {
+			whereClause += " AND {{.DeletedAtField.Column}} IS NULL"
+		} else {
+			whereClause = " WHERE {{.DeletedAtField.Column}} IS NULL"
+		}
+	}
+	{{- end}}
+
+	query := "SELECT EXISTS(SELECT 1 FROM {{.Table}}" + whereClause + ")"
+
+	var exists bool
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
+		return false, fmt.Errorf("exists{{.Name}}: %w", err)
 	}
 	return exists, nil
 }

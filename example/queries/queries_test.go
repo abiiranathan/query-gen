@@ -1306,3 +1306,154 @@ func TestDeleteProject(t *testing.T) {
 		t.Errorf("expected soft-deleted project to exist when IncludeDeleted option is used")
 	}
 }
+
+func TestGetUser(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u1 := &models.User{Name: "Alice Smith", Email: "alice@example.com", Age: "30"}
+	u2 := &models.User{Name: "Bob Jones", Email: "bob@example.com", Age: "25"}
+	_ = queries.InsertUser(ctx, db, u1)
+	_ = queries.InsertUser(ctx, db, u2)
+
+	// Seed an order for u1 to test preloading
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 150.00})
+
+	t.Run("Get single user by custom where clause", func(t *testing.T) {
+		fetched, err := queries.GetUser(ctx, db, queries.Where("email = $1", "alice@example.com"))
+		if err != nil {
+			t.Fatalf("GetUser failed: %v", err)
+		}
+		if fetched.ID != u1.ID || fetched.Name != "Alice Smith" {
+			t.Errorf("got user %+v, want user ID %d", fetched, u1.ID)
+		}
+	})
+
+	t.Run("GetUser with relation preloading", func(t *testing.T) {
+		fetched, err := queries.GetUser(ctx, db,
+			queries.Where("id = $1", u1.ID),
+			queries.Preload(true),
+		)
+		if err != nil {
+			t.Fatalf("GetUser with preload failed: %v", err)
+		}
+		if len(fetched.Orders) != 1 {
+			t.Errorf("expected 1 preloaded order, got %d", len(fetched.Orders))
+		}
+	})
+
+	t.Run("Fails when mandatory where clause is missing", func(t *testing.T) {
+		_, err := queries.GetUser(ctx, db)
+		if err == nil {
+			t.Fatalf("expected error when calling GetUser without Where clause, got nil")
+		}
+	})
+
+	t.Run("Returns error when no record matches", func(t *testing.T) {
+		_, err := queries.GetUser(ctx, db, queries.Where("email = $1", "nonexistent@example.com"))
+		if err == nil {
+			t.Fatalf("expected error for nonexistent user, got nil")
+		}
+	})
+}
+
+func TestUpdateUserColumns(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u := &models.User{Name: "Original Name", Email: "orig@test.com", Age: "20"}
+	if err := queries.InsertUser(ctx, db, u); err != nil {
+		t.Fatalf("InsertUser failed: %v", err)
+	}
+
+	t.Run("Updates specified columns only", func(t *testing.T) {
+		// Mutate Name, Email, and Age on struct in Go, but ONLY request updating "name" and "Email"
+		u.Name = "Updated Name"
+		u.Email = "updated@test.com"
+		u.Age = "99" // Should NOT be updated in DB
+
+		if err := queries.UpdateUserColumns(ctx, db, u, "name", "Email"); err != nil {
+			t.Fatalf("UpdateUserColumns failed: %v", err)
+		}
+
+		fetched, err := queries.GetUserByID(ctx, db, u.ID)
+		if err != nil {
+			t.Fatalf("GetUserByID failed: %v", err)
+		}
+
+		if fetched.Name != "Updated Name" {
+			t.Errorf("got name %q, want 'Updated Name'", fetched.Name)
+		}
+		if fetched.Email != "updated@test.com" {
+			t.Errorf("got email %q, want 'updated@test.com'", fetched.Email)
+		}
+		if fetched.Age != "20" {
+			t.Errorf("got age %q, want original '20' (should not have been updated)", fetched.Age)
+		}
+	})
+
+	t.Run("Fails when no columns specified", func(t *testing.T) {
+		err := queries.UpdateUserColumns(ctx, db, u)
+		if err == nil {
+			t.Fatalf("expected error when passing 0 columns, got nil")
+		}
+	})
+
+	t.Run("Fails when invalid column name provided", func(t *testing.T) {
+		err := queries.UpdateUserColumns(ctx, db, u, "invalid_column_name")
+		if err == nil {
+			t.Fatalf("expected error for invalid column name, got nil")
+		}
+	})
+}
+
+func TestExistsUser(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u := &models.User{Name: "Charlie", Email: "charlie@test.com"}
+	if err := queries.InsertUser(ctx, db, u); err != nil {
+		t.Fatalf("InsertUser failed: %v", err)
+	}
+
+	t.Run("Returns true when matching record exists", func(t *testing.T) {
+		exists, err := queries.ExistsUser(ctx, db, queries.Where("email = $1", "charlie@test.com"))
+		if err != nil || !exists {
+			t.Errorf("ExistsUser returned (%v, %v), want (true, nil)", exists, err)
+		}
+	})
+
+	t.Run("Returns false when no record matches", func(t *testing.T) {
+		exists, err := queries.ExistsUser(ctx, db, queries.Where("email = $1", "ghost@test.com"))
+		if err != nil || exists {
+			t.Errorf("ExistsUser returned (%v, %v), want (false, nil)", exists, err)
+		}
+	})
+
+	t.Run("Fails when mandatory where clause is missing", func(t *testing.T) {
+		_, err := queries.ExistsUser(ctx, db)
+		if err == nil {
+			t.Fatalf("expected error when calling ExistsUser without Where clause, got nil")
+		}
+	})
+
+	t.Run("Respects soft delete filters", func(t *testing.T) {
+		// Soft delete user
+		_ = queries.DeleteUser(ctx, db, u.ID)
+
+		// Default ExistsUser excludes soft-deleted record
+		exists, err := queries.ExistsUser(ctx, db, queries.Where("email = $1", "charlie@test.com"))
+		if err != nil || exists {
+			t.Errorf("ExistsUser should return false for soft-deleted user, got (%v, %v)", exists, err)
+		}
+
+		// ExistsUser with IncludeDeleted includes soft-deleted record
+		existsWithDeleted, err := queries.ExistsUser(ctx, db,
+			queries.Where("email = $1", "charlie@test.com"),
+			queries.IncludeDeleted(),
+		)
+		if err != nil || !existsWithDeleted {
+			t.Errorf("ExistsUser with IncludeDeleted should return true, got (%v, %v)", existsWithDeleted, err)
+		}
+	})
+}

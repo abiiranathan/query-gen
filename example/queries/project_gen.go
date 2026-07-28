@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
@@ -175,6 +176,99 @@ func GetProjectByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption)
 	return &m, nil
 }
 
+// GetProject retrieves a single Project record matching mandatory query options/where clause.
+// Returns sql.ErrNoRows if no matching record is found.
+func GetProject(ctx context.Context, db DBTX, opts ...QueryOption) (*models.Project, error) {
+	if db == nil {
+		return nil, errors.New("getProject: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return nil, errors.New("getProject: query options/where clause required to prevent returning arbitrary row")
+	}
+
+	pOpts := append([]QueryOption(nil), opts...)
+	pOpts = append(pOpts, Limit(1))
+
+	items, err := FetchAllProjects(ctx, db, pOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("getProject: %w", err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("getProject: %w", sql.ErrNoRows)
+	}
+	return items[0], nil
+}
+
+// UpdateProjectColumns updates only the specified updatable columns/fields for an existing Project record in projects.
+// Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
+func UpdateProjectColumns(ctx context.Context, db DBTX, m *models.Project, cols ...string) error {
+	if db == nil {
+		return errors.New("updateProjectColumns: db is nil")
+	}
+	if m == nil {
+		return errors.New("updateProjectColumns: m is nil")
+	}
+	if len(cols) == 0 {
+		return errors.New("updateProjectColumns: at least one column/field must be specified")
+	}
+
+	allowedColumns := []string{
+		"name", "Name",
+		"description", "Description",
+		"created_at", "CreatedAt",
+	}
+
+	setClauses := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols)+1)
+
+	for _, col := range cols {
+		if !slices.Contains(allowedColumns, col) {
+			return fmt.Errorf("updateProjectColumns: column or field %q is not updatable", col)
+		}
+
+		var dbCol string
+		var val any
+
+		switch col {
+		case "name", "Name":
+			dbCol = "name"
+			val = m.Name
+		case "description", "Description":
+			dbCol = "description"
+			val = m.Description
+		case "created_at", "CreatedAt":
+			dbCol = "created_at"
+			val = m.CreatedAt
+		}
+
+		args = append(args, val)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", dbCol, len(args)))
+	}
+
+	pkClauses := make([]string, 0, 1)
+	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "id", len(args)+0+1))
+	query := fmt.Sprintf("UPDATE projects SET %s WHERE %s",
+		strings.Join(setClauses, ", "), strings.Join(pkClauses, " AND "))
+
+	args = append(args, m.ID)
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("updateProjectColumns(%v): %w", fmt.Sprint(m.ID), err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("detect rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("updateProjectColumns(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
+	}
+	return nil
+}
+
 // ExistsProjectByID reports whether a Project record with the given primary key exists.
 func ExistsProjectByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (bool, error) {
 	if db == nil {
@@ -191,6 +285,39 @@ func ExistsProjectByID(ctx context.Context, db DBTX, id int64, opts ...QueryOpti
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
 		return false, fmt.Errorf("existsProjectByID(%v): %w", id, err)
+	}
+	return exists, nil
+}
+
+// ExistsProject reports whether a Project record matching the mandatory query options/where clause exists.
+func ExistsProject(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
+	if db == nil {
+		return false, errors.New("existsProject: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return false, errors.New("existsProject: query options/where clause required")
+	}
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	if !cfg.IncludeDeleted {
+		if whereClause != "" {
+			whereClause += " AND deleted_at IS NULL"
+		} else {
+			whereClause = " WHERE deleted_at IS NULL"
+		}
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM projects" + whereClause + ")"
+
+	var exists bool
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
+		return false, fmt.Errorf("existsProject: %w", err)
 	}
 	return exists, nil
 }

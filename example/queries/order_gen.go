@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
@@ -167,6 +168,95 @@ func GetOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (
 	return &m, nil
 }
 
+// GetOrder retrieves a single Order record matching mandatory query options/where clause.
+// Returns sql.ErrNoRows if no matching record is found.
+func GetOrder(ctx context.Context, db DBTX, opts ...QueryOption) (*models.Order, error) {
+	if db == nil {
+		return nil, errors.New("getOrder: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return nil, errors.New("getOrder: query options/where clause required to prevent returning arbitrary row")
+	}
+
+	pOpts := append([]QueryOption(nil), opts...)
+	pOpts = append(pOpts, Limit(1))
+
+	items, err := FetchAllOrders(ctx, db, pOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("getOrder: %w", err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("getOrder: %w", sql.ErrNoRows)
+	}
+	return items[0], nil
+}
+
+// UpdateOrderColumns updates only the specified updatable columns/fields for an existing Order record in orders.
+// Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
+func UpdateOrderColumns(ctx context.Context, db DBTX, m *models.Order, cols ...string) error {
+	if db == nil {
+		return errors.New("updateOrderColumns: db is nil")
+	}
+	if m == nil {
+		return errors.New("updateOrderColumns: m is nil")
+	}
+	if len(cols) == 0 {
+		return errors.New("updateOrderColumns: at least one column/field must be specified")
+	}
+
+	allowedColumns := []string{
+		"user_id", "UserID",
+		"amount", "Amount",
+	}
+
+	setClauses := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols)+1)
+
+	for _, col := range cols {
+		if !slices.Contains(allowedColumns, col) {
+			return fmt.Errorf("updateOrderColumns: column or field %q is not updatable", col)
+		}
+
+		var dbCol string
+		var val any
+
+		switch col {
+		case "user_id", "UserID":
+			dbCol = "user_id"
+			val = m.UserID
+		case "amount", "Amount":
+			dbCol = "amount"
+			val = m.Amount
+		}
+
+		args = append(args, val)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", dbCol, len(args)))
+	}
+
+	pkClauses := make([]string, 0, 1)
+	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "order_id", len(args)+0+1))
+	query := fmt.Sprintf("UPDATE orders SET %s WHERE %s",
+		strings.Join(setClauses, ", "), strings.Join(pkClauses, " AND "))
+
+	args = append(args, m.ID)
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("updateOrderColumns(%v): %w", fmt.Sprint(m.ID), err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("detect rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("updateOrderColumns(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
+	}
+	return nil
+}
+
 // ExistsOrderByID reports whether a Order record with the given primary key exists.
 func ExistsOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (bool, error) {
 	if db == nil {
@@ -178,6 +268,31 @@ func ExistsOrderByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
 		return false, fmt.Errorf("existsOrderByID(%v): %w", id, err)
+	}
+	return exists, nil
+}
+
+// ExistsOrder reports whether a Order record matching the mandatory query options/where clause exists.
+func ExistsOrder(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
+	if db == nil {
+		return false, errors.New("existsOrder: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return false, errors.New("existsOrder: query options/where clause required")
+	}
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM orders" + whereClause + ")"
+
+	var exists bool
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
+		return false, fmt.Errorf("existsOrder: %w", err)
 	}
 	return exists, nil
 }

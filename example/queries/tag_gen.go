@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
@@ -161,6 +162,95 @@ func GetTagByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*m
 	return &m, nil
 }
 
+// GetTag retrieves a single Tag record matching mandatory query options/where clause.
+// Returns sql.ErrNoRows if no matching record is found.
+func GetTag(ctx context.Context, db DBTX, opts ...QueryOption) (*models.Tag, error) {
+	if db == nil {
+		return nil, errors.New("getTag: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return nil, errors.New("getTag: query options/where clause required to prevent returning arbitrary row")
+	}
+
+	pOpts := append([]QueryOption(nil), opts...)
+	pOpts = append(pOpts, Limit(1))
+
+	items, err := FetchAllTags(ctx, db, pOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("getTag: %w", err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("getTag: %w", sql.ErrNoRows)
+	}
+	return items[0], nil
+}
+
+// UpdateTagColumns updates only the specified updatable columns/fields for an existing Tag record in tags.
+// Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
+func UpdateTagColumns(ctx context.Context, db DBTX, m *models.Tag, cols ...string) error {
+	if db == nil {
+		return errors.New("updateTagColumns: db is nil")
+	}
+	if m == nil {
+		return errors.New("updateTagColumns: m is nil")
+	}
+	if len(cols) == 0 {
+		return errors.New("updateTagColumns: at least one column/field must be specified")
+	}
+
+	allowedColumns := []string{
+		"project_id", "ProjectID",
+		"name", "Name",
+	}
+
+	setClauses := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols)+1)
+
+	for _, col := range cols {
+		if !slices.Contains(allowedColumns, col) {
+			return fmt.Errorf("updateTagColumns: column or field %q is not updatable", col)
+		}
+
+		var dbCol string
+		var val any
+
+		switch col {
+		case "project_id", "ProjectID":
+			dbCol = "project_id"
+			val = m.ProjectID
+		case "name", "Name":
+			dbCol = "name"
+			val = m.Name
+		}
+
+		args = append(args, val)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", dbCol, len(args)))
+	}
+
+	pkClauses := make([]string, 0, 1)
+	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "id", len(args)+0+1))
+	query := fmt.Sprintf("UPDATE tags SET %s WHERE %s",
+		strings.Join(setClauses, ", "), strings.Join(pkClauses, " AND "))
+
+	args = append(args, m.ID)
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("updateTagColumns(%v): %w", fmt.Sprint(m.ID), err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("detect rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("updateTagColumns(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
+	}
+	return nil
+}
+
 // ExistsTagByID reports whether a Tag record with the given primary key exists.
 func ExistsTagByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (bool, error) {
 	if db == nil {
@@ -172,6 +262,31 @@ func ExistsTagByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
 		return false, fmt.Errorf("existsTagByID(%v): %w", id, err)
+	}
+	return exists, nil
+}
+
+// ExistsTag reports whether a Tag record matching the mandatory query options/where clause exists.
+func ExistsTag(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
+	if db == nil {
+		return false, errors.New("existsTag: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return false, errors.New("existsTag: query options/where clause required")
+	}
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM tags" + whereClause + ")"
+
+	var exists bool
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
+		return false, fmt.Errorf("existsTag: %w", err)
 	}
 	return exists, nil
 }

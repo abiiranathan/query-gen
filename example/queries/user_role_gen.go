@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
@@ -166,6 +167,92 @@ func GetUserRoleByID(ctx context.Context, db DBTX, userID int64, roleID int64, o
 	return &m, nil
 }
 
+// GetUserRole retrieves a single UserRole record matching mandatory query options/where clause.
+// Returns sql.ErrNoRows if no matching record is found.
+func GetUserRole(ctx context.Context, db DBTX, opts ...QueryOption) (*models.UserRole, error) {
+	if db == nil {
+		return nil, errors.New("getUserRole: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return nil, errors.New("getUserRole: query options/where clause required to prevent returning arbitrary row")
+	}
+
+	pOpts := append([]QueryOption(nil), opts...)
+	pOpts = append(pOpts, Limit(1))
+
+	items, err := FetchAllUserRoles(ctx, db, pOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("getUserRole: %w", err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("getUserRole: %w", sql.ErrNoRows)
+	}
+	return items[0], nil
+}
+
+// UpdateUserRoleColumns updates only the specified updatable columns/fields for an existing UserRole record in user_roles.
+// Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
+func UpdateUserRoleColumns(ctx context.Context, db DBTX, m *models.UserRole, cols ...string) error {
+	if db == nil {
+		return errors.New("updateUserRoleColumns: db is nil")
+	}
+	if m == nil {
+		return errors.New("updateUserRoleColumns: m is nil")
+	}
+	if len(cols) == 0 {
+		return errors.New("updateUserRoleColumns: at least one column/field must be specified")
+	}
+
+	allowedColumns := []string{
+		"assigned_at", "AssignedAt",
+	}
+
+	setClauses := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols)+2)
+
+	for _, col := range cols {
+		if !slices.Contains(allowedColumns, col) {
+			return fmt.Errorf("updateUserRoleColumns: column or field %q is not updatable", col)
+		}
+
+		var dbCol string
+		var val any
+
+		switch col {
+		case "assigned_at", "AssignedAt":
+			dbCol = "assigned_at"
+			val = m.AssignedAt
+		}
+
+		args = append(args, val)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", dbCol, len(args)))
+	}
+
+	pkClauses := make([]string, 0, 2)
+	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "user_id", len(args)+0+1))
+	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "role_id", len(args)+1+1))
+	query := fmt.Sprintf("UPDATE user_roles SET %s WHERE %s",
+		strings.Join(setClauses, ", "), strings.Join(pkClauses, " AND "))
+
+	args = append(args, m.UserID, m.RoleID)
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("updateUserRoleColumns(%v): %w", fmt.Sprint(m.UserID, m.RoleID), err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("detect rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("updateUserRoleColumns(%v): %w", fmt.Sprint(m.UserID, m.RoleID), sql.ErrNoRows)
+	}
+	return nil
+}
+
 // ExistsUserRoleByID reports whether a UserRole record with the given primary key exists.
 func ExistsUserRoleByID(ctx context.Context, db DBTX, userID int64, roleID int64, opts ...QueryOption) (bool, error) {
 	if db == nil {
@@ -177,6 +264,31 @@ func ExistsUserRoleByID(ctx context.Context, db DBTX, userID int64, roleID int64
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, userID, roleID).Scan(&exists); err != nil {
 		return false, fmt.Errorf("existsUserRoleByID(%v): %w", fmt.Sprint(userID, roleID), err)
+	}
+	return exists, nil
+}
+
+// ExistsUserRole reports whether a UserRole record matching the mandatory query options/where clause exists.
+func ExistsUserRole(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
+	if db == nil {
+		return false, errors.New("existsUserRole: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return false, errors.New("existsUserRole: query options/where clause required")
+	}
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM user_roles" + whereClause + ")"
+
+	var exists bool
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
+		return false, fmt.Errorf("existsUserRole: %w", err)
 	}
 	return exists, nil
 }

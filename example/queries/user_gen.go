@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/abiiranathan/query-gen/example/models"
@@ -185,6 +186,107 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 	return &m, nil
 }
 
+// GetUser retrieves a single User record matching mandatory query options/where clause.
+// Returns sql.ErrNoRows if no matching record is found.
+func GetUser(ctx context.Context, db DBTX, opts ...QueryOption) (*models.User, error) {
+	if db == nil {
+		return nil, errors.New("getUser: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return nil, errors.New("getUser: query options/where clause required to prevent returning arbitrary row")
+	}
+
+	pOpts := append([]QueryOption(nil), opts...)
+	pOpts = append(pOpts, Limit(1))
+
+	items, err := FetchAllUsers(ctx, db, pOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("getUser: %w", err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("getUser: %w", sql.ErrNoRows)
+	}
+	return items[0], nil
+}
+
+// UpdateUserColumns updates only the specified updatable columns/fields for an existing User record in users.
+// Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
+func UpdateUserColumns(ctx context.Context, db DBTX, m *models.User, cols ...string) error {
+	if db == nil {
+		return errors.New("updateUserColumns: db is nil")
+	}
+	if m == nil {
+		return errors.New("updateUserColumns: m is nil")
+	}
+	if len(cols) == 0 {
+		return errors.New("updateUserColumns: at least one column/field must be specified")
+	}
+
+	allowedColumns := []string{
+		"name", "Name",
+		"email", "Email",
+		"created_at", "CreatedAt",
+		"age", "Age",
+		"permissions", "Permissions",
+	}
+
+	setClauses := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols)+1)
+
+	for _, col := range cols {
+		if !slices.Contains(allowedColumns, col) {
+			return fmt.Errorf("updateUserColumns: column or field %q is not updatable", col)
+		}
+
+		var dbCol string
+		var val any
+
+		switch col {
+		case "name", "Name":
+			dbCol = "name"
+			val = m.Name
+		case "email", "Email":
+			dbCol = "email"
+			val = m.Email
+		case "created_at", "CreatedAt":
+			dbCol = "created_at"
+			val = m.CreatedAt
+		case "age", "Age":
+			dbCol = "age"
+			val = m.Age
+		case "permissions", "Permissions":
+			dbCol = "permissions"
+			val = m.Permissions
+		}
+
+		args = append(args, val)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", dbCol, len(args)))
+	}
+
+	pkClauses := make([]string, 0, 1)
+	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "id", len(args)+0+1))
+	query := fmt.Sprintf("UPDATE users SET %s WHERE %s",
+		strings.Join(setClauses, ", "), strings.Join(pkClauses, " AND "))
+
+	args = append(args, m.ID)
+
+	res, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("updateUserColumns(%v): %w", fmt.Sprint(m.ID), err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("detect rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("updateUserColumns(%v): %w", fmt.Sprint(m.ID), sql.ErrNoRows)
+	}
+	return nil
+}
+
 // ExistsUserByID reports whether a User record with the given primary key exists.
 func ExistsUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (bool, error) {
 	if db == nil {
@@ -201,6 +303,39 @@ func ExistsUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption)
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
 		return false, fmt.Errorf("existsUserByID(%v): %w", id, err)
+	}
+	return exists, nil
+}
+
+// ExistsUser reports whether a User record matching the mandatory query options/where clause exists.
+func ExistsUser(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
+	if db == nil {
+		return false, errors.New("existsUser: db is nil")
+	}
+
+	cfg := parseQueryOptions(opts...)
+	if cfg.Where == "" {
+		return false, errors.New("existsUser: query options/where clause required")
+	}
+
+	var whereClause string
+	if cfg.Where != "" {
+		whereClause = " WHERE " + cfg.Where
+	}
+
+	if !cfg.IncludeDeleted {
+		if whereClause != "" {
+			whereClause += " AND deleted_at IS NULL"
+		} else {
+			whereClause = " WHERE deleted_at IS NULL"
+		}
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM users" + whereClause + ")"
+
+	var exists bool
+	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
+		return false, fmt.Errorf("existsUser: %w", err)
 	}
 	return exists, nil
 }
