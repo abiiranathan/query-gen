@@ -1560,3 +1560,55 @@ func TestViewMethods(t *testing.T) {
 		}
 	})
 }
+
+func TestQuestionMarkPlaceholders(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// 1. Seed users and orders
+	u1 := &models.User{Name: "Alice", Email: "alice@example.com", Age: "30"}
+	u2 := &models.User{Name: "Bob", Email: "bob@example.com", Age: "25"}
+	if err := queries.InsertUser(ctx, db, u1); err != nil {
+		t.Fatalf("failed to insert u1: %v", err)
+	}
+	if err := queries.InsertUser(ctx, db, u2); err != nil {
+		t.Fatalf("failed to insert u2: %v", err)
+	}
+
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 200.00})
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u1.ID, Amount: 100.00})
+	_ = queries.InsertOrder(ctx, db, &models.Order{UserID: u2.ID, Amount: 50.00})
+
+	// 2. Test Where clause using multiple '?' placeholders
+	t.Run("Where clause with '?' placeholders", func(t *testing.T) {
+		users, err := queries.FetchAllUsers(ctx, db,
+			queries.Where("email = ? AND age = ?", "alice@example.com", "30"),
+		)
+		if err != nil {
+			t.Fatalf("FetchAllUsers with '?' placeholder failed: %v", err)
+		}
+		if len(users) != 1 {
+			t.Fatalf("expected 1 user, got %d", len(users))
+		}
+		if users[0].Name != "Alice" {
+			t.Errorf("expected user 'Alice', got %q", users[0].Name)
+		}
+	})
+
+	// 3. Test Having clause using multiple '?' placeholders
+	t.Run("Having clause with '?' placeholders", func(t *testing.T) {
+		orders, err := queries.FetchAllOrders(ctx, db,
+			queries.GroupBy("user_id, order_id, amount"),
+			queries.Having("amount >= ? AND SUM(amount) > ?", 100.00, 150.00),
+		)
+		if err != nil {
+			t.Fatalf("FetchAllOrders with '?' placeholder in HAVING failed: %v", err)
+		}
+		if len(orders) != 1 {
+			t.Fatalf("expected 1 order matching HAVING clause, got %d", len(orders))
+		}
+		if orders[0].UserID != u1.ID || orders[0].Amount != 200.00 {
+			t.Errorf("unexpected order returned: %+v", orders[0])
+		}
+	})
+}

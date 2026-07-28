@@ -44,7 +44,8 @@ func batchIn[T, K any](ctx context.Context, db DBTX, ids []K, fetch func(ctx con
 	return results, nil
 }
 
-// QueryOptions provides optional filtering, ordering, grouping, having, pagination, association preloading, and soft-delete controls for queries.
+// QueryOptions provides optional filtering, ordering, grouping, having, pagination,
+// association preloading, and soft-delete controls for queries.
 type QueryOptions struct {
 	Where               string
 	Args                []any
@@ -59,35 +60,6 @@ type QueryOptions struct {
 }
 
 type QueryOption func(*QueryOptions)
-
-func Where(where string, args ...any) QueryOption {
-	return func(o *QueryOptions) {
-		if o.Where != "" {
-			o.Where += " AND " + where
-		} else {
-			o.Where = where
-		}
-		o.Args = append(o.Args, args...)
-	}
-}
-
-// ILIKE performs a case-insensitive pattern match using ILIKE (or LOWER for cross-dialect compatibility).
-func ILIKE(column, value string) QueryOption {
-	return func(o *QueryOptions) {
-		if value == "" {
-			return
-		}
-
-		o.Args = append(o.Args, "%"+strings.ToLower(value)+"%")
-		clause := fmt.Sprintf("LOWER(%s) LIKE $%d", column, len(o.Args))
-
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
 
 // staticPlaceholders pre-computes "$1" through "$1000" to eliminate string formatting
 // allocations during query option construction and parameter binding.
@@ -108,8 +80,83 @@ func getPlaceholder(idx int) string {
 	return fmt.Sprintf("$%d", idx)
 }
 
+// Where appends a raw WHERE clause to the query options.
+//
+// Placeholder Handling:
+//   - '?' Placeholders (Recommended): Automatically replaced with dynamic dollar-indexed
+//     placeholders ($1, $2, ...) based on the current total argument count. This is safest
+//     for dynamic/conditional queries where the number or order of filters is unknown at runtime.
+//   - '$n' Placeholders: Supported as-is. If you provide explicit placeholders (e.g. "$1", "$2"),
+//     they will remain untouched, provided they match the expected argument index in your query.
+func Where(where string, args ...any) QueryOption {
+	return func(o *QueryOptions) {
+		for _, arg := range args {
+			o.Args = append(o.Args, arg)
+			where = strings.Replace(where, "?", getPlaceholder(len(o.Args)), 1)
+		}
+
+		if o.Where != "" {
+			o.Where += " AND " + where
+		} else {
+			o.Where = where
+		}
+	}
+}
+
+// Having appends a raw HAVING clause to the query options.
+//
+// Placeholder Handling:
+//   - '?' Placeholders (Recommended): Automatically replaced with dynamic dollar-indexed
+//     placeholders ($1, $2, ...) based on the current total argument count. This is safest
+//     for dynamic/conditional queries where argument ordering is subject to change.
+//   - '$n' Placeholders: Supported as-is. Explicit placeholders (e.g. "$1", "$2") remain
+//     untouched in the resulting query string.
+func Having(having string, args ...any) QueryOption {
+	return func(o *QueryOptions) {
+		for _, arg := range args {
+			o.Args = append(o.Args, arg)
+			having = strings.Replace(having, "?", getPlaceholder(len(o.Args)), 1)
+		}
+		if o.Having != "" {
+			o.Having += " AND " + having
+		} else {
+			o.Having = having
+		}
+	}
+}
+
+// Eq applies an equality filter (=).
+func Eq(column string, val any) QueryOption {
+	return func(o *QueryOptions) {
+		o.Args = append(o.Args, val)
+		clause := fmt.Sprintf("%s = %s", column, getPlaceholder(len(o.Args)))
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
+// ILIKE performs a case-insensitive pattern match using ILIKE (or LOWER for cross-dialect compatibility).
+func ILIKE(column, value string) QueryOption {
+	return func(o *QueryOptions) {
+		if value == "" {
+			return
+		}
+
+		o.Args = append(o.Args, "%"+strings.ToLower(value)+"%")
+		clause := fmt.Sprintf("LOWER(%s) LIKE %s", column, getPlaceholder(len(o.Args)))
+
+		if o.Where != "" {
+			o.Where += " AND " + clause
+		} else {
+			o.Where = clause
+		}
+	}
+}
+
 // In filters a column matching any of the provided values.
-// It pre-allocates buffer memory and uses cached placeholder strings to minimize allocations.
 func In(column string, values ...any) QueryOption {
 	return func(o *QueryOptions) {
 		n := len(values)
@@ -117,14 +164,13 @@ func In(column string, values ...any) QueryOption {
 			return
 		}
 
-		// Pre-allocate o.Args slice capacity in a single grow step
+		// Pre-allocate o.Args slice capacity
 		if cap(o.Args)-len(o.Args) < n {
 			newArgs := make([]any, len(o.Args), len(o.Args)+n)
 			copy(newArgs, o.Args)
 			o.Args = newArgs
 		}
 
-		// Pre-allocate string builder buffer capacity
 		var sb strings.Builder
 		sb.Grow(len(column) + 6 + (n * 6))
 		sb.WriteString(column)
@@ -149,7 +195,6 @@ func In(column string, values ...any) QueryOption {
 }
 
 // NotIn filters a column not matching any of the provided values.
-// It does nothing if values is empty.
 func NotIn(column string, values ...any) QueryOption {
 	return func(o *QueryOptions) {
 		if len(values) == 0 {
@@ -159,7 +204,7 @@ func NotIn(column string, values ...any) QueryOption {
 		placeholders := make([]string, 0, len(values))
 		for _, v := range values {
 			o.Args = append(o.Args, v)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", len(o.Args)))
+			placeholders = append(placeholders, getPlaceholder(len(o.Args)))
 		}
 
 		clause := fmt.Sprintf("%s NOT IN (%s)", column, strings.Join(placeholders, ", "))
@@ -198,9 +243,10 @@ func IsNotNull(column string) QueryOption {
 // Between applies a BETWEEN min AND max filter on a column.
 func Between(column string, min, max any) QueryOption {
 	return func(o *QueryOptions) {
-		o.Args = append(o.Args, min, max)
-		p1 := fmt.Sprintf("$%d", len(o.Args)-1)
-		p2 := fmt.Sprintf("$%d", len(o.Args))
+		o.Args = append(o.Args, min)
+		p1 := getPlaceholder(len(o.Args))
+		o.Args = append(o.Args, max)
+		p2 := getPlaceholder(len(o.Args))
 
 		clause := fmt.Sprintf("%s BETWEEN %s AND %s", column, p1, p2)
 		if o.Where != "" {
@@ -212,7 +258,6 @@ func Between(column string, min, max any) QueryOption {
 }
 
 // Search performs a pattern match across multiple columns.
-// It does nothing if query or columns is empty.
 func Search(query string, columns ...string) QueryOption {
 	return func(o *QueryOptions) {
 		if query == "" || len(columns) == 0 {
@@ -220,7 +265,7 @@ func Search(query string, columns ...string) QueryOption {
 		}
 
 		o.Args = append(o.Args, "%"+query+"%")
-		placeholder := fmt.Sprintf("$%d", len(o.Args))
+		placeholder := getPlaceholder(len(o.Args))
 
 		clauses := make([]string, 0, len(columns))
 		for _, col := range columns {
@@ -240,7 +285,7 @@ func Search(query string, columns ...string) QueryOption {
 func Gt(column string, val any) QueryOption {
 	return func(o *QueryOptions) {
 		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s > $%d", column, len(o.Args))
+		clause := fmt.Sprintf("%s > %s", column, getPlaceholder(len(o.Args)))
 		if o.Where != "" {
 			o.Where += " AND " + clause
 		} else {
@@ -253,7 +298,7 @@ func Gt(column string, val any) QueryOption {
 func Gte(column string, val any) QueryOption {
 	return func(o *QueryOptions) {
 		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s >= $%d", column, len(o.Args))
+		clause := fmt.Sprintf("%s >= %s", column, getPlaceholder(len(o.Args)))
 		if o.Where != "" {
 			o.Where += " AND " + clause
 		} else {
@@ -266,7 +311,7 @@ func Gte(column string, val any) QueryOption {
 func Lt(column string, val any) QueryOption {
 	return func(o *QueryOptions) {
 		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s < $%d", column, len(o.Args))
+		clause := fmt.Sprintf("%s < %s", column, getPlaceholder(len(o.Args)))
 		if o.Where != "" {
 			o.Where += " AND " + clause
 		} else {
@@ -279,7 +324,7 @@ func Lt(column string, val any) QueryOption {
 func Lte(column string, val any) QueryOption {
 	return func(o *QueryOptions) {
 		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s <= $%d", column, len(o.Args))
+		clause := fmt.Sprintf("%s <= %s", column, getPlaceholder(len(o.Args)))
 		if o.Where != "" {
 			o.Where += " AND " + clause
 		} else {
@@ -288,35 +333,28 @@ func Lte(column string, val any) QueryOption {
 	}
 }
 
-func Having(having string, args ...any) QueryOption {
-	return func(o *QueryOptions) {
-		if o.Having != "" {
-			o.Having += " AND " + having
-		} else {
-			o.Having = having
-		}
-		o.Args = append(o.Args, args...)
-	}
-}
-
+// Order resultset by the specified column/columns (conditions).
 func OrderBy(orderBy string) QueryOption {
 	return func(o *QueryOptions) {
 		o.OrderBy = orderBy
 	}
 }
 
+// Group by the specified column/columns (conditions).
 func GroupBy(groupBy string) QueryOption {
 	return func(o *QueryOptions) {
 		o.GroupBy = groupBy
 	}
 }
 
+// Set pagination limit. Use together with Offsset to control pagination.
 func Limit(limit int) QueryOption {
 	return func(o *QueryOptions) {
 		o.Limit = limit
 	}
 }
 
+// Set pagination offset. Must be set together with limit.
 func Offset(offset int) QueryOption {
 	return func(o *QueryOptions) {
 		o.Offset = offset
