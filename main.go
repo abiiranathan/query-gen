@@ -231,6 +231,11 @@ type Model struct {
 	TableChecks    []checkInfo      // Struct-level CHECK constraints not scoped to a single column.
 }
 
+// HasPK reports whether the model has at least one primary key defined.
+func (m Model) HasPK() bool {
+	return len(m.PK) > 0
+}
+
 // HasDeletedAt reports whether the model contains a DeletedAt soft-delete field.
 func (m Model) HasDeletedAt() bool {
 	return m.DeletedAtField() != nil
@@ -284,8 +289,6 @@ func toLowerCamel(s string) string {
 	}
 	return string(runes)
 }
-
-// --- Composite PK Helper Methods ---
 
 // FirstPK returns the first primary key field (or nil).
 func (m Model) FirstPK() *Field {
@@ -557,9 +560,15 @@ func (m Model) AllRelationJoins(parentPrefix string) string {
 		var joinCond string
 		switch rel.Type {
 		case RelHasMany:
+			if m.FirstPK() == nil {
+				continue
+			}
 			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
 				target.Table, alias, alias, rel.ForeignKey, parentPrefix, m.FirstPK().Column)
 		case RelBelongsTo:
+			if target.FirstPK() == nil {
+				continue
+			}
 			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
 				target.Table, alias, alias, target.FirstPK().Column, parentPrefix, rel.ForeignKey)
 		}
@@ -617,6 +626,7 @@ func main() {
 	outPkg := flag.String("pkg", "queries", "Package name for generated code")
 	schemaOut := flag.String("schema", "", "If set, path to write a generated SQL schema file (e.g. ./schema.sql)")
 	dbType := flag.String("dbtype", "postgres", "Target database dialect for -schema: postgres or sqlite3")
+	verbose := flag.Bool("verbose", false, "Verbose loggin")
 	flag.Parse()
 
 	parsedModels, fullPkgPath, err := parsePackage(*inputPkg)
@@ -639,9 +649,6 @@ func main() {
 			if m.Fields[i].IsPK {
 				m.PK = append(m.PK, &m.Fields[i])
 			}
-		}
-		if len(m.PK) == 0 {
-			log.Fatalf("query-gen: model %q has no primary key field; models without a primary key are prohibited", name)
 		}
 		modelMap[name] = m
 	}
@@ -673,8 +680,10 @@ func main() {
 	pkgAlias := filepath.Base(fullPkgPath)
 
 	for _, model := range parsedModels {
-		if len(model.PK) == 0 {
-			log.Fatalf("query-gen: model %q has no primary key field; models without a primary key are prohibited", model.Name)
+		if *verbose {
+			if !model.HasPK() {
+				log.Printf("query-gen: model %q has no primary key; generating read-only view queries\n", model.Name)
+			}
 		}
 
 		model.Package = *outPkg
@@ -908,10 +917,6 @@ func parsePackage(pattern string) ([]Model, string, error) {
 					}
 				}
 
-				if len(model.PK) == 0 {
-					log.Fatalf("query-gen: model %q has no primary key field; models without a primary key are prohibited", model.Name)
-				}
-
 				result = append(result, model)
 				return true
 			})
@@ -1143,91 +1148,50 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 	return rel, true
 }
 
-// parseFieldTags parses a struct field's name, type, and raw tag string into a
-// Field description, interpreting `gorm:"..."` tag syntax per GORM's tag
-// specification (https://gorm.io/docs/models.html#Fields-Tags).
-//
-// fieldName is the Go struct field's identifier (e.g. "UserID"), fieldType is
-// its textual Go type (e.g. "*string"), and rawTag is the field's full raw
-// struct tag string (e.g. `gorm:"column:user_id;not null"`), as obtained from
-// reflect.StructField.Tag.
-//
-// The returned Field has sensible defaults derived from fieldName and
-// fieldType even when rawTag contains no "gorm" key, or is empty.
 func parseFieldTags(fieldName, fieldType, rawTag string) Field {
-	// Seed the result with defaults inferred purely from the field's Go-level
-	// name and type, before any tag parsing occurs. These are overridden below
-	// as relevant gorm tag options are discovered.
 	f := Field{
 		Name:       fieldName,
 		Type:       fieldType,
-		Column:     toSnakeCase(fieldName),             // default column name, e.g. "UserID" -> "user_id"
-		IsPK:       strings.EqualFold(fieldName, "ID"), // GORM convention: a field literally named "ID" (any case) is the primary key
-		Permission: PermReadWrite,                      // fields are read/write unless a tag says otherwise
+		Column:     toSnakeCase(fieldName),
+		IsPK:       strings.EqualFold(fieldName, "ID"),
+		Permission: PermReadWrite,
 	}
 
-	// A Go pointer type (e.g. "*string") signals a nullable column by GORM
-	// convention, independent of any explicit "null"/"not null" tag.
 	f.Nullable = strings.HasPrefix(fieldType, "*")
 
-	// No struct tag at all: nothing further to parse, return the type-derived defaults.
 	if rawTag == "" {
 		return f
 	}
 
-	// Wrap the raw tag string in reflect.StructTag so we can extract just the
-	// "gorm" key's value (GORM tags are namespaced under gorm:"...").
 	structTag := reflect.StructTag(rawTag)
 	gormTag := structTag.Get("gorm")
 	if gormTag == "" {
-		// The field has other tags (e.g. json:"...") but no gorm tag; nothing
-		// GORM-specific to apply.
 		return f
 	}
 
-	// --- First pass: column name only -----------------------------------
-	// GORM tag options are semicolon-separated. This first pass scans only
-	// for "column:" so that f.Column is resolved before anything else,
-	// independent of where "column:" appears relative to other options.
-	// It stops at the first match via break, so only the first "column:"
-	// segment found takes effect if there are (invalidly) multiple.
 	for part := range strings.SplitSeq(gormTag, ";") {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(strings.ToLower(part), "column:") {
-			// NOTE: uses the original-case `part`, not `lower`, so the actual
-			// column name preserves the case the user wrote after "column:".
 			f.Column = part[len("column:"):]
 			break
 		}
 	}
 
-	// Local accumulators for read/create/update permission bits, combined
-	// into f.Permission after the main loop. All default to true (readable
-	// and writable) and are narrowed by "->" / "<-" style tags below.
 	canRead := true
 	canCreate := true
 	canUpdate := true
-	// Track whether a "->" (read) or "<-" (write) style tag was seen at all,
-	// distinguishing "explicitly set to true" from "never mentioned".
 	hasReadTag := false
 	hasWriteTag := false
 
-	// --- Second pass: every other option ---------------------------------
 	for part := range strings.SplitSeq(gormTag, ";") {
 		part = strings.TrimSpace(part)
 		lower := strings.ToLower(part)
 
 		switch {
-		// "-" ignores the field entirely (read, write, and migration); "-:all"
-		// is the explicit long form of the same thing. Either way, return
-		// immediately: no other tag option can matter once the field is ignored.
 		case part == "-" || lower == "-:all":
 			f.IsIgnore = true
 			return f
 
-		// "-:migration" excludes the field from auto-migration only; it still
-		// participates in normal read/write. No field on Field models this
-		// distinction here, so the case is present but intentionally a no-op.
 		case lower == "-:migration":
 
 		case lower == "primarykey" || lower == "primary_key":
@@ -1239,12 +1203,9 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case lower == "index":
 			f.HasIndex = true
 
-		// "index:name" — a named index. Checked after the bare "index" case;
-		// since lower == "index" won't match this HasPrefix branch (no colon),
-		// order between the two doesn't actually matter here.
 		case strings.HasPrefix(lower, "index:"):
 			f.HasIndex = true
-			f.IndexName = part[len("index:"):] // preserves original case of the name
+			f.IndexName = part[len("index:"):]
 
 		case lower == "uniqueindex" || lower == "unique_index":
 			f.HasUniqueIndex = true
@@ -1253,9 +1214,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			f.HasUniqueIndex = true
 			f.UniqueIndexName = part[len("uniqueindex:"):]
 
-		// GORM accepts both "uniqueIndex:" and "unique_index:" spellings for a
-		// named unique index; handled as two separate prefix cases since the
-		// prefix lengths differ.
 		case strings.HasPrefix(lower, "unique_index:"):
 			f.HasUniqueIndex = true
 			f.UniqueIndexName = part[len("unique_index:"):]
@@ -1267,16 +1225,11 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case strings.HasPrefix(lower, "type:"):
 			f.RawSQLType = part[len("type:"):]
 
-		// "datatype:" is an alternate/legacy spelling for an explicit SQL
-		// type. Only applied if "type:" hasn't already set RawSQLType, so
-		// "type:" takes priority when both are present.
 		case strings.HasPrefix(lower, "datatype:"):
 			if f.RawSQLType == "" {
 				f.RawSQLType = part[len("datatype:"):]
 			}
 
-		// "size:N" — malformed/non-numeric values are silently ignored
-		// (err != nil skips the assignment) rather than causing a parse failure.
 		case strings.HasPrefix(lower, "size:"):
 			if n, err := strconv.Atoi(part[len("size:"):]); err == nil {
 				f.Size = n
@@ -1313,9 +1266,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		case lower == "null":
 			f.Nullable = true
 
-		// "->" family: read permission tags. Bare "->", "->:true", "->:rw",
-		// and "->:r" are all treated as "readable" (GORM's finer-grained
-		// distinctions between these forms aren't modeled separately here).
 		case lower == "->" || lower == "->:true" || lower == "->:rw" || lower == "->:r":
 			canRead = true
 			hasReadTag = true
@@ -1324,8 +1274,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 			canRead = false
 			hasReadTag = true
 
-		// "<-" family: write permission tags. Bare "<-" and "<-:true" both
-		// mean fully writable (create + update).
 		case lower == "<-" || lower == "<-:true" || lower == "<-:rw":
 			canCreate = true
 			canUpdate = true
@@ -1348,25 +1296,11 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		}
 	}
 
-	// If a read-permission tag was given but no write-permission tag was
-	// given, and the field is still marked readable, GORM's semantics treat
-	// this as "read-only unless writability is separately declared" — so
-	// creation/update are turned off. Without this adjustment, a bare "->"
-	// tag (meaning "readable") would otherwise leave canCreate/canUpdate at
-	// their true defaults and incorrectly produce PermReadWrite.
 	if hasReadTag && !hasWriteTag && canRead {
 		canCreate = false
 		canUpdate = false
 	}
 
-	// Collapse the three canRead/canCreate/canUpdate booleans into the
-	// Field's single Permission value. The first five cases cover the
-	// "clean" combinations with dedicated named constants; anything else
-	// (i.e. the remaining three of the eight possible boolean combinations,
-	// including "all false") falls through to the default branch, which
-	// OR-bits together whichever of PermReadOnly/PermCreateOnly/PermUpdateOnly
-	// apply. Note this presumes Permission is a bitmask type where those
-	// single-capability constants can be safely combined with |.
 	switch {
 	case canRead && canCreate && canUpdate:
 		f.Permission = PermReadWrite
@@ -1392,7 +1326,6 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 		f.Permission = perm
 	}
 
-	// Primary keys are never nullable.
 	if f.IsPK {
 		f.Nullable = false
 	}
@@ -1930,28 +1863,25 @@ func applyQueryOptions(defaultPK string, deletedAtCol string, opts ...QueryOptio
 		sb.WriteString(cfg.Having)
 	}
 
-	// ORDER BY, LIMIT, and OFFSET only apply to row-fetching queries (when defaultPK != ""),
-	// avoiding invalid ORDER BY clauses in aggregate COUNT(*) queries.
-	if defaultPK != "" {
-		if cfg.OrderBy != "" {
-			sb.WriteString(" ORDER BY ")
-			sb.WriteString(cfg.OrderBy)
-		} else {
-			sb.WriteString(" ORDER BY ")
-			sb.WriteString(defaultPK)
-			sb.WriteString(" ASC")
-		}
-
-		if cfg.Limit > 0 {
-			args = append(args, cfg.Limit)
-			fmt.Fprintf(&sb, " LIMIT $%d", len(args))
-		}
-
-		if cfg.Offset > 0 {
-			args = append(args, cfg.Offset)
-			fmt.Fprintf(&sb, " OFFSET $%d", len(args))
-		}
+	if cfg.OrderBy != "" {
+		sb.WriteString(" ORDER BY ")
+		sb.WriteString(cfg.OrderBy)
+	} else if defaultPK != "" {
+		sb.WriteString(" ORDER BY ")
+		sb.WriteString(defaultPK)
+		sb.WriteString(" ASC")
 	}
+
+	if cfg.Limit > 0 {
+		args = append(args, cfg.Limit)
+		fmt.Fprintf(&sb, " LIMIT $%d", len(args))
+	}
+
+	if cfg.Offset > 0 {
+		args = append(args, cfg.Offset)
+		fmt.Fprintf(&sb, " OFFSET $%d", len(args))
+	}
+
 	return sb.String(), args, cfg
 }
 
@@ -2369,6 +2299,7 @@ import (
 	"{{.ModelPkg}}"
 )
 
+{{if .HasPK -}}
 // Insert{{.Name}} inserts a new {{.Name}} record into the {{.Table}} table.
 func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}) error {
 	if db == nil {
@@ -2512,7 +2443,6 @@ func insert{{.NamePlural}}Batch(ctx context.Context, db DBTX, batch []*{{.ModelP
 	{{end -}}
 }
 
-
 // Get{{.Name}}ByID retrieves a single {{.Name}} record from {{.Table}} by its primary key.
 func Get{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	if db == nil {
@@ -2555,6 +2485,7 @@ func Get{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}
 
 	return &m, nil
 }
+{{end -}}
 
 // Get{{.Name}} retrieves a single {{.Name}} record matching mandatory query options/where clause.
 // Returns sql.ErrNoRows if no matching record is found.
@@ -2581,6 +2512,7 @@ func Get{{.Name}}(ctx context.Context, db DBTX, opts ...QueryOption) (*{{.ModelP
 	return items[0], nil
 }
 
+{{if .HasPK -}}
 // Update{{.Name}}Columns updates only the specified updatable columns/fields for an existing {{.Name}} record in {{.Table}}.
 // Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
 func Update{{.Name}}Columns(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}, cols ...string) error {
@@ -2648,7 +2580,6 @@ func Update{{.Name}}Columns(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.
 	return nil
 }
 
-
 // Exists{{.Name}}ByID reports whether a {{.Name}} record with the given primary key exists.
 func Exists{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (bool, error) {
 	if db == nil {
@@ -2673,6 +2604,7 @@ func Exists{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlia
 	}
 	return exists, nil
 }
+{{end -}}
 
 // Exists{{.Name}} reports whether a {{.Name}} record matching the mandatory query options/where clause exists.
 func Exists{{.Name}}(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
@@ -2746,7 +2678,7 @@ func FetchAll{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) 
 	if db == nil {
 		return nil, errors.New("fetchAll{{.NamePlural}}: db is nil")
 	}
-	{{- if .Relations}}
+	{{- if and .Relations .HasPK}}
 
 	clause, args, cfg := applyQueryOptions("{{.PKColumns ""}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	if cfg.PreloadAssociations {
@@ -2754,7 +2686,7 @@ func FetchAll{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) 
 	}
 	{{- else}}
 
-	clause, args, _ := applyQueryOptions("{{.PKColumns ""}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
+	clause, args, _ := applyQueryOptions({{if .HasPK}}"{{.PKColumns ""}}"{{else}}""{{end}}, {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	{{- end}}
 
 	query := "SELECT {{.AllColumns ""}} FROM {{.Table}}" + clause
@@ -2781,6 +2713,7 @@ func FetchAll{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) 
 	return items, nil
 }
 
+{{if .HasPK -}}
 // Update{{.Name}} updates an existing {{.Name}} record in {{.Table}}.
 func Update{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}) error {
 	if db == nil {
@@ -2894,9 +2827,10 @@ func Delete{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) (i
 
 	return n, nil
 }
+{{end -}}
 
 // ================= FETCHING RELATIONS ===============================
-{{- if .Relations}}
+{{- if and .Relations .HasPK}}
 {{- if .UseJoinStrategy}}
 func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
 	{{- if .HasDeletedAt}}

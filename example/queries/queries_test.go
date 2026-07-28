@@ -155,6 +155,16 @@ func setupTestDB(tb testing.TB) *sql.DB {
 		project_id BIGINT NOT NULL REFERENCES projects(id),
 		title TEXT NOT NULL
 	);
+
+	-- Create the SQL view selecting specific fields from the main 'users' table
+	CREATE OR REPLACE VIEW user_summary_views AS
+	SELECT
+		id AS user_id,
+		name,
+		email,
+		created_at AS registered_at
+	FROM users
+	WHERE deleted_at IS NULL;
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -1454,6 +1464,99 @@ func TestExistsUser(t *testing.T) {
 		)
 		if err != nil || !existsWithDeleted {
 			t.Errorf("ExistsUser with IncludeDeleted should return true, got (%v, %v)", existsWithDeleted, err)
+		}
+	})
+}
+
+func TestViewMethods(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	// Seed underlying users table (which automatically populates user_summary_views)
+	seedUsers := []*models.User{
+		{Name: "View User 1", Email: "view1@example.com"},
+		{Name: "View User 2", Email: "view2@example.com"},
+		{Name: "View User 3", Email: "view3@example.com"},
+	}
+	for _, u := range seedUsers {
+		if err := queries.InsertUser(ctx, db, u); err != nil {
+			t.Fatalf("failed to insert seed user for view test: %v", err)
+		}
+	}
+
+	t.Run("FetchAllUserSummaryViews", func(t *testing.T) {
+		views, err := queries.FetchAllUserSummaryViews(ctx, db,
+			queries.ILIKE("name", "view user"),
+			queries.OrderBy("user_id ASC"),
+		)
+		if err != nil {
+			t.Fatalf("FetchAllUserSummaryViews failed: %v", err)
+		}
+		if len(views) != 3 {
+			t.Fatalf("got %d view rows, want 3", len(views))
+		}
+		if views[0].Name != "View User 1" || views[0].Email != "view1@example.com" {
+			t.Errorf("unexpected view row content: %+v", views[0])
+		}
+	})
+
+	t.Run("GetUserSummaryView", func(t *testing.T) {
+		view, err := queries.GetUserSummaryView(ctx, db, queries.Where("email = $1", "view2@example.com"))
+		if err != nil {
+			t.Fatalf("GetUserSummaryView failed: %v", err)
+		}
+		if view.Name != "View User 2" {
+			t.Errorf("got name %q, want 'View User 2'", view.Name)
+		}
+	})
+
+	t.Run("CountUserSummaryViews", func(t *testing.T) {
+		count, err := queries.CountUserSummaryViews(ctx, db, queries.ILIKE("email", "view"))
+		if err != nil {
+			t.Fatalf("CountUserSummaryViews failed: %v", err)
+		}
+		if count != 3 {
+			t.Errorf("got count %d, want 3", count)
+		}
+	})
+
+	t.Run("ExistsUserSummaryView", func(t *testing.T) {
+		exists, err := queries.ExistsUserSummaryView(ctx, db, queries.Where("email = $1", "view1@example.com"))
+		if err != nil || !exists {
+			t.Errorf("ExistsUserSummaryView returned (%v, %v), want (true, nil)", exists, err)
+		}
+
+		notExists, err := queries.ExistsUserSummaryView(ctx, db, queries.Where("email = $1", "ghost@example.com"))
+		if err != nil || notExists {
+			t.Errorf("ExistsUserSummaryView returned (%v, %v), want (false, nil)", notExists, err)
+		}
+	})
+
+	t.Run("Paginate UserSummaryViews", func(t *testing.T) {
+		res, err := queries.Paginate(
+			ctx,
+			db,
+			queries.CountUserSummaryViews,
+			queries.FetchAllUserSummaryViews,
+			1, // page
+			2, // pageSize
+			queries.OrderBy("user_id ASC"),
+		)
+		if err != nil {
+			t.Fatalf("Paginate on view failed: %v", err)
+		}
+
+		if res.Count != 3 {
+			t.Errorf("got Count = %d, want 3", res.Count)
+		}
+		if res.TotalPages != 2 {
+			t.Errorf("got TotalPages = %d, want 2", res.TotalPages)
+		}
+		if len(res.Results) != 2 {
+			t.Fatalf("got %d page results, want 2", len(res.Results))
+		}
+		if res.Results[0].Name != "View User 1" {
+			t.Errorf("expected first item 'View User 1', got %q", res.Results[0].Name)
 		}
 	})
 }

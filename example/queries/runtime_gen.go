@@ -489,28 +489,25 @@ func applyQueryOptions(defaultPK string, deletedAtCol string, opts ...QueryOptio
 		sb.WriteString(cfg.Having)
 	}
 
-	// ORDER BY, LIMIT, and OFFSET only apply to row-fetching queries (when defaultPK != ""),
-	// avoiding invalid ORDER BY clauses in aggregate COUNT(*) queries.
-	if defaultPK != "" {
-		if cfg.OrderBy != "" {
-			sb.WriteString(" ORDER BY ")
-			sb.WriteString(cfg.OrderBy)
-		} else {
-			sb.WriteString(" ORDER BY ")
-			sb.WriteString(defaultPK)
-			sb.WriteString(" ASC")
-		}
-
-		if cfg.Limit > 0 {
-			args = append(args, cfg.Limit)
-			fmt.Fprintf(&sb, " LIMIT $%d", len(args))
-		}
-
-		if cfg.Offset > 0 {
-			args = append(args, cfg.Offset)
-			fmt.Fprintf(&sb, " OFFSET $%d", len(args))
-		}
+	if cfg.OrderBy != "" {
+		sb.WriteString(" ORDER BY ")
+		sb.WriteString(cfg.OrderBy)
+	} else if defaultPK != "" {
+		sb.WriteString(" ORDER BY ")
+		sb.WriteString(defaultPK)
+		sb.WriteString(" ASC")
 	}
+
+	if cfg.Limit > 0 {
+		args = append(args, cfg.Limit)
+		fmt.Fprintf(&sb, " LIMIT $%d", len(args))
+	}
+
+	if cfg.Offset > 0 {
+		args = append(args, cfg.Offset)
+		fmt.Fprintf(&sb, " OFFSET $%d", len(args))
+	}
+
 	return sb.String(), args, cfg
 }
 
