@@ -626,10 +626,10 @@ func main() {
 	outPkg := flag.String("pkg", "queries", "Package name for generated code")
 	schemaOut := flag.String("schema", "", "If set, path to write a generated SQL schema file (e.g. ./schema.sql)")
 	dbType := flag.String("dbtype", "postgres", "Target database dialect for -schema: postgres or sqlite3")
-	verbose := flag.Bool("verbose", false, "Verbose loggin")
+	defaultNullable := flag.Bool("nullable", false, "All fields without explicit \"not null\" tag are considered NULL")
 	flag.Parse()
 
-	parsedModels, fullPkgPath, err := parsePackage(*inputPkg)
+	parsedModels, fullPkgPath, err := parsePackage(*inputPkg, *defaultNullable)
 	if err != nil {
 		log.Fatalf("query-gen: parsing package %q: %v", *inputPkg, err)
 	}
@@ -680,12 +680,6 @@ func main() {
 	pkgAlias := filepath.Base(fullPkgPath)
 
 	for _, model := range parsedModels {
-		if *verbose {
-			if !model.HasPK() {
-				log.Printf("query-gen: model %q has no primary key; generating read-only view queries\n", model.Name)
-			}
-		}
-
 		model.Package = *outPkg
 		model.ModelPkg = fullPkgPath
 		model.ModelPkgAlias = pkgAlias
@@ -804,7 +798,7 @@ func bareTypeName(s string) string {
 	return s
 }
 
-func parsePackage(pattern string) ([]Model, string, error) {
+func parsePackage(pattern string, defaultNullable bool) ([]Model, string, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -872,7 +866,7 @@ func parsePackage(pattern string) ([]Model, string, error) {
 					}
 
 					fieldType := types.ExprString(field.Type)
-					parsedField := parseFieldTags(fieldName, fieldType, rawTag)
+					parsedField := parseFieldTags(fieldName, fieldType, rawTag, defaultNullable)
 
 					if parsedField.IsIgnore {
 						continue
@@ -1148,13 +1142,14 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 	return rel, true
 }
 
-func parseFieldTags(fieldName, fieldType, rawTag string) Field {
+func parseFieldTags(fieldName, fieldType, rawTag string, defaultNullable bool) Field {
 	f := Field{
 		Name:       fieldName,
 		Type:       fieldType,
 		Column:     toSnakeCase(fieldName),
 		IsPK:       strings.EqualFold(fieldName, "ID"),
-		Permission: PermReadWrite,
+		Permission: PermReadWrite,   // rw for field by default
+		Nullable:   defaultNullable, // Nullable by default (unless PK or not null specified)
 	}
 
 	f.Nullable = strings.HasPrefix(fieldType, "*")
@@ -1260,7 +1255,7 @@ func parseFieldTags(fieldName, fieldType, rawTag string) Field {
 				f.CheckConstraint = strings.TrimSpace(raw)
 			}
 
-		case lower == "not null" || lower == "notnull":
+		case lower == "not null":
 			f.Nullable = false
 
 		case lower == "null":

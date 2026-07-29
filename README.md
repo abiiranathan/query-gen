@@ -416,13 +416,14 @@ type PaginationResult[T any] struct {
 
 ## 🛠️ Command-Line Flags
 
-| Flag      | Default             | Description                                                                     |
-| :-------- | :------------------ | :------------------------------------------------------------------------------ |
-| `-input`  | `./example/models`  | Path to the Go package directory containing source models.                      |
-| `-out`    | `./example/queries` | Destination directory where generated Go files will be written.                 |
-| `-pkg`    | `queries`           | Package name declaration for the generated query code.                          |
-| `-schema` | `""`                | Optional path to output a generated SQL schema DDL file (e.g., `./schema.sql`). |
-| `-dbtype` | `postgres`          | Target database dialect for `-schema`: `postgres` or `sqlite3`.                 |
+| Flag        | Default             | Description                                                                     |
+| :---------- | :------------------ | :------------------------------------------------------------------------------ |
+| `-input`    | `./example/models`  | Path to the Go package directory containing source models.                      |
+| `-out`      | `./example/queries` | Destination directory where generated Go files will be written.                 |
+| `-pkg`      | `queries`           | Package name declaration for the generated query code.                          |
+| `-schema`   | `""`                | Optional path to output a generated SQL schema DDL file (e.g., `./schema.sql`). |
+| `-dbtype`   | `postgres`          | Target database dialect for `-schema`: `postgres` or `sqlite3`.                 |
+| `-nullable` | `false`             | When true, all fields MUST specify `gorm:"not null"` to be considered NOT NULL  |
 
 ---
 
@@ -430,7 +431,7 @@ type PaginationResult[T any] struct {
 - `gorm:"primaryKey"` or `gorm:"primary_key"` — Marks field as primary key (supports composite primary keys).
 - `gorm:"column:custom_name"` — Overrides default snake_case database column name.
 - `gorm:"default:value"` — Defines default values (zero-values are omitted during single `INSERT`).
-- `gorm:"not null"` or `gorm:"notnull"` — Marks field as non-nullable.
+- `gorm:"not null"` — Marks field as non-nullable.
 - `gorm:"null"` — Marks field as nullable.
 - `gorm:"-"` — Excludes field completely from query generation.
 - `gorm:"->"` — Read-only field (omitted from INSERT and UPDATE statements).
