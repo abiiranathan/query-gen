@@ -282,7 +282,12 @@ func ExistsTag(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) 
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM tags" + whereClause + ")"
+	tableName := "tags"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -304,7 +309,12 @@ func CountTags(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error)
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT COUNT(*) FROM tags" + whereClause
+	tableName := "tags"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -319,9 +329,14 @@ func FetchAllTags(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models.
 		return nil, errors.New("fetchAllTags: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("id", "", opts...)
+	clause, args, cfg := applyQueryOptions("id", "", opts...)
 
-	query := "SELECT id, project_id, name FROM tags" + clause
+	tableName := "tags"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT id, project_id, name FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -409,10 +424,15 @@ func DeleteTags(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 		return 0, errors.New("deleteTags: query options/where clause required to prevent accidental bulk deletion")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
+	clause, args, cfg := applyQueryOptions("", "", opts...)
+
+	tableName := "tags"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
 
 	var query string
-	query = "DELETE FROM tags" + clause
+	query = "DELETE FROM " + tableName + clause
 
 	res, err := db.ExecContext(ctx, query, args...)
 	if err != nil {

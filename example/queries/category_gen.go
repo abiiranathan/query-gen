@@ -282,7 +282,12 @@ func ExistsCategory(ctx context.Context, db DBTX, opts ...QueryOption) (bool, er
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM categories" + whereClause + ")"
+	tableName := "categories"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -304,7 +309,12 @@ func CountCategories(ctx context.Context, db DBTX, opts ...QueryOption) (int64, 
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT COUNT(*) FROM categories" + whereClause
+	tableName := "categories"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -319,9 +329,14 @@ func FetchAllCategories(ctx context.Context, db DBTX, opts ...QueryOption) ([]*m
 		return nil, errors.New("fetchAllCategories: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("id", "", opts...)
+	clause, args, cfg := applyQueryOptions("id", "", opts...)
 
-	query := "SELECT id, project_id, name FROM categories" + clause
+	tableName := "categories"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT id, project_id, name FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -409,10 +424,15 @@ func DeleteCategories(ctx context.Context, db DBTX, opts ...QueryOption) (int64,
 		return 0, errors.New("deleteCategories: query options/where clause required to prevent accidental bulk deletion")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
+	clause, args, cfg := applyQueryOptions("", "", opts...)
+
+	tableName := "categories"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
 
 	var query string
-	query = "DELETE FROM categories" + clause
+	query = "DELETE FROM " + tableName + clause
 
 	res, err := db.ExecContext(ctx, query, args...)
 	if err != nil {

@@ -1416,6 +1416,7 @@ func batchIn[T, K any](ctx context.Context, db DBTX, ids []K, fetch func(ctx con
 // QueryOptions provides optional filtering, ordering, grouping, having, pagination,
 // association preloading, and soft-delete controls for queries.
 type QueryOptions struct {
+	Table string           // Dynamic table name passed at runtime.
 	Where               string
 	Args                []any
 	Having              string
@@ -1491,6 +1492,15 @@ func Having(having string, args ...any) QueryOption {
 		} else {
 			o.Having = having
 		}
+	}
+}
+
+
+// Table overrides the default table name for the query.
+// Useful is you have multiple views that can be scanned with the same struct.
+func Table(name string) QueryOption {
+	return func(o *QueryOptions) {
+		o.Table = name
 	}
 }
 
@@ -2665,7 +2675,12 @@ func Exists{{.Name}}(ctx context.Context, db DBTX, opts ...QueryOption) (bool, e
 	}
 	{{- end}}
 
-	query := "SELECT EXISTS(SELECT 1 FROM {{.Table}}" + whereClause + ")"
+	tableName := "{{.Table}}"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -2697,7 +2712,12 @@ func Count{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) (in
 	}
 	{{- end}}
 
-	query := "SELECT COUNT(*) FROM {{.Table}}" + whereClause
+	tableName := "{{.Table}}"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -2719,10 +2739,15 @@ func FetchAll{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) 
 	}
 	{{- else}}
 
-	clause, args, _ := applyQueryOptions({{if .HasPK}}"{{.PKColumns ""}}"{{else}}""{{end}}, {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
+	clause, args, cfg := applyQueryOptions({{if .HasPK}}"{{.PKColumns ""}}"{{else}}""{{end}}, {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
 	{{- end}}
 
-	query := "SELECT {{.AllColumns ""}} FROM {{.Table}}" + clause
+	tableName := "{{.Table}}"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT {{.AllColumns ""}} FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -2834,18 +2859,23 @@ func Delete{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) (i
 	clause, args, cfg := applyQueryOptions("", "{{.DeletedAtField.Column}}", opts...)
 	{{- else}}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
+	clause, args, cfg := applyQueryOptions("", "", opts...)
 	{{- end}}
+
+	tableName := "{{.Table}}"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
 
 	var query string
 	{{- if .HasDeletedAt}}
 	if !cfg.HardDelete {
-		query = "UPDATE {{.Table}} SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP" + clause
+		query = "UPDATE " + tableName + " SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP" + clause
 	} else {
-		query = "DELETE FROM {{.Table}}" + clause
+		query = "DELETE FROM " + tableName + clause
 	}
 	{{- else}}
-	query = "DELETE FROM {{.Table}}" + clause
+	query = "DELETE FROM " + tableName + clause
 	{{- end}}
 
 	res, err := db.ExecContext(ctx, query, args...)

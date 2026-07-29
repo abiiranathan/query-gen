@@ -51,7 +51,12 @@ func ExistsUserSummaryView(ctx context.Context, db DBTX, opts ...QueryOption) (b
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM user_summary_views" + whereClause + ")"
+	tableName := "user_summary_views"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -73,7 +78,12 @@ func CountUserSummaryViews(ctx context.Context, db DBTX, opts ...QueryOption) (i
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT COUNT(*) FROM user_summary_views" + whereClause
+	tableName := "user_summary_views"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -88,9 +98,14 @@ func FetchAllUserSummaryViews(ctx context.Context, db DBTX, opts ...QueryOption)
 		return nil, errors.New("fetchAllUserSummaryViews: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
+	clause, args, cfg := applyQueryOptions("", "", opts...)
 
-	query := "SELECT user_id, name, email, registered_at FROM user_summary_views" + clause
+	tableName := "user_summary_views"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT user_id, name, email, registered_at FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {

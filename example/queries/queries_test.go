@@ -1612,3 +1612,32 @@ func TestQuestionMarkPlaceholders(t *testing.T) {
 		}
 	})
 }
+
+func TestTableOverride(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	u := &models.User{Name: "Table Override User", Email: "override@test.com"}
+	if err := queries.InsertUser(ctx, db, u); err != nil {
+		t.Fatalf("InsertUser failed: %v", err)
+	}
+
+	// 1. Test querying users using an explicit Table override pointing to the table name
+	users, err := queries.FetchAllUsers(ctx, db,
+		queries.Table("users"),
+		queries.Where("email = $1", "override@test.com"),
+	)
+	if err != nil {
+		t.Fatalf("FetchAllUsers with Table override failed: %v", err)
+	}
+	if len(users) != 1 || users[0].Name != "Table Override User" {
+		t.Errorf("unexpected result with Table override: %+v", users)
+	}
+
+	// 2. Test that overriding to a non-existent table correctly returns a database error
+	// (proving the generated SQL actually executed against the overridden table name)
+	_, err = queries.FetchAllUsers(ctx, db, queries.Table("nonexistent_table_xyz"))
+	if err == nil {
+		t.Errorf("expected database error when querying non-existent table via Table override, got nil")
+	}
+}

@@ -282,7 +282,12 @@ func ExistsTask(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error)
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM tasks" + whereClause + ")"
+	tableName := "tasks"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -304,7 +309,12 @@ func CountTasks(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT COUNT(*) FROM tasks" + whereClause
+	tableName := "tasks"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -319,9 +329,14 @@ func FetchAllTasks(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 		return nil, errors.New("fetchAllTasks: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("id", "", opts...)
+	clause, args, cfg := applyQueryOptions("id", "", opts...)
 
-	query := "SELECT id, project_id, title FROM tasks" + clause
+	tableName := "tasks"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT id, project_id, title FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -409,10 +424,15 @@ func DeleteTasks(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 		return 0, errors.New("deleteTasks: query options/where clause required to prevent accidental bulk deletion")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
+	clause, args, cfg := applyQueryOptions("", "", opts...)
+
+	tableName := "tasks"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
 
 	var query string
-	query = "DELETE FROM tasks" + clause
+	query = "DELETE FROM " + tableName + clause
 
 	res, err := db.ExecContext(ctx, query, args...)
 	if err != nil {

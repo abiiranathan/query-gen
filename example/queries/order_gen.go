@@ -288,7 +288,12 @@ func ExistsOrder(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM orders" + whereClause + ")"
+	tableName := "orders"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -310,7 +315,12 @@ func CountOrders(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT COUNT(*) FROM orders" + whereClause
+	tableName := "orders"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -330,7 +340,12 @@ func FetchAllOrders(ctx context.Context, db DBTX, opts ...QueryOption) ([]*model
 		return fetchAllOrdersWithRelations(ctx, db, clause, args, cfg)
 	}
 
-	query := "SELECT order_id, user_id, amount FROM orders" + clause
+	tableName := "orders"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT order_id, user_id, amount FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -418,10 +433,15 @@ func DeleteOrders(ctx context.Context, db DBTX, opts ...QueryOption) (int64, err
 		return 0, errors.New("deleteOrders: query options/where clause required to prevent accidental bulk deletion")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
+	clause, args, cfg := applyQueryOptions("", "", opts...)
+
+	tableName := "orders"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
 
 	var query string
-	query = "DELETE FROM orders" + clause
+	query = "DELETE FROM " + tableName + clause
 
 	res, err := db.ExecContext(ctx, query, args...)
 	if err != nil {

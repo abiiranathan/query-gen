@@ -284,7 +284,12 @@ func ExistsUserRole(ctx context.Context, db DBTX, opts ...QueryOption) (bool, er
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM user_roles" + whereClause + ")"
+	tableName := "user_roles"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -306,7 +311,12 @@ func CountUserRoles(ctx context.Context, db DBTX, opts ...QueryOption) (int64, e
 		whereClause = " WHERE " + cfg.Where
 	}
 
-	query := "SELECT COUNT(*) FROM user_roles" + whereClause
+	tableName := "user_roles"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -321,9 +331,14 @@ func FetchAllUserRoles(ctx context.Context, db DBTX, opts ...QueryOption) ([]*mo
 		return nil, errors.New("fetchAllUserRoles: db is nil")
 	}
 
-	clause, args, _ := applyQueryOptions("user_id, role_id", "", opts...)
+	clause, args, cfg := applyQueryOptions("user_id, role_id", "", opts...)
 
-	query := "SELECT user_id, role_id, assigned_at FROM user_roles" + clause
+	tableName := "user_roles"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT user_id, role_id, assigned_at FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -411,10 +426,15 @@ func DeleteUserRoles(ctx context.Context, db DBTX, opts ...QueryOption) (int64, 
 		return 0, errors.New("deleteUserRoles: query options/where clause required to prevent accidental bulk deletion")
 	}
 
-	clause, args, _ := applyQueryOptions("", "", opts...)
+	clause, args, cfg := applyQueryOptions("", "", opts...)
+
+	tableName := "user_roles"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
 
 	var query string
-	query = "DELETE FROM user_roles" + clause
+	query = "DELETE FROM " + tableName + clause
 
 	res, err := db.ExecContext(ctx, query, args...)
 	if err != nil {

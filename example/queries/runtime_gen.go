@@ -47,6 +47,7 @@ func batchIn[T, K any](ctx context.Context, db DBTX, ids []K, fetch func(ctx con
 // QueryOptions provides optional filtering, ordering, grouping, having, pagination,
 // association preloading, and soft-delete controls for queries.
 type QueryOptions struct {
+	Table               string // Dynamic table name passed at runtime.
 	Where               string
 	Args                []any
 	Having              string
@@ -122,6 +123,14 @@ func Having(having string, args ...any) QueryOption {
 		} else {
 			o.Having = having
 		}
+	}
+}
+
+// Table overrides the default table name for the query.
+// Useful is you have multiple views that can be scanned with the same struct.
+func Table(name string) QueryOption {
+	return func(o *QueryOptions) {
+		o.Table = name
 	}
 }
 

@@ -313,7 +313,12 @@ func ExistsProject(ctx context.Context, db DBTX, opts ...QueryOption) (bool, err
 		}
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM projects" + whereClause + ")"
+	tableName := "projects"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -343,7 +348,12 @@ func CountProjects(ctx context.Context, db DBTX, opts ...QueryOption) (int64, er
 		}
 	}
 
-	query := "SELECT COUNT(*) FROM projects" + whereClause
+	tableName := "projects"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -363,7 +373,12 @@ func FetchAllProjects(ctx context.Context, db DBTX, opts ...QueryOption) ([]*mod
 		return fetchAllProjectsWithRelations(ctx, db, clause, args, cfg)
 	}
 
-	query := "SELECT id, name, description, created_at, deleted_at FROM projects" + clause
+	tableName := "projects"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT id, name, description, created_at, deleted_at FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -470,11 +485,16 @@ func DeleteProjects(ctx context.Context, db DBTX, opts ...QueryOption) (int64, e
 
 	clause, args, cfg := applyQueryOptions("", "deleted_at", opts...)
 
+	tableName := "projects"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
 	var query string
 	if !cfg.HardDelete {
-		query = "UPDATE projects SET deleted_at = CURRENT_TIMESTAMP" + clause
+		query = "UPDATE " + tableName + " SET deleted_at = CURRENT_TIMESTAMP" + clause
 	} else {
-		query = "DELETE FROM projects" + clause
+		query = "DELETE FROM " + tableName + clause
 	}
 
 	res, err := db.ExecContext(ctx, query, args...)

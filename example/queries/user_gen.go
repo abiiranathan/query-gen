@@ -331,7 +331,12 @@ func ExistsUser(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error)
 		}
 	}
 
-	query := "SELECT EXISTS(SELECT 1 FROM users" + whereClause + ")"
+	tableName := "users"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
@@ -361,7 +366,12 @@ func CountUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 		}
 	}
 
-	query := "SELECT COUNT(*) FROM users" + whereClause
+	tableName := "users"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT COUNT(*) FROM " + tableName + whereClause
 
 	var count int64
 	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
@@ -381,7 +391,12 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 		return fetchAllUsersWithRelations(ctx, db, clause, args, cfg)
 	}
 
-	query := "SELECT id, name, email, created_at, deleted_at, age, permissions FROM users" + clause
+	tableName := "users"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
+	query := "SELECT id, name, email, created_at, deleted_at, age, permissions FROM " + tableName + clause
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -488,11 +503,16 @@ func DeleteUsers(ctx context.Context, db DBTX, opts ...QueryOption) (int64, erro
 
 	clause, args, cfg := applyQueryOptions("", "deleted_at", opts...)
 
+	tableName := "users"
+	if cfg.Table != "" {
+		tableName = cfg.Table
+	}
+
 	var query string
 	if !cfg.HardDelete {
-		query = "UPDATE users SET deleted_at = CURRENT_TIMESTAMP" + clause
+		query = "UPDATE " + tableName + " SET deleted_at = CURRENT_TIMESTAMP" + clause
 	} else {
-		query = "DELETE FROM users" + clause
+		query = "DELETE FROM " + tableName + clause
 	}
 
 	res, err := db.ExecContext(ctx, query, args...)
