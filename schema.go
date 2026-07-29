@@ -178,6 +178,15 @@ func (m Model) isCompositePK() bool {
 	return len(m.pkColumns()) > 1
 }
 
+// uniquenessLabel renders a human-readable description of an index's
+// uniqueness for use in collision error messages.
+func uniquenessLabel(unique bool) string {
+	if unique {
+		return "UNIQUE"
+	}
+	return "non-unique"
+}
+
 // GenerateSchema renders CREATE TABLE, CHECK, and CREATE INDEX SQL statements for a single model.
 func (m Model) GenerateSchema(dialect SchemaDialect) string {
 	var sb strings.Builder
@@ -319,12 +328,34 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 
 	getOrCreateIndex := func(name string, unique bool) *indexInfo {
 		if idx, ok := indices[name]; ok {
+			if idx.Unique != unique {
+				log.Fatalf("query-gen: model %q has conflicting index %q: previously declared %s, now requested %s",
+					m.Name, name, uniquenessLabel(idx.Unique), uniquenessLabel(unique))
+			}
 			return idx
 		}
 		idx := &indexInfo{Name: name, Unique: unique, Columns: make([]string, 0, 2)}
 		indices[name] = idx
 		indexOrder = append(indexOrder, name)
 		return idx
+	}
+
+	// columnHasLeadingIndex reports whether column is already served by some
+	// existing index as its leading (first) column. A B-tree index on
+	// (a, b, ...) can satisfy lookups on "a" alone via its leftmost prefix,
+	// but cannot efficiently satisfy lookups on any non-leading column, so
+	// only leading-column coverage makes a single-column index on that
+	// column redundant. Checked by column identity rather than by the
+	// auto-generated index name, so it correctly recognizes coverage from
+	// composite indexes (e.g. a uniqueIndex spanning multiple fields) that
+	// happen to have been given a different name.
+	columnHasLeadingIndex := func(column string) bool {
+		for _, idx := range indices {
+			if len(idx.Columns) > 0 && idx.Columns[0] == column {
+				return true
+			}
+		}
+		return false
 	}
 
 	for _, f := range m.Fields {
@@ -346,11 +377,15 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 		}
 	}
 
-	// Automatically index DeletedAt column for soft-delete support if not explicitly indexed.
+	// Automatically index DeletedAt column for soft-delete support if not
+	// already covered as the leading column of some other index (explicit
+	// or composite) — an explicitly-named index on this column, or a
+	// composite index that happens to lead with it, already serves
+	// single-column lookups just as well as a dedicated index would.
 	if m.HasDeletedAt() {
 		deletedAtCol := m.DeletedAtField().Column
-		deletedAtIdxName := fmt.Sprintf("idx_%s_%s", m.Table, deletedAtCol)
-		if _, exists := indices[deletedAtIdxName]; !exists {
+		if !columnHasLeadingIndex(deletedAtCol) {
+			deletedAtIdxName := fmt.Sprintf("idx_%s_%s", m.Table, deletedAtCol)
 			idx := getOrCreateIndex(deletedAtIdxName, false)
 			idx.Columns = append(idx.Columns, deletedAtCol)
 		}
@@ -358,13 +393,18 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 
 	// Index every BelongsTo foreign key column not already covered, since
 	// these are the columns joined on during preload and left unindexed
-	// they silently degrade preload queries to sequential scans.
+	// they silently degrade preload queries to sequential scans. Coverage
+	// is checked by column identity (columnHasLeadingIndex), not by the
+	// auto-generated index name, so a foreign key that is already the
+	// leading column of a composite index — e.g. a uniqueIndex("user_id,
+	// hospital_id") covering UserID — is correctly recognized as already
+	// indexed and is not given a redundant single-column index alongside it.
 	for _, rel := range m.Relations {
 		if rel.Type != RelBelongsTo {
 			continue
 		}
-		fkIdxName := fmt.Sprintf("idx_%s_%s", m.Table, rel.ForeignKey)
-		if _, exists := indices[fkIdxName]; !exists {
+		if !columnHasLeadingIndex(rel.ForeignKey) {
+			fkIdxName := fmt.Sprintf("idx_%s_%s", m.Table, rel.ForeignKey)
 			idx := getOrCreateIndex(fkIdxName, false)
 			idx.Columns = append(idx.Columns, rel.ForeignKey)
 		}
