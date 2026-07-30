@@ -147,6 +147,12 @@ func GetCategoryByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption
 		return nil, errors.New("getCategoryByID: db is nil")
 	}
 
+	cfg := parseQueryOptions(opts...)
+
+	if cfg.PreloadAssociations {
+		return getCategoryByIDWithRelations(ctx, db, id, cfg)
+	}
+
 	const query = `
 		SELECT id, project_id, name
 		FROM categories
@@ -330,6 +336,9 @@ func FetchAllCategories(ctx context.Context, db DBTX, opts ...QueryOption) ([]*m
 	}
 
 	clause, args, cfg := applyQueryOptions("id", "", opts...)
+	if cfg.PreloadAssociations {
+		return fetchAllCategoriesWithRelations(ctx, db, clause, args, cfg)
+	}
 
 	tableName := "categories"
 	if cfg.Table != "" {
@@ -448,3 +457,126 @@ func DeleteCategories(ctx context.Context, db DBTX, opts ...QueryOption) (int64,
 }
 
 // ================= FETCHING RELATIONS ===============================
+func getCategoryByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Category, error) {
+	const query = `
+		SELECT 
+			p.id, p.project_id, p.name, r0.id, r0.name, r0.description, r0.created_at, r0.deleted_at
+		FROM categories p
+		LEFT JOIN projects r0 ON r0.id = p.project_id AND r0.deleted_at IS NULL
+		WHERE p.id = $1
+	`
+
+	rows, err := db.QueryContext(ctx, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("getCategoryByIDWithRelations(%v): %w", id, err)
+	}
+	defer rows.Close()
+
+	var parent *models.Category
+	var p models.Category
+
+	seen_Project := make(map[int64]struct{}, 4)
+	var c0 models.Project
+	scanArgs := []any{
+		&p.ID, &p.ProjectID, &p.Name,
+		scanNullable(&c0.ID),
+		scanNullable(&c0.Name),
+		scanNullable(&c0.Description),
+		scanNullable(&c0.CreatedAt),
+		scanNullable(&c0.DeletedAt),
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("getCategoryByIDWithRelations(%v): scanning row: %w", id, err)
+		}
+
+		if parent == nil {
+			parent = &p
+		}
+
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
+			if _, ok := seen_Project[rPk0]; !ok {
+				seen_Project[rPk0] = struct{}{}
+				child := c0
+				parent.Project = &child
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("getCategoryByIDWithRelations(%v): iterating rows: %w", id, err)
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("getCategoryByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+	}
+
+	return parent, nil
+}
+
+func fetchAllCategoriesWithRelations(ctx context.Context, db DBTX, clause string, args []any, cfg QueryOptions) ([]*models.Category, error) {
+	query := `
+		WITH p AS (
+			SELECT p.id, p.project_id, p.name
+			FROM categories p
+	` + clause + `
+		)
+		SELECT 
+			p.id, p.project_id, p.name, r0.id, r0.name, r0.description, r0.created_at, r0.deleted_at
+		FROM p
+		LEFT JOIN projects r0 ON r0.id = p.project_id AND r0.deleted_at IS NULL
+		ORDER BY p.id ASC
+	`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAllCategoriesWithRelations: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]*models.Category, 0, 16)
+	itemsMap := make(map[int64]*models.Category, 16)
+
+	seen_Project := make(map[seenKey[int64, int64]]struct{}, 64)
+	for rows.Next() {
+		var p models.Category
+		var c0 models.Project
+		scanArgs := []any{
+			&p.ID, &p.ProjectID, &p.Name,
+			scanNullable(&c0.ID),
+			scanNullable(&c0.Name),
+			scanNullable(&c0.Description),
+			scanNullable(&c0.CreatedAt),
+			scanNullable(&c0.DeletedAt),
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("fetchAllCategoriesWithRelations: scanning row: %w", err)
+		}
+
+		pPK := p.ID
+		parent, exists := itemsMap[pPK]
+		if !exists {
+			parent = &p
+			itemsMap[pPK] = parent
+			items = append(items, parent)
+		}
+
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
+			key0 := seenKey[int64, int64]{parent: pPK, child: rPk0}
+			if _, ok := seen_Project[key0]; !ok {
+				seen_Project[key0] = struct{}{}
+				child := c0
+				parent.Project = &child
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetchAllCategoriesWithRelations: iterating rows: %w", err)
+	}
+
+	return items, nil
+}

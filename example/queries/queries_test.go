@@ -12,80 +12,8 @@ import (
 	"github.com/abiiranathan/query-gen/example/queries"
 	"github.com/abiiranathan/query-gen/perms"
 
-	// _ "github.com/mattn/go-sqlite3"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
-
-// // setupTestDB creates an in-memory SQLite database matching the updated example schema.
-// func setupTestDB(tb testing.TB) *sql.DB {
-// 	tb.Helper()
-
-// 	db, err := sql.Open("sqlite3", "file::memory:?mode=memory&cache=shared")
-// 	if err != nil {
-// 		tb.Fatalf("failed to open in-memory sqlite3 db: %v", err)
-// 	}
-// 	if err != nil {
-// 		tb.Fatalf("failed to open in-memory sqlite db: %v", err)
-// 	}
-
-// 	schema := `
-// 	CREATE TABLE IF NOT EXISTS users (
-// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-// 		name TEXT NOT NULL,
-// 		email TEXT,
-// 		created_at DATE DEFAULT CURRENT_DATE,
-// 		deleted_at DATETIME,
-// 		age VARCHAR(20) NOT NULL,
-//      permissions INT
-// 	);
-
-// 	CREATE TABLE IF NOT EXISTS orders (
-// 		order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-// 		user_id INTEGER NOT NULL,
-// 		amount REAL NOT NULL,
-// 		FOREIGN KEY (user_id) REFERENCES users(id)
-// 	);
-
-// 	CREATE TABLE IF NOT EXISTS projects (
-// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-// 		name TEXT NOT NULL,
-// 		description TEXT,
-// 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-// 		deleted_at DATETIME
-// 	);
-
-// 	CREATE TABLE IF NOT EXISTS tags (
-// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-// 		project_id INTEGER NOT NULL,
-// 		name TEXT NOT NULL,
-// 		FOREIGN KEY (project_id) REFERENCES projects(id)
-// 	);
-
-// 	CREATE TABLE IF NOT EXISTS categories (
-// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-// 		project_id INTEGER NOT NULL,
-// 		name TEXT NOT NULL,
-// 		FOREIGN KEY (project_id) REFERENCES projects(id)
-// 	);
-
-// 	CREATE TABLE IF NOT EXISTS tasks (
-// 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-// 		project_id INTEGER NOT NULL,
-// 		title TEXT NOT NULL,
-// 		FOREIGN KEY (project_id) REFERENCES projects(id)
-// 	);
-// 	`
-
-// 	if _, err := db.Exec(schema); err != nil {
-// 		tb.Fatalf("failed to execute test schema: %v", err)
-// 	}
-
-// 	tb.Cleanup(func() {
-// 		_ = db.Close()
-// 	})
-
-// 	return db
-// }
 
 // setupPostgresDB connects to a local PostgreSQL instance using pgx stdlib driver.
 // Skips automatically if the PostgreSQL database is not reachable.

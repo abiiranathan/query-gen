@@ -147,6 +147,12 @@ func GetTagByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*m
 		return nil, errors.New("getTagByID: db is nil")
 	}
 
+	cfg := parseQueryOptions(opts...)
+
+	if cfg.PreloadAssociations {
+		return getTagByIDWithRelations(ctx, db, id, cfg)
+	}
+
 	const query = `
 		SELECT id, project_id, name
 		FROM tags
@@ -330,6 +336,9 @@ func FetchAllTags(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models.
 	}
 
 	clause, args, cfg := applyQueryOptions("id", "", opts...)
+	if cfg.PreloadAssociations {
+		return fetchAllTagsWithRelations(ctx, db, clause, args, cfg)
+	}
 
 	tableName := "tags"
 	if cfg.Table != "" {
@@ -448,3 +457,126 @@ func DeleteTags(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error
 }
 
 // ================= FETCHING RELATIONS ===============================
+func getTagByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryOptions) (*models.Tag, error) {
+	const query = `
+		SELECT 
+			p.id, p.project_id, p.name, r0.id, r0.name, r0.description, r0.created_at, r0.deleted_at
+		FROM tags p
+		LEFT JOIN projects r0 ON r0.id = p.project_id AND r0.deleted_at IS NULL
+		WHERE p.id = $1
+	`
+
+	rows, err := db.QueryContext(ctx, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("getTagByIDWithRelations(%v): %w", id, err)
+	}
+	defer rows.Close()
+
+	var parent *models.Tag
+	var p models.Tag
+
+	seen_Project := make(map[int64]struct{}, 4)
+	var c0 models.Project
+	scanArgs := []any{
+		&p.ID, &p.ProjectID, &p.Name,
+		scanNullable(&c0.ID),
+		scanNullable(&c0.Name),
+		scanNullable(&c0.Description),
+		scanNullable(&c0.CreatedAt),
+		scanNullable(&c0.DeletedAt),
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("getTagByIDWithRelations(%v): scanning row: %w", id, err)
+		}
+
+		if parent == nil {
+			parent = &p
+		}
+
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
+			if _, ok := seen_Project[rPk0]; !ok {
+				seen_Project[rPk0] = struct{}{}
+				child := c0
+				parent.Project = &child
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("getTagByIDWithRelations(%v): iterating rows: %w", id, err)
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("getTagByIDWithRelations(%v): %w", id, sql.ErrNoRows)
+	}
+
+	return parent, nil
+}
+
+func fetchAllTagsWithRelations(ctx context.Context, db DBTX, clause string, args []any, cfg QueryOptions) ([]*models.Tag, error) {
+	query := `
+		WITH p AS (
+			SELECT p.id, p.project_id, p.name
+			FROM tags p
+	` + clause + `
+		)
+		SELECT 
+			p.id, p.project_id, p.name, r0.id, r0.name, r0.description, r0.created_at, r0.deleted_at
+		FROM p
+		LEFT JOIN projects r0 ON r0.id = p.project_id AND r0.deleted_at IS NULL
+		ORDER BY p.id ASC
+	`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAllTagsWithRelations: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]*models.Tag, 0, 16)
+	itemsMap := make(map[int64]*models.Tag, 16)
+
+	seen_Project := make(map[seenKey[int64, int64]]struct{}, 64)
+	for rows.Next() {
+		var p models.Tag
+		var c0 models.Project
+		scanArgs := []any{
+			&p.ID, &p.ProjectID, &p.Name,
+			scanNullable(&c0.ID),
+			scanNullable(&c0.Name),
+			scanNullable(&c0.Description),
+			scanNullable(&c0.CreatedAt),
+			scanNullable(&c0.DeletedAt),
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("fetchAllTagsWithRelations: scanning row: %w", err)
+		}
+
+		pPK := p.ID
+		parent, exists := itemsMap[pPK]
+		if !exists {
+			parent = &p
+			itemsMap[pPK] = parent
+			items = append(items, parent)
+		}
+
+		if !(IsZero(c0.ID)) {
+			rPk0 := c0.ID
+			key0 := seenKey[int64, int64]{parent: pPK, child: rPk0}
+			if _, ok := seen_Project[key0]; !ok {
+				seen_Project[key0] = struct{}{}
+				child := c0
+				parent.Project = &child
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetchAllTagsWithRelations: iterating rows: %w", err)
+	}
+
+	return items, nil
+}

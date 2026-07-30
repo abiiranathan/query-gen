@@ -25,23 +25,26 @@ type User struct {
 
 // Tag represents a label attached to a Project.
 type Tag struct {
-	ID        int64  `gorm:"primaryKey"`
-	ProjectID int64  `gorm:"not null;column:project_id"`
-	Name      string `gorm:"not null"`
+	ID        int64    `gorm:"primaryKey"`
+	ProjectID int64    `gorm:"not null;column:project_id"`
+	Name      string   `gorm:"not null"`
+	Project   *Project `gorm:"foreignKey:ProjectID;constraint:OnDelete:CASCADE,OnUpdate:CASCADE;"`
 }
 
 // Category represents a classification group for a Project.
 type Category struct {
-	ID        int64  `gorm:"primaryKey"`
-	ProjectID int64  `gorm:"not null;column:project_id"`
-	Name      string `gorm:"not null"`
+	ID        int64    `gorm:"primaryKey"`
+	ProjectID int64    `gorm:"not null;column:project_id"`
+	Name      string   `gorm:"not null"`
+	Project   *Project `gorm:"foreignKey:ProjectID;constraint:OnDelete:CASCADE,OnUpdate:CASCADE;"`
 }
 
 // Task represents a work item associated with a Project.
 type Task struct {
-	ID        int64  `gorm:"primaryKey"`
-	ProjectID int64  `gorm:"not null;column:project_id"`
-	Title     string `gorm:"not null"`
+	ID        int64    `gorm:"primaryKey"`
+	ProjectID int64    `gorm:"not null;column:project_id"`
+	Title     string   `gorm:"not null"`
+	Project   *Project `gorm:"foreignKey:ProjectID;constraint:OnDelete:CASCADE,OnUpdate:CASCADE;"`
 }
 
 // Project represents a workspace entity containing multiple associated collections.
