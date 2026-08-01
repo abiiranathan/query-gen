@@ -55,7 +55,7 @@ func InsertUser(ctx context.Context, db DBTX, m *models.User) error {
 	}
 
 	if err := db.QueryRowContext(ctx, query, args...).
-		Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
+		Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 		return fmt.Errorf("insertUser: %w", err)
 	}
 	return nil
@@ -139,7 +139,7 @@ func insertUsersBatch(ctx context.Context, db DBTX, batch []*models.User) error 
 			return errors.New("unexpected extra row returned from insert")
 		}
 		m := batch[idx]
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 			return fmt.Errorf("scanning row %d: %w", idx, err)
 		}
 		idx++
@@ -179,7 +179,7 @@ func GetUserByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) (*
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m models.User
-	if err := row.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
+	if err := row.Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 		return nil, fmt.Errorf("getUserByID(%v): %w", id, err)
 	}
 
@@ -407,7 +407,7 @@ func FetchAllUsers(ctx context.Context, db DBTX, opts ...QueryOption) ([]*models
 	items := make([]*models.User, 0, 16)
 	for rows.Next() {
 		var m models.User
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt), &m.Age, &m.Permissions); err != nil {
 			return nil, fmt.Errorf("fetchAllUsers: scanning row: %w", err)
 		}
 		items = append(items, &m)
@@ -553,10 +553,10 @@ func getUserByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 	seen_Orders := make(map[int64]struct{}, 4)
 	var c0 models.Order
 	scanArgs := []any{
-		&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age, &p.Permissions,
-		scanNullable(&c0.ID),
-		scanNullable(&c0.UserID),
-		scanNullable(&c0.Amount),
+		&p.ID, &p.Name, &p.Email, ScanNullable(&p.CreatedAt), ScanNullable(&p.DeletedAt), &p.Age, &p.Permissions,
+		ScanNullable(&c0.ID),
+		ScanNullable(&c0.UserID),
+		ScanNullable(&c0.Amount),
 	}
 
 	for rows.Next() {
@@ -616,10 +616,10 @@ func fetchAllUsersWithRelations(ctx context.Context, db DBTX, clause string, arg
 		var p models.User
 		var c0 models.Order
 		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt), &p.Age, &p.Permissions,
-			scanNullable(&c0.ID),
-			scanNullable(&c0.UserID),
-			scanNullable(&c0.Amount),
+			&p.ID, &p.Name, &p.Email, ScanNullable(&p.CreatedAt), ScanNullable(&p.DeletedAt), &p.Age, &p.Permissions,
+			ScanNullable(&c0.ID),
+			ScanNullable(&c0.UserID),
+			ScanNullable(&c0.Amount),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {

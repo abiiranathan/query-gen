@@ -53,7 +53,7 @@ func InsertUserRole(ctx context.Context, db DBTX, m *models.UserRole) error {
 	}
 
 	if err := db.QueryRowContext(ctx, query, args...).
-		Scan(&m.UserID, &m.RoleID, scanNullable(&m.AssignedAt)); err != nil {
+		Scan(&m.UserID, &m.RoleID, ScanNullable(&m.AssignedAt)); err != nil {
 		return fmt.Errorf("insertUserRole: %w", err)
 	}
 	return nil
@@ -129,7 +129,7 @@ func insertUserRolesBatch(ctx context.Context, db DBTX, batch []*models.UserRole
 			return errors.New("unexpected extra row returned from insert")
 		}
 		m := batch[idx]
-		if err := rows.Scan(&m.UserID, &m.RoleID, scanNullable(&m.AssignedAt)); err != nil {
+		if err := rows.Scan(&m.UserID, &m.RoleID, ScanNullable(&m.AssignedAt)); err != nil {
 			return fmt.Errorf("scanning row %d: %w", idx, err)
 		}
 		idx++
@@ -160,7 +160,7 @@ func GetUserRoleByID(ctx context.Context, db DBTX, userID int64, roleID int64, o
 
 	row := db.QueryRowContext(ctx, query, userID, roleID)
 	var m models.UserRole
-	if err := row.Scan(&m.UserID, &m.RoleID, scanNullable(&m.AssignedAt)); err != nil {
+	if err := row.Scan(&m.UserID, &m.RoleID, ScanNullable(&m.AssignedAt)); err != nil {
 		return nil, fmt.Errorf("getUserRoleByID(%v): %w", fmt.Sprint(userID, roleID), err)
 	}
 
@@ -349,7 +349,7 @@ func FetchAllUserRoles(ctx context.Context, db DBTX, opts ...QueryOption) ([]*mo
 	items := make([]*models.UserRole, 0, 16)
 	for rows.Next() {
 		var m models.UserRole
-		if err := rows.Scan(&m.UserID, &m.RoleID, scanNullable(&m.AssignedAt)); err != nil {
+		if err := rows.Scan(&m.UserID, &m.RoleID, ScanNullable(&m.AssignedAt)); err != nil {
 			return nil, fmt.Errorf("fetchAllUserRoles: scanning row: %w", err)
 		}
 		items = append(items, &m)

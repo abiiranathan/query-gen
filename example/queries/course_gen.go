@@ -53,7 +53,7 @@ func InsertCourse(ctx context.Context, db DBTX, m *models.Course) error {
 	}
 
 	if err := db.QueryRowContext(ctx, query, args...).
-		Scan(&m.ID, &m.Code, &m.Title, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		Scan(&m.ID, &m.Code, &m.Title, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 		return fmt.Errorf("insertCourse: %w", err)
 	}
 	return nil
@@ -129,7 +129,7 @@ func insertCoursesBatch(ctx context.Context, db DBTX, batch []*models.Course) er
 			return errors.New("unexpected extra row returned from insert")
 		}
 		m := batch[idx]
-		if err := rows.Scan(&m.ID, &m.Code, &m.Title, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		if err := rows.Scan(&m.ID, &m.Code, &m.Title, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 			return fmt.Errorf("scanning row %d: %w", idx, err)
 		}
 		idx++
@@ -165,7 +165,7 @@ func GetCourseByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption) 
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m models.Course
-	if err := row.Scan(&m.ID, &m.Code, &m.Title, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+	if err := row.Scan(&m.ID, &m.Code, &m.Title, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 		return nil, fmt.Errorf("getCourseByID(%v): %w", id, err)
 	}
 
@@ -382,7 +382,7 @@ func FetchAllCourses(ctx context.Context, db DBTX, opts ...QueryOption) ([]*mode
 	items := make([]*models.Course, 0, 16)
 	for rows.Next() {
 		var m models.Course
-		if err := rows.Scan(&m.ID, &m.Code, &m.Title, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		if err := rows.Scan(&m.ID, &m.Code, &m.Title, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 			return nil, fmt.Errorf("fetchAllCourses: scanning row: %w", err)
 		}
 		items = append(items, &m)

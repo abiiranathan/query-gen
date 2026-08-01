@@ -53,7 +53,7 @@ func InsertProject(ctx context.Context, db DBTX, m *models.Project) error {
 	}
 
 	if err := db.QueryRowContext(ctx, query, args...).
-		Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		Scan(&m.ID, &m.Name, &m.Description, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 		return fmt.Errorf("insertProject: %w", err)
 	}
 	return nil
@@ -129,7 +129,7 @@ func insertProjectsBatch(ctx context.Context, db DBTX, batch []*models.Project) 
 			return errors.New("unexpected extra row returned from insert")
 		}
 		m := batch[idx]
-		if err := rows.Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Description, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 			return fmt.Errorf("scanning row %d: %w", idx, err)
 		}
 		idx++
@@ -169,7 +169,7 @@ func GetProjectByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption)
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m models.Project
-	if err := row.Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+	if err := row.Scan(&m.ID, &m.Name, &m.Description, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 		return nil, fmt.Errorf("getProjectByID(%v): %w", id, err)
 	}
 
@@ -389,7 +389,7 @@ func FetchAllProjects(ctx context.Context, db DBTX, opts ...QueryOption) ([]*mod
 	items := make([]*models.Project, 0, 16)
 	for rows.Next() {
 		var m models.Project
-		if err := rows.Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Description, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 			return nil, fmt.Errorf("fetchAllProjects: scanning row: %w", err)
 		}
 		items = append(items, &m)
@@ -580,7 +580,7 @@ func fetchAllProjectsWithRelations(ctx context.Context, db DBTX, clause string, 
 	items := make([]*models.Project, 0, 16)
 	for rows.Next() {
 		var m models.Project
-		if err := rows.Scan(&m.ID, &m.Name, &m.Description, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Description, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 			return nil, fmt.Errorf("fetchAllProjectsWithRelations: scanning row: %w", err)
 		}
 		items = append(items, &m)

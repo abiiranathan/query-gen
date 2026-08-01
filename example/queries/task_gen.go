@@ -479,11 +479,11 @@ func getTaskByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg QueryO
 	var c0 models.Project
 	scanArgs := []any{
 		&p.ID, &p.ProjectID, &p.Title,
-		scanNullable(&c0.ID),
-		scanNullable(&c0.Name),
-		scanNullable(&c0.Description),
-		scanNullable(&c0.CreatedAt),
-		scanNullable(&c0.DeletedAt),
+		ScanNullable(&c0.ID),
+		ScanNullable(&c0.Name),
+		ScanNullable(&c0.Description),
+		ScanNullable(&c0.CreatedAt),
+		ScanNullable(&c0.DeletedAt),
 	}
 
 	for rows.Next() {
@@ -544,11 +544,11 @@ func fetchAllTasksWithRelations(ctx context.Context, db DBTX, clause string, arg
 		var c0 models.Project
 		scanArgs := []any{
 			&p.ID, &p.ProjectID, &p.Title,
-			scanNullable(&c0.ID),
-			scanNullable(&c0.Name),
-			scanNullable(&c0.Description),
-			scanNullable(&c0.CreatedAt),
-			scanNullable(&c0.DeletedAt),
+			ScanNullable(&c0.ID),
+			ScanNullable(&c0.Name),
+			ScanNullable(&c0.Description),
+			ScanNullable(&c0.CreatedAt),
+			ScanNullable(&c0.DeletedAt),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {

@@ -53,7 +53,7 @@ func InsertStudent(ctx context.Context, db DBTX, m *models.Student) error {
 	}
 
 	if err := db.QueryRowContext(ctx, query, args...).
-		Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 		return fmt.Errorf("insertStudent: %w", err)
 	}
 	return nil
@@ -129,7 +129,7 @@ func insertStudentsBatch(ctx context.Context, db DBTX, batch []*models.Student) 
 			return errors.New("unexpected extra row returned from insert")
 		}
 		m := batch[idx]
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 			return fmt.Errorf("scanning row %d: %w", idx, err)
 		}
 		idx++
@@ -169,7 +169,7 @@ func GetStudentByID(ctx context.Context, db DBTX, id int64, opts ...QueryOption)
 
 	row := db.QueryRowContext(ctx, query, id)
 	var m models.Student
-	if err := row.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+	if err := row.Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 		return nil, fmt.Errorf("getStudentByID(%v): %w", id, err)
 	}
 
@@ -389,7 +389,7 @@ func FetchAllStudents(ctx context.Context, db DBTX, opts ...QueryOption) ([]*mod
 	items := make([]*models.Student, 0, 16)
 	for rows.Next() {
 		var m models.Student
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email, scanNullable(&m.CreatedAt), scanNullable(&m.DeletedAt)); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, ScanNullable(&m.CreatedAt), ScanNullable(&m.DeletedAt)); err != nil {
 			return nil, fmt.Errorf("fetchAllStudents: scanning row: %w", err)
 		}
 		items = append(items, &m)
@@ -536,12 +536,12 @@ func getStudentByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Que
 	seen_Courses := make(map[int64]struct{}, 4)
 	var c0 models.Course
 	scanArgs := []any{
-		&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt),
-		scanNullable(&c0.ID),
-		scanNullable(&c0.Code),
-		scanNullable(&c0.Title),
-		scanNullable(&c0.CreatedAt),
-		scanNullable(&c0.DeletedAt),
+		&p.ID, &p.Name, &p.Email, ScanNullable(&p.CreatedAt), ScanNullable(&p.DeletedAt),
+		ScanNullable(&c0.ID),
+		ScanNullable(&c0.Code),
+		ScanNullable(&c0.Title),
+		ScanNullable(&c0.CreatedAt),
+		ScanNullable(&c0.DeletedAt),
 	}
 
 	for rows.Next() {
@@ -602,12 +602,12 @@ func fetchAllStudentsWithRelations(ctx context.Context, db DBTX, clause string, 
 		var p models.Student
 		var c0 models.Course
 		scanArgs := []any{
-			&p.ID, &p.Name, &p.Email, scanNullable(&p.CreatedAt), scanNullable(&p.DeletedAt),
-			scanNullable(&c0.ID),
-			scanNullable(&c0.Code),
-			scanNullable(&c0.Title),
-			scanNullable(&c0.CreatedAt),
-			scanNullable(&c0.DeletedAt),
+			&p.ID, &p.Name, &p.Email, ScanNullable(&p.CreatedAt), ScanNullable(&p.DeletedAt),
+			ScanNullable(&c0.ID),
+			ScanNullable(&c0.Code),
+			ScanNullable(&c0.Title),
+			ScanNullable(&c0.CreatedAt),
+			ScanNullable(&c0.DeletedAt),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {

@@ -479,13 +479,13 @@ func getOrderByIDWithRelations(ctx context.Context, db DBTX, id int64, cfg Query
 	var c0 models.User
 	scanArgs := []any{
 		&p.ID, &p.UserID, &p.Amount,
-		scanNullable(&c0.ID),
-		scanNullable(&c0.Name),
-		scanNullable(&c0.Email),
-		scanNullable(&c0.CreatedAt),
-		scanNullable(&c0.DeletedAt),
-		scanNullable(&c0.Age),
-		scanNullable(&c0.Permissions),
+		ScanNullable(&c0.ID),
+		ScanNullable(&c0.Name),
+		ScanNullable(&c0.Email),
+		ScanNullable(&c0.CreatedAt),
+		ScanNullable(&c0.DeletedAt),
+		ScanNullable(&c0.Age),
+		ScanNullable(&c0.Permissions),
 	}
 
 	for rows.Next() {
@@ -546,13 +546,13 @@ func fetchAllOrdersWithRelations(ctx context.Context, db DBTX, clause string, ar
 		var c0 models.User
 		scanArgs := []any{
 			&p.ID, &p.UserID, &p.Amount,
-			scanNullable(&c0.ID),
-			scanNullable(&c0.Name),
-			scanNullable(&c0.Email),
-			scanNullable(&c0.CreatedAt),
-			scanNullable(&c0.DeletedAt),
-			scanNullable(&c0.Age),
-			scanNullable(&c0.Permissions),
+			ScanNullable(&c0.ID),
+			ScanNullable(&c0.Name),
+			ScanNullable(&c0.Email),
+			ScanNullable(&c0.CreatedAt),
+			ScanNullable(&c0.DeletedAt),
+			ScanNullable(&c0.Age),
+			ScanNullable(&c0.Permissions),
 		}
 
 		if err := rows.Scan(scanArgs...); err != nil {

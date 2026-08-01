@@ -116,7 +116,7 @@ func FetchAllUserSummaryViews(ctx context.Context, db DBTX, opts ...QueryOption)
 	items := make([]*models.UserSummaryView, 0, 16)
 	for rows.Next() {
 		var m models.UserSummaryView
-		if err := rows.Scan(&m.UserID, &m.Name, &m.Email, scanNullable(&m.RegisteredAt)); err != nil {
+		if err := rows.Scan(&m.UserID, &m.Name, &m.Email, ScanNullable(&m.RegisteredAt)); err != nil {
 			return nil, fmt.Errorf("fetchAllUserSummaryViews: scanning row: %w", err)
 		}
 		items = append(items, &m)

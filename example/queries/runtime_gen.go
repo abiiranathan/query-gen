@@ -652,11 +652,11 @@ func (n nullableScanner[T]) Scan(src any) error {
 		// Passes the inner *string to convertAssign
 		return convertAssign(vDst.Interface(), src)
 	}
-	return fmt.Errorf("scanNullable: cannot scan %T into %T", src, n.dst)
+	return fmt.Errorf("ScanNullable: cannot scan %T into %T", src, n.dst)
 }
 
-// scanNullable returns a value implementing sql.Scanner for dst.
-func scanNullable[T any](dst *T) nullableScanner[T] {
+// ScanNullable returns a value implementing sql.Scanner for dst.
+func ScanNullable[T any](dst *T) nullableScanner[T] {
 	return nullableScanner[T]{dst: dst}
 }
 
@@ -821,7 +821,7 @@ func convertAssign(dst any, src any) error {
 		return nil
 	}
 
-	return fmt.Errorf("scanNullable: cannot convert %T (%v) to %T", src, src, dst)
+	return fmt.Errorf("ScanNullable: cannot convert %T (%v) to %T", src, src, dst)
 }
 
 func toInt64(src any) (int64, bool) {

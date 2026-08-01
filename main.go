@@ -501,7 +501,7 @@ func (m Model) UpdateSetClause() string {
 
 func scanTarget(varName string, f Field) string {
 	if f.IsPointer() || f.Nullable || f.IsTimestamp() {
-		return fmt.Sprintf("scanNullable(&%s.%s)", varName, f.Name)
+		return fmt.Sprintf("ScanNullable(&%s.%s)", varName, f.Name)
 	}
 	return fmt.Sprintf("&%s.%s", varName, f.Name)
 }
@@ -2061,11 +2061,11 @@ func (n nullableScanner[T]) Scan(src any) error {
 		// Passes the inner *string to convertAssign
 		return convertAssign(vDst.Interface(), src)
 	}
-	return fmt.Errorf("scanNullable: cannot scan %T into %T", src, n.dst)
+	return fmt.Errorf("ScanNullable: cannot scan %T into %T", src, n.dst)
 }
 
-// scanNullable returns a value implementing sql.Scanner for dst.
-func scanNullable[T any](dst *T) nullableScanner[T] {
+// ScanNullable returns a value implementing sql.Scanner for dst.
+func ScanNullable[T any](dst *T) nullableScanner[T] {
 	return nullableScanner[T]{dst: dst}
 }
 
@@ -2230,7 +2230,7 @@ func convertAssign(dst any, src any) error {
 		return nil
 	}
 
-	return fmt.Errorf("scanNullable: cannot convert %T (%v) to %T", src, src, dst)
+	return fmt.Errorf("ScanNullable: cannot convert %T (%v) to %T", src, src, dst)
 }
 
 func toInt64(src any) (int64, bool) {
@@ -2976,7 +2976,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .Mo
 		{{range $idx, $rel := .Relations -}}
 		{{$target := index $.AllKnownModels $rel.TargetModel -}}
 		{{range $target.SelectableFields -}}
-		scanNullable(&c{{$idx}}.{{.Name}}),
+		ScanNullable(&c{{$idx}}.{{.Name}}),
 		{{end -}}
 		{{end -}}
 	}
@@ -3065,7 +3065,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 			{{range $idx, $rel := .Relations -}}
 			{{$target := index $.AllKnownModels $rel.TargetModel -}}
 			{{range $target.SelectableFields -}}
-			scanNullable(&c{{$idx}}.{{.Name}}),
+			ScanNullable(&c{{$idx}}.{{.Name}}),
 			{{end -}}
 			{{end -}}
 		}
@@ -3388,7 +3388,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 			for rows.Next() {
 				var pID {{$.FirstPK.QualifiedType $.ModelPkgAlias}}
 				var child {{$.ModelPkgAlias}}.{{$target.Name}}
-				scanArgs := append([]any{scanNullable(&pID)}, {{$target.AllScanArgs "child"}})
+				scanArgs := append([]any{ScanNullable(&pID)}, {{$target.AllScanArgs "child"}})
 				if err := rows.Scan(scanArgs...); err != nil {
 					return nil, err
 				}
