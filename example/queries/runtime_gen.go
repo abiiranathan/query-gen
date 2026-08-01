@@ -462,7 +462,7 @@ func MonthRange(column string, start, end string) QueryOption {
 }
 
 // YearRange is the same as date range but truncates the date to year.
-// e.g YearRange("DATE(created_at)", "2021-01-01", "2024-12-31")
+// e.g YearRange("DATE(created_at)", "2020-01-01", "2024-12-31")
 // It does nothing if start or end is empty.
 func YearRange(column string, start, end string) QueryOption {
 	return func(o *QueryOptions) {

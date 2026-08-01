@@ -31,6 +31,9 @@ const (
 	// RelBelongsTo marks a many-to-one (or one-to-one) relationship, backed
 	// by a pointer or bare struct field.
 	RelBelongsTo RelationType = "BelongsTo"
+
+	// RelManyToMany marks a many-to-many relationship backed by a join table.
+	RelManyToMany RelationType = "ManyToMany"
 )
 
 // Permission describes the read/write visibility of a field, derived from
@@ -55,17 +58,20 @@ const (
 	PermUpdateOnly
 )
 
-// Relation describes a HasMany or BelongsTo association discovered on a
+// Relation describes a HasMany, BelongsTo, or ManyToMany association discovered on a
 // model, used to execute association preloading when requested.
 type Relation struct {
-	FieldName   string       // Struct field name on the parent, e.g. "User" or "Orders".
-	TargetModel string       // Related model type name, e.g. "User" or "Order".
-	Type        RelationType // Cardinality type: HasMany or BelongsTo.
-	ForeignKey  string       // Column name storing the reference ID.
-	References  string       // Column name being referenced.
-	IsPointer   bool         // True if the field is a pointer (*User vs User).
-	OnDelete    string       // Referential action from gorm constraint tag, e.g. "CASCADE", "SET NULL". Empty means database default.
-	OnUpdate    string       // Referential action from gorm constraint tag, e.g. "CASCADE", "RESTRICT". Empty means database default.
+	FieldName      string       // Struct field name on the parent, e.g. "User" or "Orders".
+	TargetModel    string       // Related model type name, e.g. "User" or "Order".
+	Type           RelationType // Cardinality type: HasMany, BelongsTo, or ManyToMany.
+	ForeignKey     string       // Column name storing the reference ID.
+	References     string       // Column name being referenced.
+	IsPointer      bool         // True if the field is a pointer (*User vs User).
+	OnDelete       string       // Referential action from gorm constraint tag, e.g. "CASCADE", "SET NULL". Empty means database default.
+	OnUpdate       string       // Referential action from gorm constraint tag, e.g. "CASCADE", "RESTRICT". Empty means database default.
+	JoinTable      string       // Pivot table name from gorm:"many2many:<table>".
+	JoinForeignKey string       // Column in the join table referencing the parent model.
+	JoinReferences string       // Column in the join table referencing the target model.
 }
 
 // Field describes a single scalar struct field mapped to a database column,
@@ -216,7 +222,7 @@ func (f Field) QualifiedBaseType(pkgAlias string) string {
 
 // Model describes a parsed Go struct and everything needed to render its
 // generated CRUD query file: table name, columns, primary key, and any
-// HasMany/BelongsTo relations to other known models.
+// HasMany/BelongsTo/ManyToMany relations to other known models.
 type Model struct {
 	Package        string           // Generated package name, e.g. "queries".
 	ModelPkg       string           // Full import path of the source models package.
@@ -226,7 +232,7 @@ type Model struct {
 	Table          string           // Database table name, e.g. "users".
 	Fields         []Field          // List of scalar database fields.
 	PK             []*Field         // Primary key field references (supports single & composite primary keys).
-	Relations      []Relation       // Discovered HasMany and BelongsTo relations.
+	Relations      []Relation       // Discovered HasMany, BelongsTo, and ManyToMany relations.
 	AllKnownModels map[string]Model // All models in the parsed package, keyed by type name.
 	TableChecks    []checkInfo      // Struct-level CHECK constraints not scoped to a single column.
 }
@@ -571,6 +577,14 @@ func (m Model) AllRelationJoins(parentPrefix string) string {
 			}
 			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s",
 				target.Table, alias, alias, target.FirstPK().Column, parentPrefix, rel.ForeignKey)
+		case RelManyToMany:
+			if m.FirstPK() == nil || target.FirstPK() == nil {
+				continue
+			}
+			pivotAlias := fmt.Sprintf("j%d", i)
+			joinCond = fmt.Sprintf("LEFT JOIN %s %s ON %s.%s = %s.%s\n\t\tLEFT JOIN %s %s ON %s.%s = %s.%s",
+				rel.JoinTable, pivotAlias, pivotAlias, rel.JoinForeignKey, parentPrefix, m.FirstPK().Column,
+				target.Table, alias, alias, target.FirstPK().Column, pivotAlias, rel.JoinReferences)
 		}
 
 		if target.HasDeletedAt() {
@@ -604,10 +618,21 @@ func (m Model) BelongsToRelations() []Relation {
 	return out
 }
 
+// ManyToManyRelations returns the subset of m.Relations with cardinality ManyToMany.
+func (m Model) ManyToManyRelations() []Relation {
+	out := make([]Relation, 0, len(m.Relations))
+	for _, r := range m.Relations {
+		if r.Type == RelManyToMany {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // UseJoinStrategy reports whether relation preloading should be generated as
 // a single LEFT JOIN query.
 func (m Model) UseJoinStrategy() bool {
-	return len(m.HasManyRelations()) <= 1
+	return len(m.HasManyRelations())+len(m.ManyToManyRelations()) <= 1
 }
 
 // JoinRelations returns the relations that participate in the LEFT JOIN query.
@@ -1109,6 +1134,13 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 		for part := range strings.SplitSeq(gormTag, ";") {
 			part = strings.TrimSpace(part)
 			switch {
+			case strings.HasPrefix(part, "many2many:"):
+				rel.Type = RelManyToMany
+				rel.JoinTable = strings.TrimPrefix(part, "many2many:")
+			case strings.HasPrefix(part, "joinForeignKey:"):
+				rel.JoinForeignKey = toSnakeCase(strings.TrimPrefix(part, "joinForeignKey:"))
+			case strings.HasPrefix(part, "joinReferences:"):
+				rel.JoinReferences = toSnakeCase(strings.TrimPrefix(part, "joinReferences:"))
 			case strings.HasPrefix(part, "foreignKey:"):
 				rel.ForeignKey = toSnakeCase(strings.TrimPrefix(part, "foreignKey:"))
 			case strings.HasPrefix(part, "references:"):
@@ -1129,6 +1161,13 @@ func detectRelation(field *ast.Field, rawTag string, parentModelName string, typ
 	}
 
 	switch rel.Type {
+	case RelManyToMany:
+		if rel.JoinForeignKey == "" {
+			rel.JoinForeignKey = toSnakeCase(parentModelName) + "_id"
+		}
+		if rel.JoinReferences == "" {
+			rel.JoinReferences = toSnakeCase(rel.TargetModel) + "_id"
+		}
 	case RelHasMany:
 		if rel.ForeignKey == "" {
 			rel.ForeignKey = toSnakeCase(parentModelName) + "_id"
@@ -1832,7 +1871,7 @@ func MonthRange(column string, start, end string) QueryOption {
 }
 
 // YearRange is the same as date range but truncates the date to year.
-// e.g YearRange("DATE(created_at)", "2021-01-01", "2024-12-31")
+// e.g YearRange("DATE(created_at)", "2020-01-01", "2024-12-31")
 // It does nothing if start or end is empty.
 func YearRange(column string, start, end string) QueryOption {
 	return func(o *QueryOptions) {
@@ -2958,7 +2997,7 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .Mo
 			if _, ok := seen_{{$rel.FieldName}}[rPk{{$idx}}]; !ok {
 				seen_{{$rel.FieldName}}[rPk{{$idx}}] = struct{}{}
 				child := c{{$idx}}
-				{{if eq $rel.Type "HasMany" -}}
+				{{if or (eq $rel.Type "HasMany") (eq $rel.Type "ManyToMany") -}}
 				{{if $rel.IsPointer -}}
 				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, &child)
 				{{else -}}
@@ -3051,7 +3090,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 			if _, ok := seen_{{$rel.FieldName}}[key{{$idx}}]; !ok {
 				seen_{{$rel.FieldName}}[key{{$idx}}] = struct{}{}
 				child := c{{$idx}}
-				{{if eq $rel.Type "HasMany" -}}
+				{{if or (eq $rel.Type "HasMany") (eq $rel.Type "ManyToMany") -}}
 				{{if $rel.IsPointer -}}
 				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, &child)
 				{{else -}}
@@ -3149,6 +3188,39 @@ func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .Mo
 	}
 	{{end -}}
 	{{end -}}
+	{{else if eq $rel.Type "ManyToMany"}}
+	{
+		query := "SELECT {{$target.AllColumns "t"}} FROM {{$target.Table}} t INNER JOIN {{$rel.JoinTable}} j ON t.{{$target.FirstPK.Column}} = j.{{$rel.JoinReferences}} WHERE j.{{$rel.JoinForeignKey}} = $1"
+		{{if $target.HasDeletedAt -}}
+		if !cfg.IncludeDeleted {
+			query += " AND t.{{$target.DeletedAtField.Column}} IS NULL"
+		}
+		{{end -}}
+		rows, err := db.QueryContext(ctx, query, m.{{$.FirstPK.Name}})
+		if err != nil {
+			return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: preloading {{$rel.FieldName}}: %w", err)
+		}
+		defer rows.Close()
+		var children []*{{$.ModelPkgAlias}}.{{$target.Name}}
+		for rows.Next() {
+			var child {{$.ModelPkgAlias}}.{{$target.Name}}
+			if err := rows.Scan({{$target.AllScanArgs "child"}}); err != nil {
+				return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: scanning {{$rel.FieldName}}: %w", err)
+			}
+			children = append(children, &child)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: iterating {{$rel.FieldName}}: %w", err)
+		}
+		{{if $rel.IsPointer -}}
+		m.{{$rel.FieldName}} = children
+		{{else -}}
+		m.{{$rel.FieldName}} = make([]{{$.ModelPkgAlias}}.{{$target.Name}}, len(children))
+		for i, child := range children {
+			m.{{$rel.FieldName}}[i] = *child
+		}
+		{{end -}}
+	}
 	{{end -}}
 	{{end -}}
 
@@ -3178,7 +3250,7 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 		return items, nil
 	}
 
-	{{if .HasManyRelations -}}
+	{{if or .HasManyRelations .ManyToManyRelations -}}
 	parentIDs := make([]any, 0, len(items))
 	parentMap := make(map[{{.FirstPK.QualifiedType .ModelPkgAlias}}]*{{.ModelPkgAlias}}.{{.Name}}, len(items))
 	for _, item := range items {
@@ -3283,6 +3355,60 @@ func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause s
 		}
 	}
 	{{end -}}
+	{{else if eq $rel.Type "ManyToMany"}}
+	if len(parentIDs) > 0 {
+		preloadOpts := []QueryOption{}
+		if cfg.IncludeDeleted {
+			preloadOpts = append(preloadOpts, IncludeDeleted())
+		}
+		type m2mPair struct {
+			parentID {{$.FirstPK.QualifiedType $.ModelPkgAlias}}
+			child    *{{$.ModelPkgAlias}}.{{$target.Name}}
+		}
+		pairs, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]m2mPair, error) {
+			whereClause := fmt.Sprintf("j.{{$rel.JoinForeignKey}} IN (%s)", strings.Join(func() []string {
+				s := make([]string, len(batch))
+				for i := range batch {
+					s[i] = fmt.Sprintf("$%d", i+1)
+				}
+				return s
+			}(), ", "))
+			{{if $target.HasDeletedAt -}}
+			if !cfg.IncludeDeleted {
+				whereClause += " AND t.{{$target.DeletedAtField.Column}} IS NULL"
+			}
+			{{end -}}
+			query := "SELECT j.{{$rel.JoinForeignKey}}, {{$target.AllColumns "t"}} FROM {{$rel.JoinTable}} j INNER JOIN {{$target.Table}} t ON t.{{$target.FirstPK.Column}} = j.{{$rel.JoinReferences}} WHERE " + whereClause
+			rows, err := db.QueryContext(ctx, query, batch...)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			var res []m2mPair
+			for rows.Next() {
+				var pID {{$.FirstPK.QualifiedType $.ModelPkgAlias}}
+				var child {{$.ModelPkgAlias}}.{{$target.Name}}
+				scanArgs := append([]any{scanNullable(&pID)}, {{$target.AllScanArgs "child"}})
+				if err := rows.Scan(scanArgs...); err != nil {
+					return nil, err
+				}
+				res = append(res, m2mPair{parentID: pID, child: &child})
+			}
+			return res, rows.Err()
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fetchAll{{$.NamePlural}}WithRelations: preloading {{$rel.FieldName}}: %w", err)
+		}
+		for _, pair := range pairs {
+			if parent, ok := parentMap[pair.parentID]; ok {
+				{{if $rel.IsPointer -}}
+				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, pair.child)
+				{{else -}}
+				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, *pair.child)
+				{{end -}}
+			}
+		}
+	}
 	{{end -}}
 	{{end -}}
 

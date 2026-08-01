@@ -98,6 +98,31 @@ func sqlType(f Field, dialect SchemaDialect) string {
 	}
 }
 
+// fkSqlType maps a primary key field type to its corresponding SQL foreign key type.
+func fkSqlType(f Field, dialect SchemaDialect) string {
+	base := f.UnderlyingBaseType()
+	switch dialect {
+	case DialectPostgres:
+		switch base {
+		case "int32", "uint32":
+			return "INTEGER"
+		case "int", "int64", "uint", "uint64":
+			return "BIGINT"
+		default:
+			return sqlType(f, dialect)
+		}
+	case DialectSQLite:
+		switch base {
+		case "int", "int64", "int32", "uint", "uint64", "uint32":
+			return "INTEGER"
+		default:
+			return sqlType(f, dialect)
+		}
+	default:
+		return sqlType(f, dialect)
+	}
+}
+
 // formatDefaultValue formats a raw default value string into valid SQL for the target dialect.
 func formatDefaultValue(val string, _ Field, dialect SchemaDialect) string {
 	val = strings.TrimSpace(val)
@@ -340,15 +365,6 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 		return idx
 	}
 
-	// columnHasLeadingIndex reports whether column is already served by some
-	// existing index as its leading (first) column. A B-tree index on
-	// (a, b, ...) can satisfy lookups on "a" alone via its leftmost prefix,
-	// but cannot efficiently satisfy lookups on any non-leading column, so
-	// only leading-column coverage makes a single-column index on that
-	// column redundant. Checked by column identity rather than by the
-	// auto-generated index name, so it correctly recognizes coverage from
-	// composite indexes (e.g. a uniqueIndex spanning multiple fields) that
-	// happen to have been given a different name.
 	columnHasLeadingIndex := func(column string) bool {
 		for _, idx := range indices {
 			if len(idx.Columns) > 0 && idx.Columns[0] == column {
@@ -377,11 +393,6 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 		}
 	}
 
-	// Automatically index DeletedAt column for soft-delete support if not
-	// already covered as the leading column of some other index (explicit
-	// or composite) — an explicitly-named index on this column, or a
-	// composite index that happens to lead with it, already serves
-	// single-column lookups just as well as a dedicated index would.
 	if m.HasDeletedAt() {
 		deletedAtCol := m.DeletedAtField().Column
 		if !columnHasLeadingIndex(deletedAtCol) {
@@ -391,14 +402,6 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 		}
 	}
 
-	// Index every BelongsTo foreign key column not already covered, since
-	// these are the columns joined on during preload and left unindexed
-	// they silently degrade preload queries to sequential scans. Coverage
-	// is checked by column identity (columnHasLeadingIndex), not by the
-	// auto-generated index name, so a foreign key that is already the
-	// leading column of a composite index — e.g. a uniqueIndex("user_id,
-	// hospital_id") covering UserID — is correctly recognized as already
-	// indexed and is not given a redundant single-column index alongside it.
 	for _, rel := range m.Relations {
 		if rel.Type != RelBelongsTo {
 			continue
@@ -423,6 +426,47 @@ func (m Model) GenerateSchema(dialect SchemaDialect) string {
 	return sb.String()
 }
 
+// GenerateJoinTableSchema renders CREATE TABLE and INDEX SQL statements for a many-to-many join table.
+func GenerateJoinTableSchema(rel Relation, parent Model, modelMap map[string]Model, dialect SchemaDialect) string {
+	target, ok := modelMap[rel.TargetModel]
+	if !ok || parent.FirstPK() == nil || target.FirstPK() == nil {
+		return ""
+	}
+
+	parentPKCol := parent.FirstPK().Column
+	targetPKCol := target.FirstPK().Column
+
+	parentFKType := fkSqlType(*parent.FirstPK(), dialect)
+	targetFKType := fkSqlType(*target.FirstPK(), dialect)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "CREATE TABLE IF NOT EXISTS %s (\n", rel.JoinTable)
+	fmt.Fprintf(&sb, "    %s %s NOT NULL,\n", rel.JoinForeignKey, parentFKType)
+	fmt.Fprintf(&sb, "    %s %s NOT NULL,\n", rel.JoinReferences, targetFKType)
+
+	onDelete := "CASCADE"
+	if rel.OnDelete != "" {
+		onDelete = strings.ToUpper(rel.OnDelete)
+	}
+
+	onUpdate := ""
+	if rel.OnUpdate != "" {
+		onUpdate = " ON UPDATE " + strings.ToUpper(rel.OnUpdate)
+	}
+
+	fmt.Fprintf(&sb, "    CONSTRAINT fk_%s_%s FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE %s%s,\n",
+		rel.JoinTable, rel.JoinForeignKey, rel.JoinForeignKey, parent.Table, parentPKCol, onDelete, onUpdate)
+	fmt.Fprintf(&sb, "    CONSTRAINT fk_%s_%s FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE %s%s,\n",
+		rel.JoinTable, rel.JoinReferences, rel.JoinReferences, target.Table, targetPKCol, onDelete, onUpdate)
+	fmt.Fprintf(&sb, "    PRIMARY KEY (%s, %s)\n", rel.JoinForeignKey, rel.JoinReferences)
+	sb.WriteString(");\n")
+
+	fmt.Fprintf(&sb, "CREATE INDEX IF NOT EXISTS idx_%s_%s ON %s (%s);\n",
+		rel.JoinTable, rel.JoinReferences, rel.JoinTable, rel.JoinReferences)
+
+	return sb.String()
+}
+
 // writeSchemaFile renders CREATE TABLE and INDEX statements for all models and writes to disk.
 func writeSchemaFile(models []Model, modelMap map[string]Model, dialect SchemaDialect, outPath string) error {
 	ordered := orderModelsByDependency(models, modelMap)
@@ -430,9 +474,10 @@ func writeSchemaFile(models []Model, modelMap map[string]Model, dialect SchemaDi
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "-- Code generated by query-gen. DO NOT EDIT.\n-- Dialect: %s\n\n", dialect)
 
+	writtenJoinTables := make(map[string]bool)
+
 	for _, m := range ordered {
-		// Skip tables without a primary key.
-		// These are assumed to be views.
+		// Skip tables without a primary key (views).
 		if m.FirstPK() == nil {
 			continue
 		}
@@ -440,6 +485,17 @@ func writeSchemaFile(models []Model, modelMap map[string]Model, dialect SchemaDi
 		m.AllKnownModels = modelMap
 		sb.WriteString(m.GenerateSchema(dialect))
 		sb.WriteByte('\n')
+
+		for _, rel := range m.Relations {
+			if rel.Type == RelManyToMany && rel.JoinTable != "" {
+				if writtenJoinTables[rel.JoinTable] {
+					continue
+				}
+				writtenJoinTables[rel.JoinTable] = true
+				sb.WriteString(GenerateJoinTableSchema(rel, m, modelMap, dialect))
+				sb.WriteByte('\n')
+			}
+		}
 	}
 
 	if err := os.WriteFile(outPath, []byte(sb.String()), 0o644); err != nil {
