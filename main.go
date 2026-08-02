@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"unicode"
 
@@ -271,10 +273,41 @@ func (m Model) FieldByColumn(col string) *Field {
 
 // toLowerCamel converts a Go field name to lower camelCase.
 // E.g., "UserID" -> "userID", "ID" -> "id", "TenantCode" -> "tenantCode".
+// Fast path operates directly on ASCII bytes with zero allocations.
 func toLowerCamel(s string) string {
 	if s == "" {
 		return ""
 	}
+
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return toLowerCamelUnicode(s)
+		}
+	}
+
+	i := 0
+	for i < len(s) && (s[i] >= 'A' && s[i] <= 'Z') {
+		i++
+	}
+	if i == 0 {
+		return s
+	}
+	if i == len(s) {
+		return strings.ToLower(s)
+	}
+
+	b := []byte(s)
+	if i > 1 {
+		for j := 0; j < i-1; j++ {
+			b[j] = b[j] + ('a' - 'A')
+		}
+	} else {
+		b[0] = b[0] + ('a' - 'A')
+	}
+	return string(b)
+}
+
+func toLowerCamelUnicode(s string) string {
 	runes := []rune(s)
 	i := 0
 	for i < len(runes) && unicode.IsUpper(runes[i]) {
@@ -536,6 +569,7 @@ func (m Model) UpdatableScanArgs(varName string) string {
 // AllRelationColumns returns a comma-separated list of SELECT columns for all model relations.
 func (m Model) AllRelationColumns() string {
 	var sb strings.Builder
+	sb.Grow(len(m.Relations) * 64)
 	for i, rel := range m.Relations {
 		alias := fmt.Sprintf("r%d", i)
 		target, ok := m.AllKnownModels[rel.TargetModel]
@@ -555,7 +589,7 @@ func (m Model) AllRelationColumns() string {
 // AllRelationJoins returns the combined LEFT JOIN SQL statements for all model relations,
 // incorporating soft-delete filter conditions for related models when present.
 func (m Model) AllRelationJoins(parentPrefix string) string {
-	var joins []string
+	joins := make([]string, 0, len(m.Relations))
 	for i, rel := range m.Relations {
 		alias := fmt.Sprintf("r%d", i)
 		target, ok := m.AllKnownModels[rel.TargetModel]
@@ -704,29 +738,60 @@ func main() {
 
 	pkgAlias := filepath.Base(fullPkgPath)
 
+	// Bounded worker pool matching CPU count to execute template generation,
+	// goimports formatting, and file I/O in parallel across all parsed models.
+	numWorkers := min(runtime.GOMAXPROCS(0), len(parsedModels))
+
+	jobs := make(chan Model, len(parsedModels))
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		genErr  error
+	)
+
+	for range numWorkers {
+		wg.Go(func() {
+			for model := range jobs {
+				model.Package = *outPkg
+				model.ModelPkg = fullPkgPath
+				model.ModelPkgAlias = pkgAlias
+				model.AllKnownModels = modelMap
+
+				code, err := generateQueries(model)
+				if err != nil {
+					errOnce.Do(func() {
+						genErr = fmt.Errorf("query-gen: generating code for %q: %w", model.Name, err)
+					})
+					return
+				}
+
+				fileName := fmt.Sprintf("%s_gen.go", toSnakeCase(model.Name))
+				filePath := filepath.Join(*outDir, fileName)
+
+				formatted, err := imports.Process(filePath, []byte(code), nil)
+				if err != nil {
+					log.Printf("query-gen: warning: goimports failed for %q: %v (writing unformatted source)", model.Name, err)
+					formatted = []byte(code)
+				}
+
+				if err := os.WriteFile(filePath, formatted, 0o644); err != nil {
+					errOnce.Do(func() {
+						genErr = fmt.Errorf("query-gen: writing %q: %v", filePath, err)
+					})
+					return
+				}
+			}
+		})
+	}
+
 	for _, model := range parsedModels {
-		model.Package = *outPkg
-		model.ModelPkg = fullPkgPath
-		model.ModelPkgAlias = pkgAlias
-		model.AllKnownModels = modelMap
+		jobs <- model
+	}
+	close(jobs)
+	wg.Wait()
 
-		code, err := generateQueries(model)
-		if err != nil {
-			log.Fatalf("query-gen: generating code for %q: %v", model.Name, err)
-		}
-
-		fileName := fmt.Sprintf("%s_gen.go", toSnakeCase(model.Name))
-		filePath := filepath.Join(*outDir, fileName)
-
-		formatted, err := imports.Process(filePath, []byte(code), nil)
-		if err != nil {
-			log.Printf("query-gen: warning: goimports failed for %q: %v (writing unformatted source)", model.Name, err)
-			formatted = []byte(code)
-		}
-
-		if err := os.WriteFile(filePath, formatted, 0o644); err != nil {
-			log.Fatalf("query-gen: writing %q: %v", filePath, err)
-		}
+	if genErr != nil {
+		log.Fatal(genErr)
 	}
 }
 
@@ -867,114 +932,142 @@ func parsePackage(pattern string, defaultNullable bool) ([]Model, string, error)
 	fullPkgPath := pkgs[0].PkgPath
 
 	for _, pkg := range pkgs {
-		tableNames := collectTableNameMethods(pkg.Syntax)
-		customDataTypes := collectDataTypeMethods(pkg)
+		var tableNames map[string]string
+		var customDataTypes map[string]string
 
-		for _, file := range pkg.Syntax {
-			ast.Inspect(file, func(n ast.Node) bool {
-				typeSpec, ok := n.(*ast.TypeSpec)
-				if !ok || !typeSpec.Name.IsExported() {
-					return true
-				}
+		// Gather table names and custom data types concurrently
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			tableNames = collectTableNameMethods(pkg.Syntax)
+		})
+		wg.Go(func() {
+			customDataTypes = collectDataTypeMethods(pkg)
+		})
+		wg.Wait()
 
-				structType, ok := typeSpec.Type.(*ast.StructType)
-				if !ok {
-					return true
-				}
+		// Inspect AST syntax files in parallel while preserving file declaration order
+		type fileModels struct {
+			models []Model
+		}
 
-				// Honor "query-gen: skip" directive in the doc comment. The doc may be
-				// attached to the TypeSpec itself, or to the enclosing GenDecl when the
-				// type is declared alone (e.g. `// comment\ntype Foo struct{}`).
-				doc := typeSpec.Doc
-				if doc == nil {
-					if genDecl, ok := findEnclosingGenDecl(file, typeSpec); ok {
-						doc = genDecl.Doc
-					}
-				}
-				if doc != nil && strings.Contains(doc.Text(), "query-gen: skip") {
-					return true
-				}
+		fileResults := make([]fileModels, len(pkg.Syntax))
+		var wgFiles sync.WaitGroup
 
-				model := Model{
-					Name:       typeSpec.Name.Name,
-					NamePlural: safePlural(typeSpec.Name.Name),
-					Table:      inflection.Plural(toSnakeCase(typeSpec.Name.Name)),
-				}
+		for idx, file := range pkg.Syntax {
+			wgFiles.Add(1)
+			go func(idx int, file *ast.File) {
+				defer wgFiles.Done()
+				var localModels []Model
 
-				if explicit, ok := tableNames[model.Name]; ok {
-					model.Table = explicit
-				}
-
-				for _, field := range structType.Fields.List {
-					if len(field.Names) == 0 || !field.Names[0].IsExported() {
-						continue
+				ast.Inspect(file, func(n ast.Node) bool {
+					typeSpec, ok := n.(*ast.TypeSpec)
+					if !ok || !typeSpec.Name.IsExported() {
+						return true
 					}
 
-					fieldName := field.Names[0].Name
-					rawTag := ""
-					if field.Tag != nil {
-						rawTag = strings.Trim(field.Tag.Value, "`")
+					structType, ok := typeSpec.Type.(*ast.StructType)
+					if !ok {
+						return true
 					}
 
-					if rel, ok := detectRelation(field, rawTag, model.Name, pkg.TypesInfo); ok {
-						model.Relations = append(model.Relations, rel)
-						continue
+					doc := typeSpec.Doc
+					if doc == nil {
+						if genDecl, ok := findEnclosingGenDecl(file, typeSpec); ok {
+							doc = genDecl.Doc
+						}
+					}
+					if doc != nil && strings.Contains(doc.Text(), "query-gen: skip") {
+						return true
 					}
 
-					fieldType := types.ExprString(field.Type)
-					parsedField := parseFieldTags(fieldName, fieldType, rawTag, defaultNullable)
-
-					if parsedField.IsIgnore {
-						continue
+					model := Model{
+						Name:       typeSpec.Name.Name,
+						NamePlural: safePlural(typeSpec.Name.Name),
+						Table:      inflection.Plural(toSnakeCase(typeSpec.Name.Name)),
 					}
 
-					// Resolve underlying primitive Go type using type-checker info
-					parsedField.UnderlyingType = resolveUnderlyingType(field.Type, fieldType, pkg.TypesInfo)
+					if explicit, ok := tableNames[model.Name]; ok {
+						model.Table = explicit
+					}
 
-					if parsedField.RawSQLType == "" {
-						baseType := strings.TrimPrefix(fieldType, "*")
-						bareType := bareTypeName(baseType)
-						underlyingBase := parsedField.UnderlyingBaseType()
-						bareUnderlying := bareTypeName(underlyingBase)
+					model.Fields = make([]Field, 0, len(structType.Fields.List))
+					model.Relations = make([]Relation, 0, 4)
 
-						for _, t := range []string{baseType, underlyingBase, bareType, bareUnderlying} {
-							if t != "" {
-								if dt, ok := customDataTypes[t]; ok {
-									parsedField.RawSQLType = dt
-									break
+					for _, field := range structType.Fields.List {
+						if len(field.Names) == 0 || !field.Names[0].IsExported() {
+							continue
+						}
+
+						fieldName := field.Names[0].Name
+						rawTag := ""
+						if field.Tag != nil {
+							rawTag = strings.Trim(field.Tag.Value, "`")
+						}
+
+						if rel, ok := detectRelation(field, rawTag, model.Name, pkg.TypesInfo); ok {
+							model.Relations = append(model.Relations, rel)
+							continue
+						}
+
+						fieldType := types.ExprString(field.Type)
+						parsedField := parseFieldTags(fieldName, fieldType, rawTag, defaultNullable)
+
+						if parsedField.IsIgnore {
+							continue
+						}
+
+						parsedField.UnderlyingType = resolveUnderlyingType(field.Type, fieldType, pkg.TypesInfo)
+
+						if parsedField.RawSQLType == "" {
+							baseType := strings.TrimPrefix(fieldType, "*")
+							bareType := bareTypeName(baseType)
+							underlyingBase := parsedField.UnderlyingBaseType()
+							bareUnderlying := bareTypeName(underlyingBase)
+
+							for _, t := range []string{baseType, underlyingBase, bareType, bareUnderlying} {
+								if t != "" {
+									if dt, ok := customDataTypes[t]; ok {
+										parsedField.RawSQLType = dt
+										break
+									}
 								}
 							}
 						}
+						model.Fields = append(model.Fields, parsedField)
 					}
-					model.Fields = append(model.Fields, parsedField)
-				}
 
-				// Assign PK pointers after all fields are appended
-				model.PK = nil
-				for i := range model.Fields {
-					if model.Fields[i].IsPK {
-						model.PK = append(model.PK, &model.Fields[i])
-					}
-				}
-
-				if len(model.PK) == 0 {
+					model.PK = nil
 					for i := range model.Fields {
-						if strings.EqualFold(model.Fields[i].Name, "ID") {
-							model.Fields[i].IsPK = true
+						if model.Fields[i].IsPK {
 							model.PK = append(model.PK, &model.Fields[i])
-							break
 						}
 					}
-				}
 
-				// Skip models with no identifiable primary key.
-				if len(model.PK) == 0 {
+					if len(model.PK) == 0 {
+						for i := range model.Fields {
+							if strings.EqualFold(model.Fields[i].Name, "ID") {
+								model.Fields[i].IsPK = true
+								model.PK = append(model.PK, &model.Fields[i])
+								break
+							}
+						}
+					}
+
+					if len(model.PK) == 0 {
+						return true
+					}
+
+					localModels = append(localModels, model)
 					return true
-				}
+				})
 
-				result = append(result, model)
-				return true
-			})
+				fileResults[idx].models = localModels
+			}(idx, file)
+		}
+		wgFiles.Wait()
+
+		for _, res := range fileResults {
+			result = append(result, res.models...)
 		}
 	}
 
@@ -1403,21 +1496,62 @@ func parseFieldTags(fieldName, fieldType, rawTag string, defaultNullable bool) F
 	return f
 }
 
-func generateQueries(m Model) (string, error) {
-	tmpl, err := template.New("gen").Parse(codeTemplate)
-	if err != nil {
-		return "", fmt.Errorf("parsing code template: %w", err)
-	}
+// parsedTemplate caches compiled text template lazily on first access.
+// Safe for concurrent use by multiple goroutines.
+var parsedTemplate = sync.OnceValue(func() *template.Template {
+	return template.Must(template.New("gen").Parse(codeTemplate))
+})
 
+// generateQueries renders code for the specified model using the cached template.
+// Safe for concurrent use by multiple goroutines.
+func generateQueries(m Model) (string, error) {
+	tmpl := parsedTemplate()
 	var buf bytes.Buffer
+	buf.Grow(4096 * 2)
 	if err := tmpl.Execute(&buf, m); err != nil {
 		return "", fmt.Errorf("executing code template for %q: %w", m.Name, err)
 	}
-
 	return buf.String(), nil
 }
 
+// toSnakeCase converts a CamelCase Go identifier to snake_case.
+// Fast path processes standard ASCII strings with zero heap allocations.
 func toSnakeCase(str string) string {
+	if str == "" {
+		return ""
+	}
+
+	for i := 0; i < len(str); i++ {
+		if str[i] > 127 {
+			return toSnakeCaseUnicode(str)
+		}
+	}
+
+	var b strings.Builder
+	b.Grow(len(str) + 4)
+	length := len(str)
+
+	for i := range length {
+		c := str[i]
+		if c >= 'A' && c <= 'Z' {
+			if i > 0 {
+				prev := str[i-1]
+				nextIsLower := i+1 < length && (str[i+1] >= 'a' && str[i+1] <= 'z')
+				prevIsLower := prev >= 'a' && prev <= 'z'
+				prevIsUpper := prev >= 'A' && prev <= 'Z'
+				if prevIsLower || (nextIsLower && prevIsUpper) {
+					b.WriteByte('_')
+				}
+			}
+			b.WriteByte(c + ('a' - 'A'))
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func toSnakeCaseUnicode(str string) string {
 	var b strings.Builder
 	runes := []rune(str)
 	length := len(runes)
@@ -1440,2016 +1574,4 @@ func toSnakeCase(str string) string {
 	return b.String()
 }
 
-// --- Runtime Helper Template ---
-
-const runtimeTemplate = `// Code generated by query-gen. DO NOT EDIT.
-package {{.Package}}
-
-import (
-	"context"
-	"database/sql"
-	"fmt"
-	"math"
-	"reflect"
-	"strconv"
-	"strings"
-	"time"
-)
-
-type DBTX interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-// inBatchSize sets the maximum number of bind parameters per IN clause batch.
-// 999 is chosen to conform to SQLite3's default maximum limit (SQLITE_MAX_VARIABLE_NUMBER).
-const inBatchSize = 999
-
-// batchIn splits ids into chunks of at most inBatchSize and executes fetch for each batch,
-// concatenating results to avoid exceeding database SQL parameter limits.
-func batchIn[T, K any](ctx context.Context, db DBTX, ids []K, fetch func(ctx context.Context, db DBTX, batch []K) ([]T, error)) ([]T, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	if len(ids) <= inBatchSize {
-		return fetch(ctx, db, ids)
-	}
-
-	results := make([]T, 0, len(ids))
-	for i := 0; i < len(ids); i += inBatchSize {
-		end := min(i+inBatchSize, len(ids))
-		batch, err := fetch(ctx, db, ids[i:end])
-		if err != nil {
-			return nil, fmt.Errorf("batchIn: batch [%d:%d]: %w", i, end, err)
-		}
-		results = append(results, batch...)
-	}
-	return results, nil
-}
-
-// QueryOptions provides optional filtering, ordering, grouping, having, pagination,
-// association preloading, and soft-delete controls for queries.
-type QueryOptions struct {
-	Table string           // Dynamic table name passed at runtime.
-	Where               string
-	Args                []any
-	Having              string
-	OrderBy             string
-	GroupBy             string
-	Limit               int
-	Offset              int
-	PreloadAssociations bool
-	IncludeDeleted      bool
-	HardDelete          bool
-}
-
-type QueryOption func(*QueryOptions)
-
-// staticPlaceholders pre-computes "$1" through "$1000" to eliminate string formatting
-// allocations during query option construction and parameter binding.
-var staticPlaceholders = func() [1001]string {
-	var p [1001]string
-	for i := 1; i <= 1000; i++ {
-		p[i] = fmt.Sprintf("$%d", i)
-	}
-	return p
-}()
-
-// getPlaceholder returns a cached placeholder string for index <= 1000,
-// falling back to fmt.Sprintf for higher indices.
-func getPlaceholder(idx int) string {
-	if idx >= 1 && idx <= 1000 {
-		return staticPlaceholders[idx]
-	}
-	return fmt.Sprintf("$%d", idx)
-}
-
-// Where appends a raw WHERE clause to the query options.
-//
-// Placeholder Handling:
-//   - '?' Placeholders (Recommended): Automatically replaced with dynamic dollar-indexed
-//     placeholders ($1, $2, ...) based on the current total argument count. This is safest
-//     for dynamic/conditional queries where the number or order of filters is unknown at runtime.
-//   - '$n' Placeholders: Supported as-is. If you provide explicit placeholders (e.g. "$1", "$2"),
-//     they will remain untouched, provided they match the expected argument index in your query.
-func Where(where string, args ...any) QueryOption {
-	return func(o *QueryOptions) {
-		for _, arg := range args {
-			o.Args = append(o.Args, arg)
-			where = strings.Replace(where, "?", getPlaceholder(len(o.Args)), 1)
-		}
-
-		if o.Where != "" {
-			o.Where += " AND " + where
-		} else {
-			o.Where = where
-		}
-	}
-}
-
-// Having appends a raw HAVING clause to the query options.
-//
-// Placeholder Handling:
-//   - '?' Placeholders (Recommended): Automatically replaced with dynamic dollar-indexed
-//     placeholders ($1, $2, ...) based on the current total argument count. This is safest
-//     for dynamic/conditional queries where argument ordering is subject to change.
-//   - '$n' Placeholders: Supported as-is. Explicit placeholders (e.g. "$1", "$2") remain
-//     untouched in the resulting query string.
-func Having(having string, args ...any) QueryOption {
-	return func(o *QueryOptions) {
-		for _, arg := range args {
-			o.Args = append(o.Args, arg)
-			having = strings.Replace(having, "?", getPlaceholder(len(o.Args)), 1)
-		}
-		if o.Having != "" {
-			o.Having += " AND " + having
-		} else {
-			o.Having = having
-		}
-	}
-}
-
-
-// Table overrides the default table name for the query.
-// Useful is you have multiple views that can be scanned with the same struct.
-func Table(name string) QueryOption {
-	return func(o *QueryOptions) {
-		o.Table = name
-	}
-}
-
-// Eq applies an equality filter (=).
-func Eq(column string, val any) QueryOption {
-	return func(o *QueryOptions) {
-		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s = %s", column, getPlaceholder(len(o.Args)))
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// ILIKE performs a case-insensitive pattern match using ILIKE (or LOWER for cross-dialect compatibility).
-func ILIKE(column, value string) QueryOption {
-	return func(o *QueryOptions) {
-		if value == "" {
-			return
-		}
-
-		o.Args = append(o.Args, "%"+strings.ToLower(value)+"%")
-		clause := fmt.Sprintf("LOWER(%s) LIKE %s", column, getPlaceholder(len(o.Args)))
-
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// In filters a column matching any of the provided values.
-func In(column string, values ...any) QueryOption {
-	return func(o *QueryOptions) {
-		n := len(values)
-		if n == 0 {
-			return
-		}
-
-		// Pre-allocate o.Args slice capacity
-		if cap(o.Args)-len(o.Args) < n {
-			newArgs := make([]any, len(o.Args), len(o.Args)+n)
-			copy(newArgs, o.Args)
-			o.Args = newArgs
-		}
-
-		var sb strings.Builder
-		sb.Grow(len(column) + 6 + (n * 6))
-		sb.WriteString(column)
-		sb.WriteString(" IN (")
-
-		for i, v := range values {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			o.Args = append(o.Args, v)
-			sb.WriteString(getPlaceholder(len(o.Args)))
-		}
-		sb.WriteByte(')')
-
-		clause := sb.String()
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// NotIn filters a column not matching any of the provided values.
-func NotIn(column string, values ...any) QueryOption {
-	return func(o *QueryOptions) {
-		if len(values) == 0 {
-			return
-		}
-
-		placeholders := make([]string, 0, len(values))
-		for _, v := range values {
-			o.Args = append(o.Args, v)
-			placeholders = append(placeholders, getPlaceholder(len(o.Args)))
-		}
-
-		clause := fmt.Sprintf("%s NOT IN (%s)", column, strings.Join(placeholders, ", "))
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// IsNull filters rows where the column is NULL.
-func IsNull(column string) QueryOption {
-	return func(o *QueryOptions) {
-		clause := fmt.Sprintf("%s IS NULL", column)
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// IsNotNull filters rows where the column is NOT NULL.
-func IsNotNull(column string) QueryOption {
-	return func(o *QueryOptions) {
-		clause := fmt.Sprintf("%s IS NOT NULL", column)
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// Between applies a BETWEEN min AND max filter on a column.
-func Between(column string, min, max any) QueryOption {
-	return func(o *QueryOptions) {
-		o.Args = append(o.Args, min)
-		p1 := getPlaceholder(len(o.Args))
-		o.Args = append(o.Args, max)
-		p2 := getPlaceholder(len(o.Args))
-
-		clause := fmt.Sprintf("%s BETWEEN %s AND %s", column, p1, p2)
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// Search performs a pattern match across multiple columns.
-func Search(query string, columns ...string) QueryOption {
-	return func(o *QueryOptions) {
-		if query == "" || len(columns) == 0 {
-			return
-		}
-
-		o.Args = append(o.Args, "%"+query+"%")
-		placeholder := getPlaceholder(len(o.Args))
-
-		clauses := make([]string, 0, len(columns))
-		for _, col := range columns {
-			clauses = append(clauses, fmt.Sprintf("%s LIKE %s", col, placeholder))
-		}
-
-		groupClause := "(" + strings.Join(clauses, " OR ") + ")"
-		if o.Where != "" {
-			o.Where += " AND " + groupClause
-		} else {
-			o.Where = groupClause
-		}
-	}
-}
-
-// Gt applies a greater-than filter (>).
-func Gt(column string, val any) QueryOption {
-	return func(o *QueryOptions) {
-		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s > %s", column, getPlaceholder(len(o.Args)))
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// Gte applies a greater-than-or-equal filter (>=).
-func Gte(column string, val any) QueryOption {
-	return func(o *QueryOptions) {
-		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s >= %s", column, getPlaceholder(len(o.Args)))
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// Lt applies a less-than filter (<).
-func Lt(column string, val any) QueryOption {
-	return func(o *QueryOptions) {
-		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s < %s", column, getPlaceholder(len(o.Args)))
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// Lte applies a less-than-or-equal filter (<=).
-func Lte(column string, val any) QueryOption {
-	return func(o *QueryOptions) {
-		o.Args = append(o.Args, val)
-		clause := fmt.Sprintf("%s <= %s", column, getPlaceholder(len(o.Args)))
-		if o.Where != "" {
-			o.Where += " AND " + clause
-		} else {
-			o.Where = clause
-		}
-	}
-}
-
-// Order resultset by the specified column/columns (conditions).
-func OrderBy(orderBy string) QueryOption {
-	return func(o *QueryOptions) {
-		o.OrderBy = orderBy
-	}
-}
-
-// Group by the specified column/columns (conditions).
-func GroupBy(groupBy string) QueryOption {
-	return func(o *QueryOptions) {
-		o.GroupBy = groupBy
-	}
-}
-
-// Set pagination limit. Use together with Offsset to control pagination.
-func Limit(limit int) QueryOption {
-	return func(o *QueryOptions) {
-		o.Limit = limit
-	}
-}
-
-// Set pagination offset. Must be set together with limit.
-func Offset(offset int) QueryOption {
-	return func(o *QueryOptions) {
-		o.Offset = offset
-	}
-}
-
-// Preload enables or disables preloading associated model relations.
-func Preload(preload bool) QueryOption {
-	return func(o *QueryOptions) {
-		o.PreloadAssociations = preload
-	}
-}
-
-// IncludeDeleted includes soft-deleted records (where deleted_at IS NOT NULL) in query results.
-func IncludeDeleted() QueryOption {
-	return func(o *QueryOptions) {
-		o.IncludeDeleted = true
-	}
-}
-
-// HardDelete forces permanent SQL deletion on models supporting soft deletes.
-func HardDelete() QueryOption {
-	return func(o *QueryOptions) {
-		o.HardDelete = true
-	}
-}
-
-// DateRange applies date range filter on a date column.
-// e.g DateRange("DATE(created_at)", "2021-01-01", "2021-12-31")
-// It does nothing if start or end is empty.
-func DateRange(column string, start, end string) QueryOption {
-	return func(o *QueryOptions) {
-		if start != "" && end != "" {
-			o.Args = append(o.Args, start, end)
-			placeholder1 := fmt.Sprintf("$%d", len(o.Args)-1)
-			placeholder2 := fmt.Sprintf("$%d", len(o.Args))
-			clause := fmt.Sprintf("%s BETWEEN %s AND %s", column, placeholder1, placeholder2)
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		} else if start != "" {
-			o.Args = append(o.Args, start)
-			clause := fmt.Sprintf("%s >= $%d", column, len(o.Args))
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		} else if end != "" {
-			o.Args = append(o.Args, end)
-			clause := fmt.Sprintf("%s <= $%d", column, len(o.Args))
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		}
-	}
-}
-
-// MonthRange is the same as DateRange but truncates the date to month.
-// e.g MonthRange("DATE(created_at)", "2021-01-01", "2021-12-31")
-// It does nothing if start or end is empty.
-func MonthRange(column string, start, end string) QueryOption {
-	return func(o *QueryOptions) {
-		if start != "" && end != "" {
-			o.Args = append(o.Args, start, end)
-			p1 := fmt.Sprintf("$%d", len(o.Args)-1)
-			p2 := fmt.Sprintf("$%d", len(o.Args))
-			clause := fmt.Sprintf("%s BETWEEN DATE_TRUNC('month', %s::DATE) AND DATE_TRUNC('month', %s::DATE)", column, p1, p2)
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		} else if start != "" {
-			o.Args = append(o.Args, start)
-			clause := fmt.Sprintf("%s >= DATE_TRUNC('month', $%d::DATE)", column, len(o.Args))
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		} else if end != "" {
-			o.Args = append(o.Args, end)
-			clause := fmt.Sprintf("%s <= DATE_TRUNC('month', $%d::DATE)", column, len(o.Args))
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		}
-	}
-}
-
-// YearRange is the same as date range but truncates the date to year.
-// e.g YearRange("DATE(created_at)", "2020-01-01", "2024-12-31")
-// It does nothing if start or end is empty.
-func YearRange(column string, start, end string) QueryOption {
-	return func(o *QueryOptions) {
-		if start != "" && end != "" {
-			o.Args = append(o.Args, start, end)
-			p1 := fmt.Sprintf("$%d", len(o.Args)-1)
-			p2 := fmt.Sprintf("$%d", len(o.Args))
-			clause := fmt.Sprintf("%s BETWEEN DATE_TRUNC('year', %s::DATE) AND DATE_TRUNC('year', %s::DATE)", column, p1, p2)
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		} else if start != "" {
-			o.Args = append(o.Args, start)
-			clause := fmt.Sprintf("%s >= DATE_TRUNC('year', $%d::DATE)", column, len(o.Args))
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		} else if end != "" {
-			o.Args = append(o.Args, end)
-			clause := fmt.Sprintf("%s <= DATE_TRUNC('year', $%d::DATE)", column, len(o.Args))
-			if o.Where != "" {
-				o.Where += " AND " + clause
-			} else {
-				o.Where = clause
-			}
-		}
-	}
-}
-
-func parseQueryOptions(opts ...QueryOption) QueryOptions {
-	var cfg QueryOptions
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&cfg)
-		}
-	}
-	return cfg
-}
-
-func applyQueryOptions(defaultPK string, deletedAtCol string, opts ...QueryOption) (string, []any, QueryOptions) {
-	cfg := parseQueryOptions(opts...)
-
-	if deletedAtCol != "" && !cfg.IncludeDeleted {
-		clause := deletedAtCol + " IS NULL"
-		if cfg.Where != "" {
-			cfg.Where = clause + " AND " + cfg.Where
-		} else {
-			cfg.Where = clause
-		}
-	}
-
-	var sb strings.Builder
-	args := cfg.Args
-
-	if cfg.Where != "" {
-		sb.WriteString(" WHERE ")
-		sb.WriteString(cfg.Where)
-	}
-
-	if cfg.GroupBy != "" {
-		sb.WriteString(" GROUP BY ")
-		sb.WriteString(cfg.GroupBy)
-	}
-
-	if cfg.Having != "" {
-		sb.WriteString(" HAVING ")
-		sb.WriteString(cfg.Having)
-	}
-
-	if cfg.OrderBy != "" {
-		sb.WriteString(" ORDER BY ")
-		sb.WriteString(cfg.OrderBy)
-	} else if defaultPK != "" {
-		sb.WriteString(" ORDER BY ")
-		sb.WriteString(defaultPK)
-		sb.WriteString(" ASC")
-	}
-
-	if cfg.Limit > 0 {
-		args = append(args, cfg.Limit)
-		fmt.Fprintf(&sb, " LIMIT $%d", len(args))
-	}
-
-	if cfg.Offset > 0 {
-		args = append(args, cfg.Offset)
-		fmt.Fprintf(&sb, " OFFSET $%d", len(args))
-	}
-
-	return sb.String(), args, cfg
-}
-
-// PaginationResult holds the output of a paginated query.
-type PaginationResult[T any] struct {
-	Page       int   ` + "`" + `json:"page"` + "`" + `
-	PageSize   int   ` + "`" + `json:"page_size"` + "`" + `
-	TotalPages int64 ` + "`" + `json:"total_pages"` + "`" + `
-	Count      int64 ` + "`" + `json:"count"` + "`" + `
-	HasNext    bool  ` + "`" + `json:"has_next"` + "`" + `
-	HasPrev    bool  ` + "`" + `json:"has_prev"` + "`" + `
-	Results    []T   ` + "`" + `json:"results"` + "`" + `
-}
-
-// FetchFunc defines a function signature capable of fetching records using DBTX and QueryOptions.
-type FetchFunc[T any] func(ctx context.Context, db DBTX, opts ...QueryOption) ([]T, error)
-
-// CountFunc defines a function signature capable of counting total matching rows using DBTX and QueryOptions.
-type CountFunc func(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error)
-
-// Paginate executes a paginated query using DBTX, counting total rows and retrieving the requested page.
-// Page is constrained to (1, 10) if page < 1 or pageSize < 1.
-func Paginate[T any](ctx context.Context, db DBTX, countFn CountFunc, fetchFn FetchFunc[T], page, pageSize int, opts ...QueryOption) (*PaginationResult[T], error) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 10
-	}
-
-	totalCount, err := countFn(ctx, db, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("paginate: counting total rows: %w", err)
-	}
-
-	// Append pagination limit and offset options
-	pOpts := append([]QueryOption(nil), opts...)
-	pOpts = append(pOpts, Limit(pageSize), Offset((page-1)*pageSize))
-
-	results, err := fetchFn(ctx, db, pOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("paginate: fetching page results: %w", err)
-	}
-
-	if results == nil {
-		results = make([]T, 0)
-	}
-
-	return &PaginationResult[T]{
-		Page:       page,
-		PageSize:   pageSize,
-		HasNext:    int64(page*pageSize) < totalCount,
-		HasPrev:    page > 1,
-		Results:    results,
-		Count:      totalCount,
-		TotalPages: int64(math.Ceil(float64(totalCount) / float64(pageSize))),
-	}, nil
-}
-
-// nullableScanner adapts a *T destination to the sql.Scanner interface,
-// handling NULL source values by zeroing dst, and falling back to
-// sql.Scanner or convertAssign for types that don't directly assert to T.
-type nullableScanner[T any] struct {
-	dst *T // Destination field. Not owned; caller retains ownership.
-}
-
-// Scan implements sql.Scanner.
-func (n nullableScanner[T]) Scan(src any) error {
-	if src == nil {
-		var zero T
-		*n.dst = zero
-		return nil
-	}
-
-	if v, ok := src.(T); ok {
-		*n.dst = v
-		return nil
-	}
-
-	if err := convertAssign(n.dst, src); err == nil {
-		return nil
-	}
-
-	if scanner, ok := any(n.dst).(sql.Scanner); ok {
-		return scanner.Scan(src)
-	}
-
-	// n.dst is like **string, so vDst is *string
-	vDst := reflect.ValueOf(n.dst).Elem() 
-	if vDst.Kind() == reflect.Pointer {
-		if vDst.IsNil() {
-			// Automatically allocates a new type: e.g new(string)
-			vDst.Set(reflect.New(vDst.Type().Elem()))
-		}
-		// Passes the inner *string to convertAssign
-		return convertAssign(vDst.Interface(), src)
-	}
-	return fmt.Errorf("ScanNullable: cannot scan %T into %T", src, n.dst)
-}
-
-// ScanNullable returns a value implementing sql.Scanner for dst.
-func ScanNullable[T any](dst *T) nullableScanner[T] {
-	return nullableScanner[T]{dst: dst}
-}
-
-// parseTimeString parses SQL and ISO 8601 timestamp strings.
-func parseTimeString(s string) (time.Time, error) {
-	formats := []string{
-		"2006-01-02 15:04:05.999999999-07",
-		"2006-01-02 15:04:05-07",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02",
-		"Mon Jan 2 15:04:05 MST 2006",
-		"Mon Jan  2 15:04:05 MST 2006",
-	}
-
-	for _, fmtStr := range formats {
-		if t, err := time.Parse(fmtStr, s); err == nil {
-			return t, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("parseTimeString: failed to parse time string %q", s)
-}
-
-func convertAssign(dst any, src any) error {
-	if src == nil {
-		return nil
-	}
-
-	switch p := dst.(type) {
-	case *string:
-		switch s := src.(type) {
-		case []byte:
-			*p = string(s)
-			return nil
-		case string:
-			*p = s
-			return nil
-		}
-	case *[]byte:
-		switch s := src.(type) {
-		case string:
-			*p = []byte(s)
-			return nil
-		case []byte:
-			cp := make([]byte, len(s))
-			copy(cp, s)
-			*p = cp
-			return nil
-		}
-	case *time.Time:
-		switch s := src.(type) {
-		case string:
-			t, err := parseTimeString(s)
-			if err != nil {
-				return err
-			}
-			*p = t
-			return nil
-		case []byte:
-			t, err := parseTimeString(string(s))
-			if err != nil {
-				return err
-			}
-			*p = t
-			return nil
-		}
-	case *int:
-		if i, ok := toInt64(src); ok {
-			*p = int(i)
-			return nil
-		}
-	case *int8:
-		if i, ok := toInt64(src); ok {
-			*p = int8(i)
-			return nil
-		}
-	case *int16:
-		if i, ok := toInt64(src); ok {
-			*p = int16(i)
-			return nil
-		}
-	case *int32:
-		if i, ok := toInt64(src); ok {
-			*p = int32(i)
-			return nil
-		}
-	case *int64:
-		if i, ok := toInt64(src); ok {
-			*p = i
-			return nil
-		}
-	case *uint:
-		if u, ok := toUint64(src); ok {
-			*p = uint(u)
-			return nil
-		}
-	case *uint8:
-		if u, ok := toUint64(src); ok {
-			*p = uint8(u)
-			return nil
-		}
-	case *uint16:
-		if u, ok := toUint64(src); ok {
-			*p = uint16(u)
-			return nil
-		}
-	case *uint32:
-		if u, ok := toUint64(src); ok {
-			*p = uint32(u)
-			return nil
-		}
-	case *uint64:
-		if u, ok := toUint64(src); ok {
-			*p = u
-			return nil
-		}
-	case *float32:
-		if f, ok := toFloat64(src); ok {
-			*p = float32(f)
-			return nil
-		}
-	case *float64:
-		if f, ok := toFloat64(src); ok {
-			*p = f
-			return nil
-		}
-	case *time.Duration:
-		if i, ok := toInt64(src); ok {
-			*p = time.Duration(i)
-			return nil
-		}
-		switch s := src.(type) {
-		case []byte:
-			i, err := strconv.ParseInt(string(s), 10, 64)
-			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse duration bytes %q: %w", s, err)
-			}
-			*p = time.Duration(i)
-			return nil
-		case string:
-			i, err := strconv.ParseInt(s, 10, 64)
-			if err != nil {
-				return fmt.Errorf("convertAssign: failed to parse duration string %q: %w", s, err)
-			}
-			*p = time.Duration(i)
-			return nil
-		}
-	}
-
-	vDst := reflect.ValueOf(dst)
-	if vDst.Kind() != reflect.Pointer || vDst.IsNil() {
-		return fmt.Errorf("convertAssign: dst must be a non-nil pointer, got %T", dst)
-	}
-
-	vElem := vDst.Elem()
-	vSrc := reflect.ValueOf(src)
-
-	if vSrc.Type().ConvertibleTo(vElem.Type()) {
-		vElem.Set(vSrc.Convert(vElem.Type()))
-		return nil
-	}
-
-	return fmt.Errorf("ScanNullable: cannot convert %T (%v) to %T", src, src, dst)
-}
-
-func toInt64(src any) (int64, bool) {
-	switch v := src.(type) {
-	case int:
-		return int64(v), true
-	case int8:
-		return int64(v), true
-	case int16:
-		return int64(v), true
-	case int32:
-		return int64(v), true
-	case int64:
-		return v, true
-	case uint:
-		return int64(v), true
-	case uint8:
-		return int64(v), true
-	case uint16:
-		return int64(v), true
-	case uint32:
-		return int64(v), true
-	case uint64:
-		return int64(v), true
-	default:
-		return 0, false
-	}
-}
-
-func toUint64(src any) (uint64, bool) {
-	switch v := src.(type) {
-	case int:
-		return uint64(v), true
-	case int8:
-		return uint64(v), true
-	case int16:
-		return uint64(v), true
-	case int32:
-		return uint64(v), true
-	case int64:
-		return uint64(v), true
-	case uint:
-		return uint64(v), true
-	case uint8:
-		return uint64(v), true
-	case uint16:
-		return uint64(v), true
-	case uint32:
-		return uint64(v), true
-	case uint64:
-		return v, true
-	default:
-		return 0, false
-	}
-}
-
-func toFloat64(src any) (float64, bool) {
-	switch v := src.(type) {
-	case float32:
-		return float64(v), true
-	case float64:
-		return v, true
-	case int:
-		return float64(v), true
-	case int64:
-		return float64(v), true
-	case uint64:
-		return float64(v), true
-	default:
-		return 0, false
-	}
-}
-
-func IsZero(v any) bool {
-	if v == nil {
-		return true
-	}
-
-	switch t := v.(type) {
-	case time.Time:
-		return t.IsZero()
-	case *time.Time:
-		return t == nil || t.IsZero()
-	}
-
-	val := reflect.ValueOf(v)
-	if val.Kind() == reflect.Pointer {
-		if val.IsNil() {
-			return true
-		}
-		return val.Elem().IsZero()
-	}
-
-	return val.IsZero()
-}
-
-func toPtr[T any](v T) *T {
-	if IsZero(v) {
-		return nil
-	}
-	return &v
-}
-
-// seenKey uniquely identifies a (parent, child) primary key pair.
-type seenKey[P comparable, C comparable] struct {
-	parent P
-	child  C
-}
-`
-
-func generateRuntimeFile(outDir, outPkg string) error {
-	tmpl, err := template.New("runtime").Parse(runtimeTemplate)
-	if err != nil {
-		return fmt.Errorf("parsing runtime template: %w", err)
-	}
-
-	var buf bytes.Buffer
-	data := map[string]string{"Package": outPkg}
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return fmt.Errorf("executing runtime template: %w", err)
-	}
-
-	filePath := filepath.Join(outDir, "runtime_gen.go")
-
-	formatted, err := imports.Process(filePath, buf.Bytes(), nil)
-	if err != nil {
-		formatted = buf.Bytes()
-	}
-
-	if err := os.WriteFile(filePath, formatted, 0o644); err != nil {
-		return fmt.Errorf("writing runtime_gen.go: %w", err)
-	}
-	return nil
-}
-
 // --- Model Code Template ---
-
-const codeTemplate = `// Code generated by query-gen. DO NOT EDIT.
-package {{.Package}}
-
-import (
-	"context"
-	"database/sql"
-	"errors"
-	"fmt"
-	"strings"
-
-	"{{.ModelPkg}}"
-)
-
-{{if .HasPK -}}
-// Insert{{.Name}} inserts a new {{.Name}} record into the {{.Table}} table.
-func Insert{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}) error {
-	if db == nil {
-		return errors.New("insert{{.Name}}: db is nil")
-	}
-	if m == nil {
-		return errors.New("insert{{.Name}}: m is nil")
-	}
-
-	fields := []struct {
-		col        string
-		val        any
-		omitIfZero bool
-	}{
-		{{range .WritableFields -}}
-		{col: "{{.Column}}", val: m.{{.Name}}, omitIfZero: {{or .HasDefault (and .IsTimestamp (not .Nullable))}}},
-		{{end -}}
-	}
-
-	cols := make([]string, 0, len(fields))
-	args := make([]any, 0, len(fields))
-	placeholders := make([]string, 0, len(fields))
-
-	for _, f := range fields {
-		if f.omitIfZero && IsZero(f.val) {
-			continue
-		}
-		cols = append(cols, f.col)
-		args = append(args, f.val)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
-	}
-
-	var query string
-	if len(cols) == 0 {
-		query = "INSERT INTO {{.Table}} DEFAULT VALUES RETURNING {{.AllColumns ""}}"
-	} else {
-		query = fmt.Sprintf("INSERT INTO {{.Table}} (%s) VALUES (%s) RETURNING {{.AllColumns ""}}",
-			strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-	}
-
-	if err := db.QueryRowContext(ctx, query, args...).
-		Scan({{.AllScanArgs "m"}}); err != nil {
-		return fmt.Errorf("insert{{.Name}}: %w", err)
-	}
-	return nil
-}
-
-// ============ Bulk insert ========================
-
-// Insert{{.NamePlural}} inserts multiple {{.Name}} records into {{.Table}} in efficient parameter-bounded batches.
-// Automatically populates database-generated values (e.g., auto-increment primary keys, default values) back into input structs via RETURNING.
-func Insert{{.NamePlural}}(ctx context.Context, db DBTX, models []*{{.ModelPkgAlias}}.{{.Name}}) error {
-	if db == nil {
-		return errors.New("insert{{.NamePlural}}: db is nil")
-	}
-	if len(models) == 0 {
-		return nil
-	}
-		
-	const batchSize = {{.BulkInsertBatchSize}}
-	for i := 0; i < len(models); i += batchSize {
-		end := min((i + batchSize), len(models))
-		batch := models[i:end]
-		if err := insert{{.NamePlural}}Batch(ctx, db, batch); err != nil {
-			return fmt.Errorf("insert{{.NamePlural}}: batch [%d:%d]: %w", i, end, err)
-		}
-	}
-	return nil
-}
-
-func insert{{.NamePlural}}Batch(ctx context.Context, db DBTX, batch []*{{.ModelPkgAlias}}.{{.Name}}) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
-	{{$writable := .WritableFields -}}
-	{{$numCols := len $writable -}}
-	{{if eq $numCols 0 -}}
-	for i, m := range batch {
-		if m == nil {
-			return fmt.Errorf("insert{{$.NamePlural}}Batch: model at index %d is nil", i)
-		}
-		const query = "INSERT INTO {{$.Table}} DEFAULT VALUES RETURNING {{$.AllColumns ""}}"
-		if err := db.QueryRowContext(ctx, query).Scan({{$.AllScanArgs "m"}}); err != nil {
-			return fmt.Errorf("insert{{$.NamePlural}}Batch row %d: %w", i, err)
-		}
-	}
-	return nil
-	{{else -}}
-	args := make([]any, 0, len(batch)*{{$numCols}})
-	var sb strings.Builder
-	sb.Grow(128 + len(batch)*{{$numCols}}*8)
-	sb.WriteString("INSERT INTO {{.Table}} ({{.InsertColumns}}) VALUES ")
-
-	paramIdx := 1
-	for i, m := range batch {
-		if m == nil {
-			return fmt.Errorf("model at index %d is nil", i)
-		}
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteByte('(')
-		{{range $j, $f := $writable -}}
-		{{if gt $j 0}}sb.WriteString(", "){{end}}
-		sb.WriteString(getPlaceholder(paramIdx))
-		paramIdx++
-		args = append(args, m.{{$f.Name}})
-		{{end -}}
-		sb.WriteByte(')')
-	}
-
-	sb.WriteString(" RETURNING {{.AllColumns ""}}")
-	rows, err := db.QueryContext(ctx, sb.String(), args...)
-	if err != nil {
-		return fmt.Errorf("executing bulk insert: %w", err)
-	}
-	defer rows.Close()
-
-	idx := 0
-	for rows.Next() {
-		if idx >= len(batch) {
-			return errors.New("unexpected extra row returned from insert")
-		}
-		m := batch[idx]
-		if err := rows.Scan({{.AllScanArgs "m"}}); err != nil {
-			return fmt.Errorf("scanning row %d: %w", idx, err)
-		}
-		idx++
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterating bulk insert rows: %w", err)
-	}
-
-	if idx < len(batch) {
-		return fmt.Errorf("expected %d inserted rows, got %d", len(batch), idx)
-	}
-
-	return nil
-	{{end -}}
-}
-
-// Get{{.Name}}ByID retrieves a single {{.Name}} record from {{.Table}} by its primary key.
-func Get{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	if db == nil {
-		return nil, errors.New("get{{.Name}}ByID: db is nil")
-	}
-	{{- if or .Relations .HasDeletedAt}}
-
-	cfg := parseQueryOptions(opts...)
-	{{- end}}
-	{{- if .Relations}}
-
-	if cfg.PreloadAssociations {
-		return get{{.Name}}ByIDWithRelations(ctx, db, {{.PKArgs ""}}, cfg)
-	}
-	{{- end}}
-	{{- if .HasDeletedAt}}
-
-	query := ` + "`" + `
-		SELECT {{.AllColumns ""}}
-		FROM {{.Table}}
-		WHERE {{.PKWhereClause "" 1}}
-	` + "`" + `
-	if !cfg.IncludeDeleted {
-		query += " AND {{.DeletedAtField.Column}} IS NULL"
-	}
-	{{- else}}
-
-	const query = ` + "`" + `
-		SELECT {{.AllColumns ""}}
-		FROM {{.Table}}
-		WHERE {{.PKWhereClause "" 1}}
-	` + "`" + `
-	{{- end}}
-
-	row := db.QueryRowContext(ctx, query, {{.PKArgs ""}})
-	var m {{.ModelPkgAlias}}.{{.Name}}
-	if err := row.Scan({{.AllScanArgs "m"}}); err != nil {
-		return nil, fmt.Errorf("get{{.Name}}ByID(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
-	}
-
-	return &m, nil
-}
-{{end -}}
-
-// Get{{.Name}} retrieves a single {{.Name}} record matching mandatory query options/where clause.
-// Returns sql.ErrNoRows if no matching record is found.
-func Get{{.Name}}(ctx context.Context, db DBTX, opts ...QueryOption) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	if db == nil {
-		return nil, errors.New("get{{.Name}}: db is nil")
-	}
-
-	cfg := parseQueryOptions(opts...)
-	if cfg.Where == "" {
-		return nil, errors.New("get{{.Name}}: query options/where clause required to prevent returning arbitrary row")
-	}
-
-	pOpts := append([]QueryOption(nil), opts...)
-	pOpts = append(pOpts, Limit(1))
-
-	items, err := FetchAll{{.NamePlural}}(ctx, db, pOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("get{{.Name}}: %w", err)
-	}
-	if len(items) == 0 {
-		return nil, fmt.Errorf("get{{.Name}}: %w", sql.ErrNoRows)
-	}
-	return items[0], nil
-}
-
-{{if .HasPK -}}
-// Update{{.Name}}Columns updates only the specified updatable columns/fields for an existing {{.Name}} record in {{.Table}}.
-// Column arguments can be database column names (e.g. "email") or Go field names (e.g. "Email").
-func Update{{.Name}}Columns(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}, cols ...string) error {
-	if db == nil {
-		return errors.New("update{{.Name}}Columns: db is nil")
-	}
-	if m == nil {
-		return errors.New("update{{.Name}}Columns: m is nil")
-	}
-	if len(cols) == 0 {
-		return errors.New("update{{.Name}}Columns: at least one column/field must be specified")
-	}
-
-	allowedColumns := []string{
-		{{range .UpdatableFields -}}
-		"{{.Column}}", "{{.Name}}",
-		{{end -}}
-	}
-
-	setClauses := make([]string, 0, len(cols))
-	args := make([]any, 0, len(cols)+{{len .PK}})
-
-	for _, col := range cols {
-		if !slices.Contains(allowedColumns, col) {
-			return fmt.Errorf("update{{.Name}}Columns: column or field %q is not updatable", col)
-		}
-
-		var dbCol string
-		var val any
-
-		switch col {
-		{{range .UpdatableFields -}}
-		case "{{.Column}}", "{{.Name}}":
-			dbCol = "{{.Column}}"
-			val = m.{{.Name}}
-		{{end -}}
-		}
-
-		args = append(args, val)
-		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", dbCol, len(args)))
-	}
-
-	pkClauses := make([]string, 0, {{len .PK}})
-	{{range $i, $pk := .PK -}}
-	pkClauses = append(pkClauses, fmt.Sprintf("%s = $%d", "{{$pk.Column}}", len(args)+{{$i}}+1))
-	{{end -}}
-
-	query := fmt.Sprintf("UPDATE {{.Table}} SET %s WHERE %s",
-		strings.Join(setClauses, ", "), strings.Join(pkClauses, " AND "))
-
-	args = append(args, {{.PKArgs "m."}})
-
-	res, err := db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("update{{.Name}}Columns(%v): %w", fmt.Sprint({{.PKArgs "m."}}), err)
-	}
-
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("detect rows affected: %w", err)
-	}
-	if n == 0 {
-		return fmt.Errorf("update{{.Name}}Columns(%v): %w", fmt.Sprint({{.PKArgs "m."}}), sql.ErrNoRows)
-	}
-	return nil
-}
-
-// Exists{{.Name}}ByID reports whether a {{.Name}} record with the given primary key exists.
-func Exists{{.Name}}ByID(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) (bool, error) {
-	if db == nil {
-		return false, errors.New("exists{{.Name}}ByID: db is nil")
-	}
-	{{- if .HasDeletedAt}}
-
-	cfg := parseQueryOptions(opts...)
-	query := ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PKWhereClause "" 1}}` + "`" + `
-	if !cfg.IncludeDeleted {
-		query += " AND {{.DeletedAtField.Column}} IS NULL"
-	}
-	query += ")"
-	{{- else}}
-
-	const query = ` + "`" + `SELECT EXISTS(SELECT 1 FROM {{.Table}} WHERE {{.PKWhereClause "" 1}})` + "`" + `
-	{{- end}}
-
-	var exists bool
-	if err := db.QueryRowContext(ctx, query, {{.PKArgs ""}}).Scan(&exists); err != nil {
-		return false, fmt.Errorf("exists{{.Name}}ByID(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
-	}
-	return exists, nil
-}
-{{end -}}
-
-// Exists{{.Name}} reports whether a {{.Name}} record matching the mandatory query options/where clause exists.
-func Exists{{.Name}}(ctx context.Context, db DBTX, opts ...QueryOption) (bool, error) {
-	if db == nil {
-		return false, errors.New("exists{{.Name}}: db is nil")
-	}
-
-	cfg := parseQueryOptions(opts...)
-	if cfg.Where == "" {
-		return false, errors.New("exists{{.Name}}: query options/where clause required")
-	}
-
-	var whereClause string
-	if cfg.Where != "" {
-		whereClause = " WHERE " + cfg.Where
-	}
-	{{- if .HasDeletedAt}}
-
-	if !cfg.IncludeDeleted {
-		if whereClause != "" {
-			whereClause += " AND {{.DeletedAtField.Column}} IS NULL"
-		} else {
-			whereClause = " WHERE {{.DeletedAtField.Column}} IS NULL"
-		}
-	}
-	{{- end}}
-
-	tableName := "{{.Table}}"
-	if cfg.Table != "" {
-		tableName = cfg.Table
-	}
-
-	query := "SELECT EXISTS(SELECT 1 FROM " + tableName + whereClause + ")"
-
-	var exists bool
-	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&exists); err != nil {
-		return false, fmt.Errorf("exists{{.Name}}: %w", err)
-	}
-	return exists, nil
-}
-
-// Count{{.NamePlural}} returns total records matching optional filter criteria.
-func Count{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
-	if db == nil {
-		return 0, errors.New("count{{.NamePlural}}: db is nil")
-	}
-
-	cfg := parseQueryOptions(opts...)
-
-	var whereClause string
-	if cfg.Where != "" {
-		whereClause = " WHERE " + cfg.Where
-	}
-	{{- if .HasDeletedAt}}
-
-	if !cfg.IncludeDeleted {
-		if whereClause != "" {
-			whereClause += " AND {{.DeletedAtField.Column}} IS NULL"
-		} else {
-			whereClause = " WHERE {{.DeletedAtField.Column}} IS NULL"
-		}
-	}
-	{{- end}}
-
-	tableName := "{{.Table}}"
-	if cfg.Table != "" {
-		tableName = cfg.Table
-	}
-
-	query := "SELECT COUNT(*) FROM " + tableName + whereClause
-
-	var count int64
-	if err := db.QueryRowContext(ctx, query, cfg.Args...).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count{{.NamePlural}}: %w", err)
-	}
-	return count, nil
-}
-
-// FetchAll{{.NamePlural}} retrieves a filtered/paginated slice of {{.Name}} records.
-func FetchAll{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) ([]*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	if db == nil {
-		return nil, errors.New("fetchAll{{.NamePlural}}: db is nil")
-	}
-	{{- if and .Relations .HasPK}}
-
-	clause, args, cfg := applyQueryOptions("{{.PKColumns ""}}", {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
-	if cfg.PreloadAssociations {
-		return fetchAll{{.NamePlural}}WithRelations(ctx, db, clause, args, cfg)
-	}
-	{{- else}}
-
-	clause, args, cfg := applyQueryOptions({{if .HasPK}}"{{.PKColumns ""}}"{{else}}""{{end}}, {{if .HasDeletedAt}}"{{.DeletedAtField.Column}}"{{else}}""{{end}}, opts...)
-	{{- end}}
-
-	tableName := "{{.Table}}"
-	if cfg.Table != "" {
-		tableName = cfg.Table
-	}
-
-	query := "SELECT {{.AllColumns ""}} FROM " + tableName + clause
-
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAll{{.NamePlural}}: %w", err)
-	}
-	defer rows.Close()
-
-	items := make([]*{{.ModelPkgAlias}}.{{.Name}}, 0, 16)
-	for rows.Next() {
-		var m {{.ModelPkgAlias}}.{{.Name}}
-		if err := rows.Scan({{.AllScanArgs "m"}}); err != nil {
-			return nil, fmt.Errorf("fetchAll{{.NamePlural}}: scanning row: %w", err)
-		}
-		items = append(items, &m)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("fetchAll{{.NamePlural}}: iterating rows: %w", err)
-	}
-
-	return items, nil
-}
-
-{{if .HasPK -}}
-// Update{{.Name}} updates an existing {{.Name}} record in {{.Table}}.
-func Update{{.Name}}(ctx context.Context, db DBTX, m *{{.ModelPkgAlias}}.{{.Name}}) error {
-	if db == nil {
-		return errors.New("update{{.Name}}: db is nil")
-	}
-	if m == nil {
-		return errors.New("update{{.Name}}: m is nil")
-	}
-
-	const query = ` + "`" + `
-		UPDATE {{.Table}}
-		SET {{.UpdateSetClause}}
-		WHERE {{.PKWhereClause "" .UpdatePKPlaceholderStartIdx}}
-	` + "`" + `
-
-	res, err := db.ExecContext(ctx, query, {{.UpdatableScanArgs "m"}}, {{.PKArgs "m."}})
-	if err != nil {
-		return fmt.Errorf("update{{.Name}}(%v): %w", fmt.Sprint({{.PKArgs "m."}}), err)
-	}
-
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("detect rows affected: %w", err)
-	}
-	if n == 0 {
-		return fmt.Errorf("update{{.Name}}(%v): %w", fmt.Sprint({{.PKArgs "m."}}), sql.ErrNoRows)
-	}
-	return nil
-}
-
-// Delete{{.Name}} deletes the {{.Name}} record identified by primary key from {{.Table}}.
-func Delete{{.Name}}(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, opts ...QueryOption) error {
-	if db == nil {
-		return errors.New("delete{{.Name}}: db is nil")
-	}
-	{{- if .HasDeletedAt}}
-
-	cfg := parseQueryOptions(opts...)
-	if !cfg.HardDelete {
-		const query = ` + "`" + `UPDATE {{.Table}} SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP WHERE {{.PKWhereClause "" 1}} AND {{.DeletedAtField.Column}} IS NULL` + "`" + `
-		res, err := db.ExecContext(ctx, query, {{.PKArgs ""}})
-		if err != nil {
-			return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("detect rows affected: %w", err)
-		}
-		if n == 0 {
-			return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, sql.ErrNoRows)
-		}
-		return nil
-	}
-	{{- end}}
-
-	const query = ` + "`" + `DELETE FROM {{.Table}} WHERE {{.PKWhereClause "" 1}}` + "`" + `
-
-	res, err := db.ExecContext(ctx, query, {{.PKArgs ""}})
-	if err != nil {
-		return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
-	}
-
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("detect rows affected: %w", err)
-	}
-	if n == 0 {
-		return fmt.Errorf("delete{{.Name}}(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, sql.ErrNoRows)
-	}
-	return nil
-}
-
-// Delete{{.NamePlural}} deletes records from {{.Table}} matching the provided query options and returns the number of affected rows.
-func Delete{{.NamePlural}}(ctx context.Context, db DBTX, opts ...QueryOption) (int64, error) {
-	if db == nil {
-		return 0, errors.New("delete{{.NamePlural}}: db is nil")
-	}
-
-	cfg := parseQueryOptions(opts...)
-	if cfg.Where == "" {
-		return 0, errors.New("delete{{.NamePlural}}: query options/where clause required to prevent accidental bulk deletion")
-	}
-	{{- if .HasDeletedAt}}
-
-	clause, args, cfg := applyQueryOptions("", "{{.DeletedAtField.Column}}", opts...)
-	{{- else}}
-
-	clause, args, cfg := applyQueryOptions("", "", opts...)
-	{{- end}}
-
-	tableName := "{{.Table}}"
-	if cfg.Table != "" {
-		tableName = cfg.Table
-	}
-
-	var query string
-	{{- if .HasDeletedAt}}
-	if !cfg.HardDelete {
-		query = "UPDATE " + tableName + " SET {{.DeletedAtField.Column}} = CURRENT_TIMESTAMP" + clause
-	} else {
-		query = "DELETE FROM " + tableName + clause
-	}
-	{{- else}}
-	query = "DELETE FROM " + tableName + clause
-	{{- end}}
-
-	res, err := db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("delete{{.NamePlural}}: %w", err)
-	}
-
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("delete{{.NamePlural}}: detecting rows affected: %w", err)
-	}
-
-	return n, nil
-}
-{{end -}}
-
-// ================= FETCHING RELATIONS ===============================
-{{- if and .Relations .HasPK}}
-{{- if .UseJoinStrategy}}
-func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	{{- if .HasDeletedAt}}
-	query := ` + "`" + `
-		SELECT 
-			{{.AllColumns "p"}}{{.AllRelationColumns}}
-		FROM {{.Table}} p
-		{{.AllRelationJoins "p"}}
-		WHERE {{.PKWhereClause "p" 1}}
-	` + "`" + `
-	if !cfg.IncludeDeleted {
-		query += " AND p.{{.DeletedAtField.Column}} IS NULL"
-	}
-	{{- else}}
-	const query = ` + "`" + `
-		SELECT 
-			{{.AllColumns "p"}}{{.AllRelationColumns}}
-		FROM {{.Table}} p
-		{{.AllRelationJoins "p"}}
-		WHERE {{.PKWhereClause "p" 1}}
-	` + "`" + `
-	{{- end}}
-
-	rows, err := db.QueryContext(ctx, query, {{.PKArgs ""}})
-	if err != nil {
-		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
-	}
-	defer rows.Close()
-
-	var parent *{{.ModelPkgAlias}}.{{.Name}}
-	var p {{.ModelPkgAlias}}.{{.Name}}
-
-	{{range $idx, $rel := .Relations -}}
-	{{$target := index $.AllKnownModels $rel.TargetModel -}}
-	seen_{{$rel.FieldName}} := make(map[{{$target.PKType $.ModelPkgAlias}}]struct{}, 4)
-	var c{{$idx}} {{$.ModelPkgAlias}}.{{$target.Name}}
-	{{end -}}
-
-	scanArgs := []any{
-		{{.AllScanArgs "p"}},
-		{{range $idx, $rel := .Relations -}}
-		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		{{range $target.SelectableFields -}}
-		ScanNullable(&c{{$idx}}.{{.Name}}),
-		{{end -}}
-		{{end -}}
-	}
-
-	for rows.Next() {
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): scanning row: %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
-		}
-
-		if parent == nil {
-			parent = &p
-		}
-
-		{{range $idx, $rel := .Relations -}}
-		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		if !({{$target.PKZeroCheck (print "c" $idx)}}) {
-			rPk{{$idx}} := {{$target.PKValue (print "c" $idx) $.ModelPkgAlias}}
-			if _, ok := seen_{{$rel.FieldName}}[rPk{{$idx}}]; !ok {
-				seen_{{$rel.FieldName}}[rPk{{$idx}}] = struct{}{}
-				child := c{{$idx}}
-				{{if or (eq $rel.Type "HasMany") (eq $rel.Type "ManyToMany") -}}
-				{{if $rel.IsPointer -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, &child)
-				{{else -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, child)
-				{{end -}}
-				{{else if eq $rel.Type "BelongsTo" -}}
-				{{if $rel.IsPointer -}}
-				parent.{{$rel.FieldName}} = &child
-				{{else -}}
-				parent.{{$rel.FieldName}} = child
-				{{end -}}
-				{{end -}}
-			}
-		}
-		{{end -}}
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): iterating rows: %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, err)
-	}
-	if parent == nil {
-		return nil, fmt.Errorf("get{{.Name}}ByIDWithRelations(%v): %w", {{if eq (len .PK) 1}}id{{else}}fmt.Sprint({{.PKArgs ""}}){{end}}, sql.ErrNoRows)
-	}
-
-	return parent, nil
-}
-
-func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause string, args []any, cfg QueryOptions) ([]*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	query := ` + "`" + `
-		WITH p AS (
-			SELECT {{.AllColumns "p"}}
-			FROM {{.Table}} p
-	` + "`" + ` + clause + ` + "`" + `
-		)
-		SELECT 
-			{{.AllColumns "p"}}{{.AllRelationColumns}}
-		FROM p
-		{{.AllRelationJoins "p"}}
-		ORDER BY {{.PKColumns "p"}} ASC
-	` + "`" + `
-
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAll{{.NamePlural}}WithRelations: %w", err)
-	}
-	defer rows.Close()
-
-	items := make([]*{{.ModelPkgAlias}}.{{.Name}}, 0, 16)
-	itemsMap := make(map[{{.PKType .ModelPkgAlias}}]*{{.ModelPkgAlias}}.{{.Name}}, 16)
-
-	{{range $idx, $rel := .Relations -}}
-	{{$target := index $.AllKnownModels $rel.TargetModel -}}
-	seen_{{$rel.FieldName}} := make(map[seenKey[{{$.PKType $.ModelPkgAlias}}, {{$target.PKType $.ModelPkgAlias}}]]struct{}, 64)
-	{{end -}}
-
-	for rows.Next() {
-		var p {{.ModelPkgAlias}}.{{.Name}}
-		{{range $idx, $rel := .Relations -}}
-		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		var c{{$idx}} {{$.ModelPkgAlias}}.{{$target.Name}}
-		{{end -}}
-
-		scanArgs := []any{
-			{{.AllScanArgs "p"}},
-			{{range $idx, $rel := .Relations -}}
-			{{$target := index $.AllKnownModels $rel.TargetModel -}}
-			{{range $target.SelectableFields -}}
-			ScanNullable(&c{{$idx}}.{{.Name}}),
-			{{end -}}
-			{{end -}}
-		}
-
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("fetchAll{{.NamePlural}}WithRelations: scanning row: %w", err)
-		}
-
-		pPK := {{.PKValue "p" .ModelPkgAlias}}
-		parent, exists := itemsMap[pPK]
-		if !exists {
-			parent = &p
-			itemsMap[pPK] = parent
-			items = append(items, parent)
-		}
-
-		{{range $idx, $rel := .Relations -}}
-		{{$target := index $.AllKnownModels $rel.TargetModel -}}
-		if !({{$target.PKZeroCheck (print "c" $idx)}}) {
-			rPk{{$idx}} := {{$target.PKValue (print "c" $idx) $.ModelPkgAlias}}
-			key{{$idx}} := seenKey[{{$.PKType $.ModelPkgAlias}}, {{$target.PKType $.ModelPkgAlias}}]{parent: pPK, child: rPk{{$idx}}}
-			if _, ok := seen_{{$rel.FieldName}}[key{{$idx}}]; !ok {
-				seen_{{$rel.FieldName}}[key{{$idx}}] = struct{}{}
-				child := c{{$idx}}
-				{{if or (eq $rel.Type "HasMany") (eq $rel.Type "ManyToMany") -}}
-				{{if $rel.IsPointer -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, &child)
-				{{else -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, child)
-				{{end -}}
-				{{else if eq $rel.Type "BelongsTo" -}}
-				{{if $rel.IsPointer -}}
-				parent.{{$rel.FieldName}} = &child
-				{{else -}}
-				parent.{{$rel.FieldName}} = child
-				{{end -}}
-				{{end -}}
-			}
-		}
-		{{end -}}
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("fetchAll{{.NamePlural}}WithRelations: iterating rows: %w", err)
-	}
-
-	return items, nil
-}
-{{else}}
-func get{{.Name}}ByIDWithRelations(ctx context.Context, db DBTX, {{.PKParams .ModelPkgAlias}}, cfg QueryOptions) (*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	opts := []QueryOption{Preload(false)}
-	if cfg.IncludeDeleted {
-		opts = append(opts, IncludeDeleted())
-	}
-
-	m, err := Get{{.Name}}ByID(ctx, db, {{.PKArgs ""}}, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	{{range $idx, $rel := .Relations -}}
-	{{$target := index $.AllKnownModels $rel.TargetModel -}}
-	{{if eq $rel.Type "HasMany"}}
-	{
-		preloadOpts := []QueryOption{Where("{{$rel.ForeignKey}} = $1", m.{{$.FirstPK.Name}})}
-		if cfg.IncludeDeleted {
-			preloadOpts = append(preloadOpts, IncludeDeleted())
-		}
-		children, err := FetchAll{{$target.NamePlural}}(ctx, db, preloadOpts...)
-		if err != nil {
-			return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: preloading {{$rel.FieldName}}: %w", err)
-		}
-		{{if $rel.IsPointer -}}
-		m.{{$rel.FieldName}} = children
-		{{else -}}
-		m.{{$rel.FieldName}} = make([]{{$.ModelPkgAlias}}.{{$target.Name}}, len(children))
-		for i, child := range children {
-			m.{{$rel.FieldName}}[i] = *child
-		}
-		{{end -}}
-	}
-	{{else if eq $rel.Type "BelongsTo"}}
-	{{$parentFK := $.FieldByColumn $rel.ForeignKey -}}
-	{{if $parentFK -}}
-	{{if $parentFK.IsPointer}}
-	if m.{{$parentFK.Name}} != nil {
-		preloadOpts := []QueryOption{}
-		if cfg.IncludeDeleted {
-			preloadOpts = append(preloadOpts, IncludeDeleted())
-		}
-		child, err := Get{{$target.Name}}ByID(ctx, db, *m.{{$parentFK.Name}}, preloadOpts...)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: preloading {{$rel.FieldName}}: %w", err)
-		}
-		if child != nil {
-			{{if $rel.IsPointer -}}
-			m.{{$rel.FieldName}} = child
-			{{else -}}
-			m.{{$rel.FieldName}} = *child
-			{{end -}}
-		}
-	}
-	{{else}}
-	if !IsZero(m.{{$parentFK.Name}}) {
-		preloadOpts := []QueryOption{}
-		if cfg.IncludeDeleted {
-			preloadOpts = append(preloadOpts, IncludeDeleted())
-		}
-		child, err := Get{{$target.Name}}ByID(ctx, db, m.{{$parentFK.Name}}, preloadOpts...)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: preloading {{$rel.FieldName}}: %w", err)
-		}
-		if child != nil {
-			{{if $rel.IsPointer -}}
-			m.{{$rel.FieldName}} = child
-			{{else -}}
-			m.{{$rel.FieldName}} = *child
-			{{end -}}
-		}
-	}
-	{{end -}}
-	{{end -}}
-	{{else if eq $rel.Type "ManyToMany"}}
-	{
-		query := "SELECT {{$target.AllColumns "t"}} FROM {{$target.Table}} t INNER JOIN {{$rel.JoinTable}} j ON t.{{$target.FirstPK.Column}} = j.{{$rel.JoinReferences}} WHERE j.{{$rel.JoinForeignKey}} = $1"
-		{{if $target.HasDeletedAt -}}
-		if !cfg.IncludeDeleted {
-			query += " AND t.{{$target.DeletedAtField.Column}} IS NULL"
-		}
-		{{end -}}
-		rows, err := db.QueryContext(ctx, query, m.{{$.FirstPK.Name}})
-		if err != nil {
-			return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: preloading {{$rel.FieldName}}: %w", err)
-		}
-		defer rows.Close()
-		var children []*{{$.ModelPkgAlias}}.{{$target.Name}}
-		for rows.Next() {
-			var child {{$.ModelPkgAlias}}.{{$target.Name}}
-			if err := rows.Scan({{$target.AllScanArgs "child"}}); err != nil {
-				return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: scanning {{$rel.FieldName}}: %w", err)
-			}
-			children = append(children, &child)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("get{{$.Name}}ByIDWithRelations: iterating {{$rel.FieldName}}: %w", err)
-		}
-		{{if $rel.IsPointer -}}
-		m.{{$rel.FieldName}} = children
-		{{else -}}
-		m.{{$rel.FieldName}} = make([]{{$.ModelPkgAlias}}.{{$target.Name}}, len(children))
-		for i, child := range children {
-			m.{{$rel.FieldName}}[i] = *child
-		}
-		{{end -}}
-	}
-	{{end -}}
-	{{end -}}
-
-	return m, nil
-}
-
-func fetchAll{{.NamePlural}}WithRelations(ctx context.Context, db DBTX, clause string, args []any, cfg QueryOptions) ([]*{{.ModelPkgAlias}}.{{.Name}}, error) {
-	query := "SELECT {{.AllColumns ""}} FROM {{.Table}}" + clause
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAll{{.NamePlural}}WithRelations: %w", err)
-	}
-	defer rows.Close()
-
-	items := make([]*{{.ModelPkgAlias}}.{{.Name}}, 0, 16)
-	for rows.Next() {
-		var m {{.ModelPkgAlias}}.{{.Name}}
-		if err := rows.Scan({{.AllScanArgs "m"}}); err != nil {
-			return nil, fmt.Errorf("fetchAll{{.NamePlural}}WithRelations: scanning row: %w", err)
-		}
-		items = append(items, &m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("fetchAll{{.NamePlural}}WithRelations: iterating rows: %w", err)
-	}
-	if len(items) == 0 {
-		return items, nil
-	}
-
-	{{if or .HasManyRelations .ManyToManyRelations -}}
-	parentIDs := make([]any, 0, len(items))
-	parentMap := make(map[{{.FirstPK.QualifiedType .ModelPkgAlias}}]*{{.ModelPkgAlias}}.{{.Name}}, len(items))
-	for _, item := range items {
-		pk := item.{{.FirstPK.Name}}
-		if !IsZero(pk) {
-			if _, exists := parentMap[pk]; !exists {
-				parentMap[pk] = item
-				parentIDs = append(parentIDs, pk)
-			}
-		}
-	}
-	{{end -}}
-
-	{{range $idx, $rel := .Relations -}}
-	{{$target := index $.AllKnownModels $rel.TargetModel -}}
-	{{if eq $rel.Type "HasMany"}}
-	{{$targetFK := $target.FieldByColumn $rel.ForeignKey -}}
-	{{if $targetFK}}
-	if len(parentIDs) > 0 {
-		preloadOpts := []QueryOption{}
-		if cfg.IncludeDeleted {
-			preloadOpts = append(preloadOpts, IncludeDeleted())
-		}
-		children, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]*{{$.ModelPkgAlias}}.{{$target.Name}}, error) {
-			opts := append([]QueryOption{In("{{$rel.ForeignKey}}", batch...)}, preloadOpts...)
-			return FetchAll{{$target.NamePlural}}(ctx, db, opts...)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("fetchAll{{$.NamePlural}}WithRelations: preloading {{$rel.FieldName}}: %w", err)
-		}
-		for _, child := range children {
-			{{if $targetFK.IsPointer -}}
-			if child.{{$targetFK.Name}} != nil {
-				if parent, ok := parentMap[*child.{{$targetFK.Name}}]; ok {
-					{{if $rel.IsPointer -}}
-					parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, child)
-					{{else -}}
-					parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, *child)
-					{{end -}}
-				}
-			}
-			{{else -}}
-			if parent, ok := parentMap[child.{{$targetFK.Name}}]; ok {
-				{{if $rel.IsPointer -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, child)
-				{{else -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, *child)
-				{{end -}}
-			}
-			{{end -}}
-		}
-	}
-	{{end -}}
-	{{else if eq $rel.Type "BelongsTo"}}
-	{{$parentFK := $.FieldByColumn $rel.ForeignKey -}}
-	{{if $parentFK}}
-	{
-		fkIDs := make([]any, 0, len(items))
-		fkMap := make(map[{{$target.FirstPK.QualifiedType $.ModelPkgAlias}}][]*{{$.ModelPkgAlias}}.{{$.Name}}, len(items))
-		for _, item := range items {
-			{{if $parentFK.IsPointer -}}
-			if item.{{$parentFK.Name}} != nil {
-				fk := *item.{{$parentFK.Name}}
-				if _, exists := fkMap[fk]; !exists {
-					fkIDs = append(fkIDs, fk)
-				}
-				fkMap[fk] = append(fkMap[fk], item)
-			}
-			{{else -}}
-			fk := item.{{$parentFK.Name}}
-			if !IsZero(fk) {
-				if _, exists := fkMap[fk]; !exists {
-					fkIDs = append(fkIDs, fk)
-				}
-				fkMap[fk] = append(fkMap[fk], item)
-			}
-			{{end -}}
-		}
-
-		if len(fkIDs) > 0 {
-			preloadOpts := []QueryOption{}
-			if cfg.IncludeDeleted {
-				preloadOpts = append(preloadOpts, IncludeDeleted())
-			}
-			children, err := batchIn(ctx, db, fkIDs, func(ctx context.Context, db DBTX, batch []any) ([]*{{$.ModelPkgAlias}}.{{$target.Name}}, error) {
-				opts := append([]QueryOption{In("{{$target.FirstPK.Column}}", batch...)}, preloadOpts...)
-				return FetchAll{{$target.NamePlural}}(ctx, db, opts...)
-			})
-			if err != nil {
-				return nil, fmt.Errorf("fetchAll{{$.NamePlural}}WithRelations: preloading {{$rel.FieldName}}: %w", err)
-			}
-			for _, child := range children {
-				parents := fkMap[child.{{$target.FirstPK.Name}}]
-				for _, parent := range parents {
-					{{if $rel.IsPointer -}}
-					parent.{{$rel.FieldName}} = child
-					{{else -}}
-					parent.{{$rel.FieldName}} = *child
-					{{end -}}
-				}
-			}
-		}
-	}
-	{{end -}}
-	{{else if eq $rel.Type "ManyToMany"}}
-	if len(parentIDs) > 0 {
-		preloadOpts := []QueryOption{}
-		if cfg.IncludeDeleted {
-			preloadOpts = append(preloadOpts, IncludeDeleted())
-		}
-		type m2mPair struct {
-			parentID {{$.FirstPK.QualifiedType $.ModelPkgAlias}}
-			child    *{{$.ModelPkgAlias}}.{{$target.Name}}
-		}
-		pairs, err := batchIn(ctx, db, parentIDs, func(ctx context.Context, db DBTX, batch []any) ([]m2mPair, error) {
-			whereClause := fmt.Sprintf("j.{{$rel.JoinForeignKey}} IN (%s)", strings.Join(func() []string {
-				s := make([]string, len(batch))
-				for i := range batch {
-					s[i] = fmt.Sprintf("$%d", i+1)
-				}
-				return s
-			}(), ", "))
-			{{if $target.HasDeletedAt -}}
-			if !cfg.IncludeDeleted {
-				whereClause += " AND t.{{$target.DeletedAtField.Column}} IS NULL"
-			}
-			{{end -}}
-			query := "SELECT j.{{$rel.JoinForeignKey}}, {{$target.AllColumns "t"}} FROM {{$rel.JoinTable}} j INNER JOIN {{$target.Table}} t ON t.{{$target.FirstPK.Column}} = j.{{$rel.JoinReferences}} WHERE " + whereClause
-			rows, err := db.QueryContext(ctx, query, batch...)
-			if err != nil {
-				return nil, err
-			}
-			defer rows.Close()
-			var res []m2mPair
-			for rows.Next() {
-				var pID {{$.FirstPK.QualifiedType $.ModelPkgAlias}}
-				var child {{$.ModelPkgAlias}}.{{$target.Name}}
-				scanArgs := append([]any{ScanNullable(&pID)}, {{$target.AllScanArgs "child"}})
-				if err := rows.Scan(scanArgs...); err != nil {
-					return nil, err
-				}
-				res = append(res, m2mPair{parentID: pID, child: &child})
-			}
-			return res, rows.Err()
-		})
-		if err != nil {
-			return nil, fmt.Errorf("fetchAll{{$.NamePlural}}WithRelations: preloading {{$rel.FieldName}}: %w", err)
-		}
-		for _, pair := range pairs {
-			if parent, ok := parentMap[pair.parentID]; ok {
-				{{if $rel.IsPointer -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, pair.child)
-				{{else -}}
-				parent.{{$rel.FieldName}} = append(parent.{{$rel.FieldName}}, *pair.child)
-				{{end -}}
-			}
-		}
-	}
-	{{end -}}
-	{{end -}}
-
-	return items, nil
-}
-{{end}}
-{{end}}
-`
