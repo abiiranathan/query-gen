@@ -823,6 +823,24 @@ func bareTypeName(s string) string {
 	return s
 }
 
+// findEnclosingGenDecl finds the *ast.GenDecl in file that declares typeSpec.
+// This is needed because doc comments on grouped type declarations
+// (type ( Foo struct{} )) attach to the GenDecl, not the TypeSpec.
+func findEnclosingGenDecl(file *ast.File, target *ast.TypeSpec) (*ast.GenDecl, bool) {
+	for _, decl := range file.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok || genDecl.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range genDecl.Specs {
+			if spec == target {
+				return genDecl, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func parsePackage(pattern string, defaultNullable bool) ([]Model, string, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
@@ -861,6 +879,19 @@ func parsePackage(pattern string, defaultNullable bool) ([]Model, string, error)
 
 				structType, ok := typeSpec.Type.(*ast.StructType)
 				if !ok {
+					return true
+				}
+
+				// Honor "query-gen: skip" directive in the doc comment. The doc may be
+				// attached to the TypeSpec itself, or to the enclosing GenDecl when the
+				// type is declared alone (e.g. `// comment\ntype Foo struct{}`).
+				doc := typeSpec.Doc
+				if doc == nil {
+					if genDecl, ok := findEnclosingGenDecl(file, typeSpec); ok {
+						doc = genDecl.Doc
+					}
+				}
+				if doc != nil && strings.Contains(doc.Text(), "query-gen: skip") {
 					return true
 				}
 
@@ -934,6 +965,11 @@ func parsePackage(pattern string, defaultNullable bool) ([]Model, string, error)
 							break
 						}
 					}
+				}
+
+				// Skip models with no identifiable primary key.
+				if len(model.PK) == 0 {
+					return true
 				}
 
 				result = append(result, model)
